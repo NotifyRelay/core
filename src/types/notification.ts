@@ -78,6 +78,10 @@ export interface SuperIslandState {
   text?: string;
   paramV2Raw?: string;
   pics?: Record<string, string>;
+  packageName?: string;
+  appName?: string;
+  time?: number;
+  isLocked?: boolean;
 }
 
 export interface SuperIslandDiff {
@@ -90,7 +94,7 @@ export interface SuperIslandDiff {
 
 export const SUPERISLAND_TERMINATE_VALUE = '__END__';
 
-export const SUPERISLAND_FEATURE_KEY = 'featureKeyValue';
+export const SUPERISLAND_FEATURE_KEY = 'si_feature_id';
 
 export interface SuperIslandMessage {
   featureId: string;

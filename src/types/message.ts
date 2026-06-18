@@ -38,6 +38,7 @@ export interface ParsedHandshake {
   publicKey: string;
   ipAddress: string;
   batteryLevel: number;
+  isCharging: boolean;
   deviceType: string;
 }
 

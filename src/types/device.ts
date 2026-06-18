@@ -26,6 +26,7 @@ export interface HandshakePayload {
   publicKey: string;
   ipAddress: string;
   batteryLevel: number;
+  isCharging: boolean;
   deviceType: DeviceType;
 }
 
@@ -34,6 +35,7 @@ export interface HandshakeResponse {
   publicKey: string;
   ipAddress: string;
   batteryLevel: number;
+  isCharging: boolean;
   deviceType: DeviceType;
   accepted: boolean;
   rejectReason?: string;

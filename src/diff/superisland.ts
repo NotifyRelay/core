@@ -1,15 +1,40 @@
 import type { SuperIslandState, SuperIslandDiff } from '../types/notification';
 import { SUPERISLAND_TERMINATE_VALUE, SUPERISLAND_FEATURE_KEY } from '../types/notification';
 import { sha1 } from '@noble/hashes/sha1';
+import { sha256 } from '@noble/hashes/sha256';
 
-export function computeFeatureId(superPkg: string, paramV2: string, instanceId?: string): string {
-  const input = instanceId ? `${superPkg}|${paramV2}|${instanceId}` : `${superPkg}|${paramV2}`;
-  const hash = sha1(input);
+function bytesToHex(bytes: Uint8Array): string {
   let hex = '';
-  for (let i = 0; i < 16; i++) {
-    hex += hash[i].toString(16).padStart(2, '0');
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
   }
   return hex;
+}
+
+export function computeFeatureId(superPkg: string, paramV2: string, instanceId?: string): string {
+  const stableFields: string[] = [superPkg];
+  try {
+    const root = JSON.parse(paramV2);
+    const extract = (path: string): string[] => {
+      const obj = root[path];
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        const result: string[] = [];
+        if (obj.title != null) result.push(String(obj.title));
+        if (obj.content != null) result.push(String(obj.content));
+        return result;
+      }
+      return [];
+    };
+    stableFields.push(...extract('chatInfo'));
+    stableFields.push(...extract('baseInfo'));
+    stableFields.push(...extract('highlightInfo'));
+  } catch {
+    if (paramV2 != null) stableFields.push(paramV2);
+    if (instanceId != null) stableFields.push(instanceId);
+  }
+  if (instanceId != null) stableFields.push(instanceId);
+  const raw = stableFields.join('|');
+  return bytesToHex(sha1(raw));
 }
 
 export function diff(oldState: SuperIslandState, newState: SuperIslandState): SuperIslandDiff | null {
@@ -58,15 +83,55 @@ export function diff(oldState: SuperIslandState, newState: SuperIslandState): Su
 }
 
 export function buildFullPayload(featureId: string, state: SuperIslandState): Record<string, unknown> {
-  return { [SUPERISLAND_FEATURE_KEY]: featureId, state: { ...state } };
+  const payload: Record<string, unknown> = {
+    packageName: state.packageName ?? '',
+    appName: state.appName ?? '',
+    time: state.time ?? 0,
+    isLocked: state.isLocked ?? false,
+    [SUPERISLAND_FEATURE_KEY]: featureId,
+    title: state.title ?? '',
+    text: state.text ?? '',
+    param_v2_raw: state.paramV2Raw ?? '',
+    pics: state.pics ?? {},
+  };
+  payload.hash = bytesToHex(sha256(JSON.stringify(payload)));
+  return payload;
 }
 
-export function buildDeltaPayload(featureId: string, diffObj: SuperIslandDiff): Record<string, unknown> {
-  return { [SUPERISLAND_FEATURE_KEY]: featureId, changes: { ...diffObj } };
+export function buildDeltaPayload(featureId: string, state: SuperIslandState, diffObj: SuperIslandDiff): Record<string, unknown> {
+  const changes: Record<string, unknown> = {};
+  if (diffObj.paramV2Raw !== undefined) {
+    changes['param_v2_raw'] = diffObj.paramV2Raw;
+  }
+  if (diffObj.picsChanged && Object.keys(diffObj.picsChanged).length > 0) {
+    changes['pics'] = diffObj.picsChanged;
+  }
+  if (diffObj.picsRemoved && diffObj.picsRemoved.length > 0) {
+    changes['pics_removed'] = diffObj.picsRemoved;
+  }
+  const payload: Record<string, unknown> = {
+    packageName: state.packageName ?? '',
+    appName: state.appName ?? '',
+    time: state.time ?? 0,
+    isLocked: state.isLocked ?? false,
+    [SUPERISLAND_FEATURE_KEY]: featureId,
+    changes,
+  };
+  payload.hash = bytesToHex(sha256(JSON.stringify(payload)));
+  return payload;
 }
 
-export function buildEndPayload(featureId: string): Record<string, unknown> {
-  return { [SUPERISLAND_FEATURE_KEY]: featureId, terminateValue: SUPERISLAND_TERMINATE_VALUE };
+export function buildEndPayload(featureId: string, state?: SuperIslandState): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    packageName: state?.packageName ?? '',
+    appName: state?.appName ?? '',
+    time: state?.time ?? 0,
+    isLocked: state?.isLocked ?? false,
+    terminateValue: SUPERISLAND_TERMINATE_VALUE,
+    [SUPERISLAND_FEATURE_KEY]: featureId,
+  };
+  payload.hash = bytesToHex(sha256(JSON.stringify(payload)));
+  return payload;
 }
 
 export class SuperIslandSendManager {
@@ -75,7 +140,7 @@ export class SuperIslandSendManager {
 
   updateAndGetPayload(deviceUuid: string, featureId: string, newState: SuperIslandState, forceFull?: boolean): {
     isFull: boolean;
-    payload: Record<string, unknown>;
+    payload: Record<string, unknown> | null;
   } {
     if (!this.lastState.has(deviceUuid)) {
       this.lastState.set(deviceUuid, new Map());
@@ -98,11 +163,11 @@ export class SuperIslandSendManager {
 
     const diffResult = diff(oldState, newState);
     if (!diffResult) {
-      return { isFull: true, payload: buildFullPayload(featureId, newState) };
+      return { isFull: false, payload: null };
     }
 
     deviceStates.set(featureId, { ...newState });
-    return { isFull: false, payload: buildDeltaPayload(featureId, diffResult) };
+    return { isFull: false, payload: buildDeltaPayload(featureId, newState, diffResult) };
   }
 
   markForceFull(deviceUuid: string, featureId: string): void {

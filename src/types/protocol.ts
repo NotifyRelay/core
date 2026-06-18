@@ -1,6 +1,7 @@
 export const PROTOCOL_VERSION = 1;
 
 export const DATA_HEADERS = {
+  DATA: 'DATA',
   NOTIFICATION: 'DATA_NOTIFICATION',
   SUPERISLAND: 'DATA_SUPERISLAND',
   MEDIAPLAY: 'DATA_MEDIAPLAY',
@@ -13,7 +14,6 @@ export const DATA_HEADERS = {
   FTP: 'DATA_FTP',
   STATUS: 'DATA_STATUS',
   APP_LAUNCH: 'DATA_APP_LAUNCH',
-  AUDIO_REQUEST: 'DATA_AUDIO_REQUEST',
 } as const;
 
 export type DataHeader = typeof DATA_HEADERS[keyof typeof DATA_HEADERS];

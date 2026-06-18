@@ -1,4 +1,4 @@
-import type { SuperIslandState, SuperIslandDiff } from '../types/notification';
+import type { SuperIslandState } from '../types/notification';
 import { SUPERISLAND_TERMINATE_VALUE } from '../types/notification';
 
 export class RemoteStore {
@@ -20,9 +20,18 @@ export class RemoteStore {
 
     if ('changes' in rawData) {
       const oldState = this.getState(deviceUuid, featureId) || {};
-      newState = this.applyDelta(oldState, rawData['changes'] as unknown as SuperIslandDiff);
+      newState = this.applyDelta(oldState, rawData['changes'] as Record<string, unknown>);
     } else {
-      newState = (rawData['state'] as SuperIslandState) || {};
+      const state: SuperIslandState = {};
+      if (rawData['packageName'] !== undefined) state.packageName = rawData['packageName'] as string;
+      if (rawData['appName'] !== undefined) state.appName = rawData['appName'] as string;
+      if (rawData['time'] !== undefined) state.time = rawData['time'] as number;
+      if (rawData['isLocked'] !== undefined) state.isLocked = rawData['isLocked'] as boolean;
+      if (rawData['title'] !== undefined) state.title = rawData['title'] as string;
+      if (rawData['text'] !== undefined) state.text = rawData['text'] as string;
+      if (rawData['param_v2_raw'] !== undefined) state.paramV2Raw = rawData['param_v2_raw'] as string;
+      if (rawData['pics'] !== undefined) state.pics = rawData['pics'] as Record<string, string>;
+      newState = state;
     }
 
     if (!this.store.has(deviceUuid)) {
@@ -33,28 +42,25 @@ export class RemoteStore {
     return newState;
   }
 
-  applyDelta(oldState: SuperIslandState, changes: SuperIslandDiff): SuperIslandState {
+  applyDelta(oldState: SuperIslandState, changes: Record<string, unknown>): SuperIslandState {
     const result: SuperIslandState = { ...oldState };
 
-    if (changes.title !== undefined && changes.title !== null) {
-      result.title = changes.title;
-    }
-    if (changes.text !== undefined && changes.text !== null) {
-      result.text = changes.text;
-    }
-    if (changes.paramV2Raw !== undefined && changes.paramV2Raw !== null) {
-      result.paramV2Raw = changes.paramV2Raw;
+    if (changes['param_v2_raw'] !== undefined && changes['param_v2_raw'] !== null) {
+      result.paramV2Raw = changes['param_v2_raw'] as string;
     }
 
-    if (changes.picsChanged || changes.picsRemoved) {
+    const pics = changes['pics'] as Record<string, string> | undefined;
+    const picsRemoved = changes['pics_removed'] as string[] | undefined;
+
+    if (pics || picsRemoved) {
       const mergedPics = { ...(oldState.pics || {}) };
-      if (changes.picsChanged) {
-        for (const key of Object.keys(changes.picsChanged)) {
-          mergedPics[key] = changes.picsChanged[key];
+      if (pics) {
+        for (const key of Object.keys(pics)) {
+          mergedPics[key] = pics[key];
         }
       }
-      if (changes.picsRemoved) {
-        for (const key of changes.picsRemoved) {
+      if (picsRemoved) {
+        for (const key of picsRemoved) {
           delete mergedPics[key];
         }
       }

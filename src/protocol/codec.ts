@@ -17,16 +17,48 @@ export function parseLine(line: string): ParsedLine {
     return {
       type: 'HEARTBEAT_TCP',
       uuid: parts[1],
-      displayName: parts[2],
+      displayName: atob(parts[2]),
       port: parseInt(parts[3], 10),
       batteryStatus: parts[4],
       deviceType: parts[5],
     }
   }
 
-  if (type === 'ACCEPT' || type === 'REJECT') {
+  if (type === 'ACCEPT') {
     const parts = line.split(':')
-    return { type, uuid: parts[1], reason: parts[2] }
+    const batteryStatus = parts[4] || '0'
+    const isCharging = batteryStatus.startsWith('+')
+    const rawLevel = parseInt(isCharging ? batteryStatus.substring(1) : batteryStatus, 10)
+    const batteryLevel = isNaN(rawLevel) ? 0 : Math.max(0, Math.min(100, rawLevel))
+    return {
+      type: 'ACCEPT',
+      uuid: parts[1],
+      publicKey: parts[2],
+      ipAddress: parts[3],
+      batteryLevel,
+      isCharging,
+      deviceType: parts[5] as DeviceType,
+    } as any
+  }
+
+  if (type === 'REJECT') {
+    const parts = line.split(':')
+    return { type: 'REJECT', uuid: parts[1] }
+  }
+
+  if (type === 'NOTIFYRELAY_DISCOVER') {
+    const parts = line.split(':')
+    return {
+      type: 'NOTIFYRELAY_DISCOVER',
+      uuid: parts[1],
+      displayName: parts[2],
+      port: parseInt(parts[3], 10),
+    } as any
+  }
+
+  if (type === 'NOTIFYRELAY_DISCOVER_MANUAL') {
+    const encrypted = line.substring(line.indexOf(':') + 1)
+    return { type: 'NOTIFYRELAY_DISCOVER_MANUAL', encrypted } as any
   }
 
   if (isDataHeader(type)) {
@@ -49,11 +81,16 @@ export function parseDataLine(line: string): RawDataMessage {
 
 export function parseHandshake(payload: string): HandshakePayload {
   const parts = payload.split(':')
+  const batteryStatus = parts[4] || '0'
+  const isCharging = batteryStatus.startsWith('+')
+  const rawLevel = parseInt(isCharging ? batteryStatus.substring(1) : batteryStatus, 10)
+  const batteryLevel = isNaN(rawLevel) ? 0 : Math.max(0, Math.min(100, rawLevel))
   return {
     uuid: parts[1],
     publicKey: parts[2],
     ipAddress: parts[3],
-    batteryLevel: parseInt(parts[4], 10),
+    batteryLevel,
+    isCharging,
     deviceType: parts[5] as DeviceType,
   }
 }
@@ -62,12 +99,13 @@ export function parseHeartbeat(line: string): HeartbeatPayload {
   const parts = line.split(':')
   const batteryStatus = parts[4]
   const isCharging = batteryStatus.startsWith('+')
-  const batteryLevel = parseInt(batteryStatus.substring(1), 10)
+  const rawLevel = parseInt(batteryStatus.substring(1), 10)
+  const batteryLevel = isNaN(rawLevel) ? 0 : Math.max(0, Math.min(100, rawLevel))
   return {
     uuid: parts[1],
     displayName: parts[2],
     port: parseInt(parts[3], 10),
-    batteryLevel: isNaN(batteryLevel) ? 0 : batteryLevel,
+    batteryLevel,
     deviceType: parts[5] as DeviceType,
     isCharging,
   }

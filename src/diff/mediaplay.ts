@@ -5,15 +5,15 @@ export function diffMediaPlay(oldState: MediaPlayState, newState: MediaPlayState
   const result: MediaPlayDiff = {};
   let changed = false;
 
-  if (newState.title !== undefined && newState.title !== oldState.title) {
+  if (newState.title !== oldState.title) {
     result.title = newState.title;
     changed = true;
   }
-  if (newState.text !== undefined && newState.text !== oldState.text) {
+  if (newState.text !== oldState.text) {
     result.text = newState.text;
     changed = true;
   }
-  if (newState.coverUrl !== undefined && newState.coverUrl !== oldState.coverUrl) {
+  if (newState.coverUrl !== oldState.coverUrl) {
     result.coverUrl = newState.coverUrl;
     changed = true;
   }
@@ -48,5 +48,6 @@ export function buildMediaPlayEnd(): Record<string, unknown> {
     type: 'END',
     mediaType: 'END',
     terminateValue: SUPERISLAND_TERMINATE_VALUE,
+    featureKeyValue: 'media_island_global',
   };
 }

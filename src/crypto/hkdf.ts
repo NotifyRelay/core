@@ -1,23 +1,19 @@
-import { hkdf } from '@noble/hashes/hkdf';
+import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
 
-function base64Decode(s: string): Uint8Array {
-  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
-}
+export function hkdfDerive(localKey: string, remoteKey: string): string {
+  const [a, b] = [localKey, remoteKey].sort();
+  const ikmBytes = new TextEncoder().encode(a + b);
 
-function base64Encode(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes));
-}
+  const saltBytes = new Uint8Array(32);
 
-export function hkdfDerive(
-  ikm: string,
-  salt: string,
-  info: string,
-  length: number
-): string {
-  const ikmBytes = base64Decode(ikm);
-  const saltBytes = new TextEncoder().encode(salt);
-  const infoBytes = new TextEncoder().encode(info);
-  const derived = hkdf(sha256, ikmBytes, saltBytes, infoBytes, length);
-  return base64Encode(derived);
+  const prk = hmac(sha256, saltBytes, ikmBytes);
+
+  const infoBytes = new TextEncoder().encode("shared-secret");
+  const okmInput = new Uint8Array(infoBytes.length + 1);
+  okmInput.set(infoBytes, 0);
+  okmInput[infoBytes.length] = 0x01;
+  const okm = hmac(sha256, prk, okmInput);
+
+  return btoa(String.fromCharCode(...okm));
 }
