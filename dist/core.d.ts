@@ -1,101 +1,3 @@
-declare const PROTOCOL_VERSION = 1;
-declare const DATA_HEADERS: {
-    readonly DATA: "DATA";
-    readonly NOTIFICATION: "DATA_NOTIFICATION";
-    readonly SUPERISLAND: "DATA_SUPERISLAND";
-    readonly MEDIAPLAY: "DATA_MEDIAPLAY";
-    readonly ICON_REQUEST: "DATA_ICON_REQUEST";
-    readonly ICON_RESPONSE: "DATA_ICON_RESPONSE";
-    readonly APP_LIST_REQUEST: "DATA_APP_LIST_REQUEST";
-    readonly APP_LIST_RESPONSE: "DATA_APP_LIST_RESPONSE";
-    readonly MEDIA_CONTROL: "DATA_MEDIA_CONTROL";
-    readonly CLIPBOARD: "DATA_CLIPBOARD";
-    readonly FTP: "DATA_FTP";
-    readonly STATUS: "DATA_STATUS";
-    readonly APP_LAUNCH: "DATA_APP_LAUNCH";
-};
-type DataHeader = typeof DATA_HEADERS[keyof typeof DATA_HEADERS];
-declare const LINE_PREFIX: {
-    readonly HANDSHAKE: "HANDSHAKE";
-    readonly ACCEPT: "ACCEPT";
-    readonly REJECT: "REJECT";
-    readonly HEARTBEAT_TCP: "HEARTBEAT_TCP";
-};
-type LinePrefix = typeof LINE_PREFIX[keyof typeof LINE_PREFIX];
-declare const DEVICE_TYPE: {
-    readonly ANDROID: "android";
-    readonly PC: "pc";
-    readonly LINUX: "linux";
-    readonly MACOS: "macos";
-};
-type DeviceType = typeof DEVICE_TYPE[keyof typeof DEVICE_TYPE];
-declare const MESSAGE_PRIORITY: {
-    readonly LOW: 0;
-    readonly NORMAL: 1;
-    readonly HIGH: 2;
-    readonly CRITICAL: 3;
-};
-type MessagePriority = typeof MESSAGE_PRIORITY[keyof typeof MESSAGE_PRIORITY];
-declare const STATUS_TYPE: {
-    readonly OK: "OK";
-    readonly ERROR: "ERROR";
-    readonly ACK: "ACK";
-    readonly PONG: "PONG";
-};
-type StatusType = typeof STATUS_TYPE[keyof typeof STATUS_TYPE];
-
-interface DeviceInfo {
-    uuid: string;
-    displayName: string;
-    deviceType: DeviceType;
-    publicKey: string;
-    ipAddress: string;
-    port: number;
-    batteryLevel: number;
-    isCharging: boolean;
-    osVersion?: string;
-    appVersion?: string;
-}
-interface AuthInfo {
-    deviceUuid: string;
-    publicKey: string;
-    sharedSecret?: string;
-    authedAt: number;
-    label?: string;
-}
-interface HandshakePayload {
-    uuid: string;
-    publicKey: string;
-    ipAddress: string;
-    batteryLevel: number;
-    isCharging: boolean;
-    deviceType: DeviceType;
-}
-interface HandshakeResponse {
-    uuid: string;
-    publicKey: string;
-    ipAddress: string;
-    batteryLevel: number;
-    isCharging: boolean;
-    deviceType: DeviceType;
-    accepted: boolean;
-    rejectReason?: string;
-}
-interface HeartbeatPayload {
-    uuid: string;
-    displayName: string;
-    port: number;
-    batteryLevel: number;
-    deviceType: DeviceType;
-    isCharging: boolean;
-}
-interface BatteryStatus {
-    level: number;
-    isCharging: boolean;
-}
-declare function formatBatteryStatus(status: BatteryStatus): string;
-declare function parseBatteryStatus(raw: string): BatteryStatus;
-
 declare const NOTIFICATION_TYPE: {
     readonly ACTIVE: "Active";
     readonly REMOVED: "Removed";
@@ -180,7 +82,6 @@ interface SuperIslandDiff {
     picsRemoved?: string[];
 }
 declare const SUPERISLAND_TERMINATE_VALUE = "__END__";
-declare const SUPERISLAND_FEATURE_KEY = "si_feature_id";
 interface SuperIslandMessage {
     featureId: string;
     deviceUuid: string;
@@ -214,6 +115,21 @@ interface MediaPlayMessage {
     mediaType?: string;
     terminateValue?: string;
 }
+
+declare const DEVICE_TYPE: {
+    readonly ANDROID: "android";
+    readonly PC: "pc";
+    readonly LINUX: "linux";
+    readonly MACOS: "macos";
+};
+type DeviceType = typeof DEVICE_TYPE[keyof typeof DEVICE_TYPE];
+declare const STATUS_TYPE: {
+    readonly OK: "OK";
+    readonly ERROR: "ERROR";
+    readonly ACK: "ACK";
+    readonly PONG: "PONG";
+};
+type StatusType = typeof STATUS_TYPE[keyof typeof STATUS_TYPE];
 
 type RawMessageType = 'DATA' | 'DATA_NOTIFICATION' | 'DATA_SUPERISLAND' | 'DATA_MEDIAPLAY' | 'DATA_ICON_REQUEST' | 'DATA_ICON_RESPONSE' | 'DATA_APP_LIST_REQUEST' | 'DATA_APP_LIST_RESPONSE' | 'DATA_MEDIA_CONTROL' | 'DATA_CLIPBOARD' | 'DATA_FTP' | 'DATA_STATUS' | 'DATA_APP_LAUNCH' | 'DATA_AUDIO_REQUEST' | 'HANDSHAKE' | 'ACCEPT' | 'REJECT' | 'HEARTBEAT_TCP';
 interface RawDataMessage {
@@ -304,7 +220,6 @@ interface AppLaunchMessage {
     sourceDevice: string;
     timestamp: number;
 }
-type ProtocolMessage = NotificationMessage | SuperIslandMessage | MediaPlayMessage | StatusMessage | ClipboardMessage | AppListRequest | AppListResponse | IconRequest | IconResponse | FtpMessage | MediaControlMessage | AppLaunchMessage;
 type MessageHandler<T = any> = (message: T, senderUuid: string) => void | Promise<void>;
 interface RouterHandlerMap {
     onNotification?: MessageHandler<NotificationMessage>;
@@ -321,6 +236,9 @@ interface RouterHandlerMap {
     onAppLaunch?: MessageHandler<AppLaunchMessage>;
 }
 
+declare function encrypt(plaintext: string, key: string): string;
+declare function decrypt(data: string, key: string): string;
+
 declare function generateKeyPair(): {
     publicKey: string;
     privateKey: string;
@@ -329,11 +247,8 @@ declare function computeSharedSecret(privateKey: string, publicKey: string): str
 
 declare function hkdfDerive(localKey: string, remoteKey: string): string;
 
-declare function encrypt(plaintext: string, key: string): string;
-declare function decrypt(data: string, key: string): string;
-
 declare function computeFeatureId(superPkg: string, paramV2: string, instanceId?: string): string;
-declare function diff(oldState: SuperIslandState, newState: SuperIslandState): SuperIslandDiff | null;
+declare function diff$1(oldState: SuperIslandState, newState: SuperIslandState): SuperIslandDiff | null;
 declare function buildFullPayload(featureId: string, state: SuperIslandState): Record<string, unknown>;
 declare function buildDeltaPayload(featureId: string, state: SuperIslandState, diffObj: SuperIslandDiff): Record<string, unknown>;
 declare function buildEndPayload(featureId: string, state?: SuperIslandState): Record<string, unknown>;
@@ -363,9 +278,35 @@ declare class RemoteStore {
     getAllStates(): Map<string, Map<string, SuperIslandState>>;
 }
 
-declare const ROUTE_TABLE: Record<string, keyof RouterHandlerMap>;
 declare function isDataHeader(header: string): boolean;
 declare function isLinePrefix(prefix: string): boolean;
+
+interface HandshakePayload {
+    uuid: string;
+    publicKey: string;
+    ipAddress: string;
+    batteryLevel: number;
+    isCharging: boolean;
+    deviceType: DeviceType;
+}
+interface HandshakeResponse {
+    uuid: string;
+    publicKey: string;
+    ipAddress: string;
+    batteryLevel: number;
+    isCharging: boolean;
+    deviceType: DeviceType;
+    accepted: boolean;
+    rejectReason?: string;
+}
+interface HeartbeatPayload {
+    uuid: string;
+    displayName: string;
+    port: number;
+    batteryLevel: number;
+    deviceType: DeviceType;
+    isCharging: boolean;
+}
 
 declare function parseLine(line: string): ParsedLine;
 declare function parseDataLine(line: string): RawDataMessage;
@@ -388,14 +329,6 @@ declare class ProtocolRouter {
     removeHandler(key: keyof RouterHandlerMap): void;
 }
 
-interface SendTask {
-    id: string;
-    header: string;
-    payload: string;
-    priority: number;
-    timestamp: number;
-    retryCount: number;
-}
 declare class ProtocolSender {
     private sendCallback;
     constructor(sendCallback: (message: string) => void | Promise<void>);
@@ -445,5 +378,50 @@ declare class FilterEngine {
     getRules(): FilterRule[];
 }
 
-export { CATEGORY, DATA_HEADERS, DEVICE_TYPE, FilterEngine, LINE_PREFIX, MESSAGE_PRIORITY, NOTIFICATION_TYPE, PRIORITY_LEVEL, PROTOCOL_VERSION, ProtocolRouter, ProtocolSender, ROUTE_TABLE, RemoteStore, STATUS_TYPE, SUPERISLAND_FEATURE_KEY, SUPERISLAND_TERMINATE_VALUE, SuperIslandSendManager, buildDeltaPayload, buildEndPayload, buildFullPayload, buildMediaPlayDelta, buildMediaPlayEnd, buildMediaPlayFull, classifyNotification, computeDedupKey, computeFeatureId, computeSharedSecret, decodeMessage, decrypt, diff, diffMediaPlay, encodeMessage, encrypt, extractMetadata, formatBatteryStatus, generateKeyPair, hkdfDerive, isDataHeader, isLinePrefix, parseBatteryStatus, parseDataLine, parseHandshake, parseHeartbeat, parseLine, processNotification, shouldSendFull };
-export type { AppInfo, AppLaunchMessage, AppListRequest, AppListResponse, AuthInfo, BatteryStatus, ClipboardMessage, DataHeader, DeviceInfo, DeviceType, FilterResult, FilterRule, FtpMessage, HandshakePayload, HandshakeResponse, HeartbeatPayload, IconRequest, IconResponse, LinePrefix, MediaControlMessage, MediaPlayDiff, MediaPlayMessage, MediaPlayState, MessageHandler, MessagePriority, NotificationAction, NotificationCategory, NotificationLaunchAction, NotificationMessage, NotificationType, ParsedHandshake, ParsedHeartbeat, ParsedLine, PriorityLevel, ProcessedNotification, ProcessedNotificationType, ProtocolMessage, RawDataMessage, RawMessageType, RouterHandlerMap, SendTask, StatusMessage, StatusType, SuperIslandDiff, SuperIslandMessage, SuperIslandState };
+declare const crypto: {
+    aesEncrypt: typeof encrypt;
+    aesDecrypt: typeof decrypt;
+    ecdhGenerateKeyPair: typeof generateKeyPair;
+    ecdhDeriveSharedSecret: typeof computeSharedSecret;
+    hkdfDerive: typeof hkdfDerive;
+};
+declare const diff: {
+    superIsland: {
+        computeFeatureId: typeof computeFeatureId;
+        diff: typeof diff$1;
+        buildFullPayload: typeof buildFullPayload;
+        buildDeltaPayload: typeof buildDeltaPayload;
+        buildEndPayload: typeof buildEndPayload;
+        SuperIslandSendManager: typeof SuperIslandSendManager;
+    };
+    mediaPlay: {
+        diffMediaPlay: typeof diffMediaPlay;
+        shouldSendFull: typeof shouldSendFull;
+        buildMediaPlayFull: typeof buildMediaPlayFull;
+        buildMediaPlayDelta: typeof buildMediaPlayDelta;
+        buildMediaPlayEnd: typeof buildMediaPlayEnd;
+    };
+    RemoteStore: typeof RemoteStore;
+};
+declare const protocol: {
+    ROUTE_TABLE: Record<string, keyof RouterHandlerMap>;
+    isDataHeader: typeof isDataHeader;
+    isLinePrefix: typeof isLinePrefix;
+    parseLine: typeof parseLine;
+    parseDataLine: typeof parseDataLine;
+    parseHandshake: typeof parseHandshake;
+    parseHeartbeat: typeof parseHeartbeat;
+    encodeMessage: typeof encodeMessage;
+    decodeMessage: typeof decodeMessage;
+    ProtocolRouter: typeof ProtocolRouter;
+    ProtocolSender: typeof ProtocolSender;
+};
+declare const notification: {
+    classifyNotification: typeof classifyNotification;
+    processNotification: typeof processNotification;
+    extractMetadata: typeof extractMetadata;
+    computeDedupKey: typeof computeDedupKey;
+    FilterEngine: typeof FilterEngine;
+};
+
+export { crypto, diff, notification, protocol };

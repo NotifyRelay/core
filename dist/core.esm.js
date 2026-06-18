@@ -1,105 +1,11 @@
-const PROTOCOL_VERSION = 1;
-const DATA_HEADERS = {
-    DATA: 'DATA',
-    NOTIFICATION: 'DATA_NOTIFICATION',
-    SUPERISLAND: 'DATA_SUPERISLAND',
-    MEDIAPLAY: 'DATA_MEDIAPLAY',
-    ICON_REQUEST: 'DATA_ICON_REQUEST',
-    ICON_RESPONSE: 'DATA_ICON_RESPONSE',
-    APP_LIST_REQUEST: 'DATA_APP_LIST_REQUEST',
-    APP_LIST_RESPONSE: 'DATA_APP_LIST_RESPONSE',
-    MEDIA_CONTROL: 'DATA_MEDIA_CONTROL',
-    CLIPBOARD: 'DATA_CLIPBOARD',
-    FTP: 'DATA_FTP',
-    STATUS: 'DATA_STATUS',
-    APP_LAUNCH: 'DATA_APP_LAUNCH',
-};
-const LINE_PREFIX = {
-    HANDSHAKE: 'HANDSHAKE',
-    ACCEPT: 'ACCEPT',
-    REJECT: 'REJECT',
-    HEARTBEAT_TCP: 'HEARTBEAT_TCP',
-};
-const DEVICE_TYPE = {
-    ANDROID: 'android',
-    PC: 'pc',
-    LINUX: 'linux',
-    MACOS: 'macos',
-};
-const MESSAGE_PRIORITY = {
-    LOW: 0,
-    NORMAL: 1,
-    HIGH: 2,
-    CRITICAL: 3,
-};
-const STATUS_TYPE = {
-    OK: 'OK',
-    ERROR: 'ERROR',
-    ACK: 'ACK',
-    PONG: 'PONG',
-};
-
-function formatBatteryStatus(status) {
-    return status.isCharging ? `+${status.level}` : `-${status.level}`;
-}
-function parseBatteryStatus(raw) {
-    const isCharging = raw.startsWith('+');
-    const level = parseInt(raw.substring(1), 10);
-    return { level: isNaN(level) ? 0 : level, isCharging };
-}
-
-const NOTIFICATION_TYPE = {
-    ACTIVE: 'Active',
-    REMOVED: 'Removed',
-    NEW: 'New',
-    ACTION: 'Action',
-    INVOKE: 'Invoke',
-};
-const CATEGORY = {
-    TRANSPORT: 'transport',
-    CALL: 'call',
-    MESSAGE: 'msg',
-    EMAIL: 'email',
-    EVENT: 'event',
-    PROMO: 'promo',
-    ALARM: 'alarm',
-    PROGRESS: 'progress',
-    SOCIAL: 'social',
-    ERROR: 'err',
-    UNDEFINED: 'undefined',
-    SYSTEM: 'system',
-};
-const PRIORITY_LEVEL = {
-    MIN: -2,
-    LOW: -1,
-    DEFAULT: 0,
-    HIGH: 1,
-    MAX: 2,
-};
-const SUPERISLAND_TERMINATE_VALUE = '__END__';
-const SUPERISLAND_FEATURE_KEY = 'si_feature_id';
-
-const crypto$2 = typeof globalThis === 'object' && 'crypto' in globalThis ? globalThis.crypto : undefined;
-
 /**
  * Utilities for hex, bytes, CSPRNG.
  * @module
  */
-/*! noble-hashes - MIT License (c) 2022 Paul Miller (paulmillr.com) */
-// We use WebCrypto aka globalThis.crypto, which exists in browsers and node.js 16+.
-// node.js versions earlier than v19 don't declare it in global scope.
-// For node.js, package.json#exports field mapping rewrites import
-// from `crypto` to `cryptoNode`, which imports native module.
-// Makes the utils un-importable in browsers without a bundler.
-// Once node.js 18 is deprecated (2025-04-30), we can just drop the import.
+/*! noble-ciphers - MIT License (c) 2023 Paul Miller (paulmillr.com) */
 /** Checks if something is Uint8Array. Be careful: nodejs Buffer will return true. */
 function isBytes$1(a) {
     return a instanceof Uint8Array || (ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array');
-}
-/** Asserts something is positive integer. */
-function anumber(n) {
-    if (!Number.isSafeInteger(n) || n < 0)
-        throw new Error('positive integer expected, got ' + n);
 }
 /** Asserts something is Uint8Array. */
 function abytes$1(b, ...lengths) {
@@ -107,13 +13,6 @@ function abytes$1(b, ...lengths) {
         throw new Error('Uint8Array expected');
     if (lengths.length > 0 && !lengths.includes(b.length))
         throw new Error('Uint8Array expected of length ' + lengths + ', got length=' + b.length);
-}
-/** Asserts something is hash */
-function ahash(h) {
-    if (typeof h !== 'function' || typeof h.create !== 'function')
-        throw new Error('Hash should be wrapped by utils.createHasher');
-    anumber(h.outputLen);
-    anumber(h.blockLen);
 }
 /** Asserts a hash instance has not been destroyed / finished */
 function aexists$1(instance, checkFinished = true) {
@@ -130,6 +29,14 @@ function aoutput$1(out, instance) {
         throw new Error('digestInto() expects output buffer of length at least ' + min);
     }
 }
+/** Cast u8 / u16 / u32 to u8. */
+function u8(arr) {
+    return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/** Cast u8 / u16 / u32 to u32. */
+function u32(arr) {
+    return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
+}
 /** Zeroize a byte array. Warning: JS provides no guarantees. */
 function clean$1(...arrays) {
     for (let i = 0; i < arrays.length; i++) {
@@ -138,6 +45,766 @@ function clean$1(...arrays) {
 }
 /** Create DataView of an array for easy byte-level manipulation. */
 function createView$1(arr) {
+    return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/** Is current platform little-endian? Most are. Big-Endian platform: IBM */
+const isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([0x11223344]).buffer)[0] === 0x44)();
+/**
+ * Converts string to bytes using UTF8 encoding.
+ * @example utf8ToBytes('abc') // new Uint8Array([97, 98, 99])
+ */
+function utf8ToBytes$1(str) {
+    if (typeof str !== 'string')
+        throw new Error('string expected');
+    return new Uint8Array(new TextEncoder().encode(str)); // https://bugzil.la/1681809
+}
+/**
+ * Normalizes (non-hex) string or Uint8Array to Uint8Array.
+ * Warning: when Uint8Array is passed, it would NOT get copied.
+ * Keep in mind for future mutable operations.
+ */
+function toBytes$1(data) {
+    if (typeof data === 'string')
+        data = utf8ToBytes$1(data);
+    else if (isBytes$1(data))
+        data = copyBytes(data);
+    else
+        throw new Error('Uint8Array expected, got ' + typeof data);
+    return data;
+}
+/** Compares 2 uint8array-s in kinda constant time. */
+function equalBytes(a, b) {
+    if (a.length !== b.length)
+        return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++)
+        diff |= a[i] ^ b[i];
+    return diff === 0;
+}
+/**
+ * Wraps a cipher: validates args, ensures encrypt() can only be called once.
+ * @__NO_SIDE_EFFECTS__
+ */
+const wrapCipher = (params, constructor) => {
+    function wrappedCipher(key, ...args) {
+        // Validate key
+        abytes$1(key);
+        // Big-Endian hardware is rare. Just in case someone still decides to run ciphers:
+        if (!isLE)
+            throw new Error('Non little-endian hardware is not yet supported');
+        // Validate nonce if nonceLength is present
+        if (params.nonceLength !== undefined) {
+            const nonce = args[0];
+            if (!nonce)
+                throw new Error('nonce / iv required');
+            if (params.varSizeNonce)
+                abytes$1(nonce);
+            else
+                abytes$1(nonce, params.nonceLength);
+        }
+        // Validate AAD if tagLength present
+        const tagl = params.tagLength;
+        if (tagl && args[1] !== undefined) {
+            abytes$1(args[1]);
+        }
+        const cipher = constructor(key, ...args);
+        const checkOutput = (fnLength, output) => {
+            if (output !== undefined) {
+                if (fnLength !== 2)
+                    throw new Error('cipher output not supported');
+                abytes$1(output);
+            }
+        };
+        // Create wrapped cipher with validation and single-use encryption
+        let called = false;
+        const wrCipher = {
+            encrypt(data, output) {
+                if (called)
+                    throw new Error('cannot encrypt() twice with same key + nonce');
+                called = true;
+                abytes$1(data);
+                checkOutput(cipher.encrypt.length, output);
+                return cipher.encrypt(data, output);
+            },
+            decrypt(data, output) {
+                abytes$1(data);
+                if (tagl && data.length < tagl)
+                    throw new Error('invalid ciphertext length: smaller than tagLength=' + tagl);
+                checkOutput(cipher.decrypt.length, output);
+                return cipher.decrypt(data, output);
+            },
+        };
+        return wrCipher;
+    }
+    Object.assign(wrappedCipher, params);
+    return wrappedCipher;
+};
+/**
+ * By default, returns u8a of length.
+ * When out is available, it checks it for validity and uses it.
+ */
+function getOutput(expectedLength, out, onlyAligned = true) {
+    if (out === undefined)
+        return new Uint8Array(expectedLength);
+    if (out.length !== expectedLength)
+        throw new Error('invalid output length, expected ' + expectedLength + ', got: ' + out.length);
+    if (onlyAligned && !isAligned32(out))
+        throw new Error('invalid output, must be aligned');
+    return out;
+}
+/** Polyfill for Safari 14. */
+function setBigUint64$1(view, byteOffset, value, isLE) {
+    if (typeof view.setBigUint64 === 'function')
+        return view.setBigUint64(byteOffset, value, isLE);
+    const _32n = BigInt(32);
+    const _u32_max = BigInt(0xffffffff);
+    const wh = Number((value >> _32n) & _u32_max);
+    const wl = Number(value & _u32_max);
+    const h = 0;
+    const l = 4;
+    view.setUint32(byteOffset + h, wh, isLE);
+    view.setUint32(byteOffset + l, wl, isLE);
+}
+function u64Lengths(dataLength, aadLength, isLE) {
+    const num = new Uint8Array(16);
+    const view = createView$1(num);
+    setBigUint64$1(view, 0, BigInt(aadLength), isLE);
+    setBigUint64$1(view, 8, BigInt(dataLength), isLE);
+    return num;
+}
+// Is byte array aligned to 4 byte offset (u32)?
+function isAligned32(bytes) {
+    return bytes.byteOffset % 4 === 0;
+}
+// copy bytes to new u8a (aligned). Because Buffer.slice is broken.
+function copyBytes(bytes) {
+    return Uint8Array.from(bytes);
+}
+
+/**
+ * GHash from AES-GCM and its little-endian "mirror image" Polyval from AES-SIV.
+ *
+ * Implemented in terms of GHash with conversion function for keys
+ * GCM GHASH from
+ * [NIST SP800-38d](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf),
+ * SIV from
+ * [RFC 8452](https://datatracker.ietf.org/doc/html/rfc8452).
+ *
+ * GHASH   modulo: x^128 + x^7   + x^2   + x     + 1
+ * POLYVAL modulo: x^128 + x^127 + x^126 + x^121 + 1
+ *
+ * @module
+ */
+// prettier-ignore
+const BLOCK_SIZE$1 = 16;
+// TODO: rewrite
+// temporary padding buffer
+const ZEROS16 = /* @__PURE__ */ new Uint8Array(16);
+const ZEROS32 = u32(ZEROS16);
+const POLY$1 = 0xe1; // v = 2*v % POLY
+// v = 2*v % POLY
+// NOTE: because x + x = 0 (add/sub is same), mul2(x) != x+x
+// We can multiply any number using montgomery ladder and this function (works as double, add is simple xor)
+const mul2$1 = (s0, s1, s2, s3) => {
+    const hiBit = s3 & 1;
+    return {
+        s3: (s2 << 31) | (s3 >>> 1),
+        s2: (s1 << 31) | (s2 >>> 1),
+        s1: (s0 << 31) | (s1 >>> 1),
+        s0: (s0 >>> 1) ^ ((POLY$1 << 24) & -(hiBit & 1)), // reduce % poly
+    };
+};
+const swapLE = (n) => (((n >>> 0) & 0xff) << 24) |
+    (((n >>> 8) & 0xff) << 16) |
+    (((n >>> 16) & 0xff) << 8) |
+    ((n >>> 24) & 0xff) |
+    0;
+/**
+ * `mulX_POLYVAL(ByteReverse(H))` from spec
+ * @param k mutated in place
+ */
+function _toGHASHKey(k) {
+    k.reverse();
+    const hiBit = k[15] & 1;
+    // k >>= 1
+    let carry = 0;
+    for (let i = 0; i < k.length; i++) {
+        const t = k[i];
+        k[i] = (t >>> 1) | carry;
+        carry = (t & 1) << 7;
+    }
+    k[0] ^= -hiBit & 0xe1; // if (hiBit) n ^= 0xe1000000000000000000000000000000;
+    return k;
+}
+const estimateWindow = (bytes) => {
+    if (bytes > 64 * 1024)
+        return 8;
+    if (bytes > 1024)
+        return 4;
+    return 2;
+};
+class GHASH {
+    // We select bits per window adaptively based on expectedLength
+    constructor(key, expectedLength) {
+        this.blockLen = BLOCK_SIZE$1;
+        this.outputLen = BLOCK_SIZE$1;
+        this.s0 = 0;
+        this.s1 = 0;
+        this.s2 = 0;
+        this.s3 = 0;
+        this.finished = false;
+        key = toBytes$1(key);
+        abytes$1(key, 16);
+        const kView = createView$1(key);
+        let k0 = kView.getUint32(0, false);
+        let k1 = kView.getUint32(4, false);
+        let k2 = kView.getUint32(8, false);
+        let k3 = kView.getUint32(12, false);
+        // generate table of doubled keys (half of montgomery ladder)
+        const doubles = [];
+        for (let i = 0; i < 128; i++) {
+            doubles.push({ s0: swapLE(k0), s1: swapLE(k1), s2: swapLE(k2), s3: swapLE(k3) });
+            ({ s0: k0, s1: k1, s2: k2, s3: k3 } = mul2$1(k0, k1, k2, k3));
+        }
+        const W = estimateWindow(expectedLength || 1024);
+        if (![1, 2, 4, 8].includes(W))
+            throw new Error('ghash: invalid window size, expected 2, 4 or 8');
+        this.W = W;
+        const bits = 128; // always 128 bits;
+        const windows = bits / W;
+        const windowSize = (this.windowSize = 2 ** W);
+        const items = [];
+        // Create precompute table for window of W bits
+        for (let w = 0; w < windows; w++) {
+            // truth table: 00, 01, 10, 11
+            for (let byte = 0; byte < windowSize; byte++) {
+                // prettier-ignore
+                let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                for (let j = 0; j < W; j++) {
+                    const bit = (byte >>> (W - j - 1)) & 1;
+                    if (!bit)
+                        continue;
+                    const { s0: d0, s1: d1, s2: d2, s3: d3 } = doubles[W * w + j];
+                    (s0 ^= d0), (s1 ^= d1), (s2 ^= d2), (s3 ^= d3);
+                }
+                items.push({ s0, s1, s2, s3 });
+            }
+        }
+        this.t = items;
+    }
+    _updateBlock(s0, s1, s2, s3) {
+        (s0 ^= this.s0), (s1 ^= this.s1), (s2 ^= this.s2), (s3 ^= this.s3);
+        const { W, t, windowSize } = this;
+        // prettier-ignore
+        let o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+        const mask = (1 << W) - 1; // 2**W will kill performance.
+        let w = 0;
+        for (const num of [s0, s1, s2, s3]) {
+            for (let bytePos = 0; bytePos < 4; bytePos++) {
+                const byte = (num >>> (8 * bytePos)) & 0xff;
+                for (let bitPos = 8 / W - 1; bitPos >= 0; bitPos--) {
+                    const bit = (byte >>> (W * bitPos)) & mask;
+                    const { s0: e0, s1: e1, s2: e2, s3: e3 } = t[w * windowSize + bit];
+                    (o0 ^= e0), (o1 ^= e1), (o2 ^= e2), (o3 ^= e3);
+                    w += 1;
+                }
+            }
+        }
+        this.s0 = o0;
+        this.s1 = o1;
+        this.s2 = o2;
+        this.s3 = o3;
+    }
+    update(data) {
+        aexists$1(this);
+        data = toBytes$1(data);
+        abytes$1(data);
+        const b32 = u32(data);
+        const blocks = Math.floor(data.length / BLOCK_SIZE$1);
+        const left = data.length % BLOCK_SIZE$1;
+        for (let i = 0; i < blocks; i++) {
+            this._updateBlock(b32[i * 4 + 0], b32[i * 4 + 1], b32[i * 4 + 2], b32[i * 4 + 3]);
+        }
+        if (left) {
+            ZEROS16.set(data.subarray(blocks * BLOCK_SIZE$1));
+            this._updateBlock(ZEROS32[0], ZEROS32[1], ZEROS32[2], ZEROS32[3]);
+            clean$1(ZEROS32); // clean tmp buffer
+        }
+        return this;
+    }
+    destroy() {
+        const { t } = this;
+        // clean precompute table
+        for (const elm of t) {
+            (elm.s0 = 0), (elm.s1 = 0), (elm.s2 = 0), (elm.s3 = 0);
+        }
+    }
+    digestInto(out) {
+        aexists$1(this);
+        aoutput$1(out, this);
+        this.finished = true;
+        const { s0, s1, s2, s3 } = this;
+        const o32 = u32(out);
+        o32[0] = s0;
+        o32[1] = s1;
+        o32[2] = s2;
+        o32[3] = s3;
+        return out;
+    }
+    digest() {
+        const res = new Uint8Array(BLOCK_SIZE$1);
+        this.digestInto(res);
+        this.destroy();
+        return res;
+    }
+}
+class Polyval extends GHASH {
+    constructor(key, expectedLength) {
+        key = toBytes$1(key);
+        abytes$1(key);
+        const ghKey = _toGHASHKey(copyBytes(key));
+        super(ghKey, expectedLength);
+        clean$1(ghKey);
+    }
+    update(data) {
+        data = toBytes$1(data);
+        aexists$1(this);
+        const b32 = u32(data);
+        const left = data.length % BLOCK_SIZE$1;
+        const blocks = Math.floor(data.length / BLOCK_SIZE$1);
+        for (let i = 0; i < blocks; i++) {
+            this._updateBlock(swapLE(b32[i * 4 + 3]), swapLE(b32[i * 4 + 2]), swapLE(b32[i * 4 + 1]), swapLE(b32[i * 4 + 0]));
+        }
+        if (left) {
+            ZEROS16.set(data.subarray(blocks * BLOCK_SIZE$1));
+            this._updateBlock(swapLE(ZEROS32[3]), swapLE(ZEROS32[2]), swapLE(ZEROS32[1]), swapLE(ZEROS32[0]));
+            clean$1(ZEROS32);
+        }
+        return this;
+    }
+    digestInto(out) {
+        aexists$1(this);
+        aoutput$1(out, this);
+        this.finished = true;
+        // tmp ugly hack
+        const { s0, s1, s2, s3 } = this;
+        const o32 = u32(out);
+        o32[0] = s0;
+        o32[1] = s1;
+        o32[2] = s2;
+        o32[3] = s3;
+        return out.reverse();
+    }
+}
+function wrapConstructorWithKey(hashCons) {
+    const hashC = (msg, key) => hashCons(key, msg.length).update(toBytes$1(msg)).digest();
+    const tmp = hashCons(new Uint8Array(16), 0);
+    hashC.outputLen = tmp.outputLen;
+    hashC.blockLen = tmp.blockLen;
+    hashC.create = (key, expectedLength) => hashCons(key, expectedLength);
+    return hashC;
+}
+/** GHash MAC for AES-GCM. */
+const ghash = wrapConstructorWithKey((key, expectedLength) => new GHASH(key, expectedLength));
+/** Polyval MAC for AES-SIV. */
+wrapConstructorWithKey((key, expectedLength) => new Polyval(key, expectedLength));
+
+/**
+ * [AES](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard)
+ * a.k.a. Advanced Encryption Standard
+ * is a variant of Rijndael block cipher, standardized by NIST in 2001.
+ * We provide the fastest available pure JS implementation.
+ *
+ * Data is split into 128-bit blocks. Encrypted in 10/12/14 rounds (128/192/256 bits). In every round:
+ * 1. **S-box**, table substitution
+ * 2. **Shift rows**, cyclic shift left of all rows of data array
+ * 3. **Mix columns**, multiplying every column by fixed polynomial
+ * 4. **Add round key**, round_key xor i-th column of array
+ *
+ * Check out [FIPS-197](https://csrc.nist.gov/files/pubs/fips/197/final/docs/fips-197.pdf)
+ * and [original proposal](https://csrc.nist.gov/csrc/media/projects/cryptographic-standards-and-guidelines/documents/aes-development/rijndael-ammended.pdf)
+ * @module
+ */
+const BLOCK_SIZE = 16;
+const BLOCK_SIZE32 = 4;
+const EMPTY_BLOCK = /* @__PURE__ */ new Uint8Array(BLOCK_SIZE);
+const POLY = 0x11b; // 1 + x + x**3 + x**4 + x**8
+// TODO: remove multiplication, binary ops only
+function mul2(n) {
+    return (n << 1) ^ (POLY & -(n >> 7));
+}
+function mul(a, b) {
+    let res = 0;
+    for (; b > 0; b >>= 1) {
+        // Montgomery ladder
+        res ^= a & -(b & 1); // if (b&1) res ^=a (but const-time).
+        a = mul2(a); // a = 2*a
+    }
+    return res;
+}
+// AES S-box is generated using finite field inversion,
+// an affine transform, and xor of a constant 0x63.
+const sbox = /* @__PURE__ */ (() => {
+    const t = new Uint8Array(256);
+    for (let i = 0, x = 1; i < 256; i++, x ^= mul2(x))
+        t[i] = x;
+    const box = new Uint8Array(256);
+    box[0] = 0x63; // first elm
+    for (let i = 0; i < 255; i++) {
+        let x = t[255 - i];
+        x |= x << 8;
+        box[t[i]] = (x ^ (x >> 4) ^ (x >> 5) ^ (x >> 6) ^ (x >> 7) ^ 0x63) & 0xff;
+    }
+    clean$1(t);
+    return box;
+})();
+// Rotate u32 by 8
+const rotr32_8 = (n) => (n << 24) | (n >>> 8);
+const rotl32_8 = (n) => (n << 8) | (n >>> 24);
+// T-table is optimization suggested in 5.2 of original proposal (missed from FIPS-197). Changes:
+// - LE instead of BE
+// - bigger tables: T0 and T1 are merged into T01 table and T2 & T3 into T23;
+//   so index is u16, instead of u8. This speeds up things, unexpectedly
+function genTtable(sbox, fn) {
+    if (sbox.length !== 256)
+        throw new Error('Wrong sbox length');
+    const T0 = new Uint32Array(256).map((_, j) => fn(sbox[j]));
+    const T1 = T0.map(rotl32_8);
+    const T2 = T1.map(rotl32_8);
+    const T3 = T2.map(rotl32_8);
+    const T01 = new Uint32Array(256 * 256);
+    const T23 = new Uint32Array(256 * 256);
+    const sbox2 = new Uint16Array(256 * 256);
+    for (let i = 0; i < 256; i++) {
+        for (let j = 0; j < 256; j++) {
+            const idx = i * 256 + j;
+            T01[idx] = T0[i] ^ T1[j];
+            T23[idx] = T2[i] ^ T3[j];
+            sbox2[idx] = (sbox[i] << 8) | sbox[j];
+        }
+    }
+    return { sbox, sbox2, T0, T1, T2, T3, T01, T23 };
+}
+const tableEncoding = /* @__PURE__ */ genTtable(sbox, (s) => (mul(s, 3) << 24) | (s << 16) | (s << 8) | mul(s, 2));
+const xPowers = /* @__PURE__ */ (() => {
+    const p = new Uint8Array(16);
+    for (let i = 0, x = 1; i < 16; i++, x = mul2(x))
+        p[i] = x;
+    return p;
+})();
+/** Key expansion used in CTR. */
+function expandKeyLE(key) {
+    abytes$1(key);
+    const len = key.length;
+    if (![16, 24, 32].includes(len))
+        throw new Error('aes: invalid key size, should be 16, 24 or 32, got ' + len);
+    const { sbox2 } = tableEncoding;
+    const toClean = [];
+    if (!isAligned32(key))
+        toClean.push((key = copyBytes(key)));
+    const k32 = u32(key);
+    const Nk = k32.length;
+    const subByte = (n) => applySbox(sbox2, n, n, n, n);
+    const xk = new Uint32Array(len + 28); // expanded key
+    xk.set(k32);
+    // 4.3.1 Key expansion
+    for (let i = Nk; i < xk.length; i++) {
+        let t = xk[i - 1];
+        if (i % Nk === 0)
+            t = subByte(rotr32_8(t)) ^ xPowers[i / Nk - 1];
+        else if (Nk > 6 && i % Nk === 4)
+            t = subByte(t);
+        xk[i] = xk[i - Nk] ^ t;
+    }
+    clean$1(...toClean);
+    return xk;
+}
+// Apply tables
+function apply0123(T01, T23, s0, s1, s2, s3) {
+    return (T01[((s0 << 8) & 0xff00) | ((s1 >>> 8) & 0xff)] ^
+        T23[((s2 >>> 8) & 0xff00) | ((s3 >>> 24) & 0xff)]);
+}
+function applySbox(sbox2, s0, s1, s2, s3) {
+    return (sbox2[(s0 & 0xff) | (s1 & 0xff00)] |
+        (sbox2[((s2 >>> 16) & 0xff) | ((s3 >>> 16) & 0xff00)] << 16));
+}
+function encrypt$1(xk, s0, s1, s2, s3) {
+    const { sbox2, T01, T23 } = tableEncoding;
+    let k = 0;
+    (s0 ^= xk[k++]), (s1 ^= xk[k++]), (s2 ^= xk[k++]), (s3 ^= xk[k++]);
+    const rounds = xk.length / 4 - 2;
+    for (let i = 0; i < rounds; i++) {
+        const t0 = xk[k++] ^ apply0123(T01, T23, s0, s1, s2, s3);
+        const t1 = xk[k++] ^ apply0123(T01, T23, s1, s2, s3, s0);
+        const t2 = xk[k++] ^ apply0123(T01, T23, s2, s3, s0, s1);
+        const t3 = xk[k++] ^ apply0123(T01, T23, s3, s0, s1, s2);
+        (s0 = t0), (s1 = t1), (s2 = t2), (s3 = t3);
+    }
+    // last round (without mixcolumns, so using SBOX2 table)
+    const t0 = xk[k++] ^ applySbox(sbox2, s0, s1, s2, s3);
+    const t1 = xk[k++] ^ applySbox(sbox2, s1, s2, s3, s0);
+    const t2 = xk[k++] ^ applySbox(sbox2, s2, s3, s0, s1);
+    const t3 = xk[k++] ^ applySbox(sbox2, s3, s0, s1, s2);
+    return { s0: t0, s1: t1, s2: t2, s3: t3 };
+}
+// AES CTR with overflowing 32 bit counter
+// It's possible to do 32le significantly simpler (and probably faster) by using u32.
+// But, we need both, and perf bottleneck is in ghash anyway.
+function ctr32(xk, isLE, nonce, src, dst) {
+    abytes$1(nonce, BLOCK_SIZE);
+    abytes$1(src);
+    dst = getOutput(src.length, dst);
+    const ctr = nonce; // write new value to nonce, so it can be re-used
+    const c32 = u32(ctr);
+    const view = createView$1(ctr);
+    const src32 = u32(src);
+    const dst32 = u32(dst);
+    const ctrPos = isLE ? 0 : 12;
+    const srcLen = src.length;
+    // Fill block (empty, ctr=0)
+    let ctrNum = view.getUint32(ctrPos, isLE); // read current counter value
+    let { s0, s1, s2, s3 } = encrypt$1(xk, c32[0], c32[1], c32[2], c32[3]);
+    // process blocks
+    for (let i = 0; i + 4 <= src32.length; i += 4) {
+        dst32[i + 0] = src32[i + 0] ^ s0;
+        dst32[i + 1] = src32[i + 1] ^ s1;
+        dst32[i + 2] = src32[i + 2] ^ s2;
+        dst32[i + 3] = src32[i + 3] ^ s3;
+        ctrNum = (ctrNum + 1) >>> 0; // u32 wrap
+        view.setUint32(ctrPos, ctrNum, isLE);
+        ({ s0, s1, s2, s3 } = encrypt$1(xk, c32[0], c32[1], c32[2], c32[3]));
+    }
+    // leftovers (less than a block)
+    const start = BLOCK_SIZE * Math.floor(src32.length / BLOCK_SIZE32);
+    if (start < srcLen) {
+        const b32 = new Uint32Array([s0, s1, s2, s3]);
+        const buf = u8(b32);
+        for (let i = start, pos = 0; i < srcLen; i++, pos++)
+            dst[i] = src[i] ^ buf[pos];
+        clean$1(b32);
+    }
+    return dst;
+}
+// TODO: merge with chacha, however gcm has bitLen while chacha has byteLen
+function computeTag(fn, isLE, key, data, AAD) {
+    const aadLength = AAD ? AAD.length : 0;
+    const h = fn.create(key, data.length + aadLength);
+    if (AAD)
+        h.update(AAD);
+    const num = u64Lengths(8 * data.length, 8 * aadLength, isLE);
+    h.update(data);
+    h.update(num);
+    const res = h.digest();
+    clean$1(num);
+    return res;
+}
+/**
+ * GCM: Galois/Counter Mode.
+ * Modern, parallel version of CTR, with MAC.
+ * Be careful: MACs can be forged.
+ * Unsafe to use random nonces under the same key, due to collision chance.
+ * As for nonce size, prefer 12-byte, instead of 8-byte.
+ */
+const gcm = /* @__PURE__ */ wrapCipher({ blockSize: 16, nonceLength: 12, tagLength: 16, varSizeNonce: true }, function aesgcm(key, nonce, AAD) {
+    // NIST 800-38d doesn't enforce minimum nonce length.
+    // We enforce 8 bytes for compat with openssl.
+    // 12 bytes are recommended. More than 12 bytes would be converted into 12.
+    if (nonce.length < 8)
+        throw new Error('aes/gcm: invalid nonce length');
+    const tagLength = 16;
+    function _computeTag(authKey, tagMask, data) {
+        const tag = computeTag(ghash, false, authKey, data, AAD);
+        for (let i = 0; i < tagMask.length; i++)
+            tag[i] ^= tagMask[i];
+        return tag;
+    }
+    function deriveKeys() {
+        const xk = expandKeyLE(key);
+        const authKey = EMPTY_BLOCK.slice();
+        const counter = EMPTY_BLOCK.slice();
+        ctr32(xk, false, counter, counter, authKey);
+        // NIST 800-38d, page 15: different behavior for 96-bit and non-96-bit nonces
+        if (nonce.length === 12) {
+            counter.set(nonce);
+        }
+        else {
+            const nonceLen = EMPTY_BLOCK.slice();
+            const view = createView$1(nonceLen);
+            setBigUint64$1(view, 8, BigInt(nonce.length * 8), false);
+            // ghash(nonce || u64be(0) || u64be(nonceLen*8))
+            const g = ghash.create(authKey).update(nonce).update(nonceLen);
+            g.digestInto(counter); // digestInto doesn't trigger '.destroy'
+            g.destroy();
+        }
+        const tagMask = ctr32(xk, false, counter, EMPTY_BLOCK);
+        return { xk, authKey, counter, tagMask };
+    }
+    return {
+        encrypt(plaintext) {
+            const { xk, authKey, counter, tagMask } = deriveKeys();
+            const out = new Uint8Array(plaintext.length + tagLength);
+            const toClean = [xk, authKey, counter, tagMask];
+            if (!isAligned32(plaintext))
+                toClean.push((plaintext = copyBytes(plaintext)));
+            ctr32(xk, false, counter, plaintext, out.subarray(0, plaintext.length));
+            const tag = _computeTag(authKey, tagMask, out.subarray(0, out.length - tagLength));
+            toClean.push(tag);
+            out.set(tag, plaintext.length);
+            clean$1(...toClean);
+            return out;
+        },
+        decrypt(ciphertext) {
+            const { xk, authKey, counter, tagMask } = deriveKeys();
+            const toClean = [xk, authKey, tagMask, counter];
+            if (!isAligned32(ciphertext))
+                toClean.push((ciphertext = copyBytes(ciphertext)));
+            const data = ciphertext.subarray(0, -tagLength);
+            const passedTag = ciphertext.subarray(-tagLength);
+            const tag = _computeTag(authKey, tagMask, data);
+            toClean.push(tag);
+            if (!equalBytes(tag, passedTag))
+                throw new Error('aes/gcm: invalid ghash tag');
+            const out = ctr32(xk, false, counter, data);
+            clean$1(...toClean);
+            return out;
+        },
+    };
+});
+
+const crypto$3 = typeof globalThis === 'object' && 'crypto' in globalThis ? globalThis.crypto : undefined;
+
+/**
+ * WebCrypto-based AES gcm/ctr/cbc, `managedNonce` and `randomBytes`.
+ * We use WebCrypto aka globalThis.crypto, which exists in browsers and node.js 16+.
+ * node.js versions earlier than v19 don't declare it in global scope.
+ * For node.js, package.js on#exports field mapping rewrites import
+ * from `crypto` to `cryptoNode`, which imports native module.
+ * Makes the utils un-importable in browsers without a bundler.
+ * Once node.js 18 is deprecated, we can just drop the import.
+ * @module
+ */
+// Use full path so that Node.js can rewrite it to `cryptoNode.js`.
+/**
+ * Secure PRNG. Uses `crypto.getRandomValues`, which defers to OS.
+ */
+function randomBytes$1(bytesLength = 32) {
+    if (crypto$3 && typeof crypto$3.getRandomValues === 'function') {
+        return crypto$3.getRandomValues(new Uint8Array(bytesLength));
+    }
+    // Legacy Node.js compatibility
+    if (crypto$3 && typeof crypto$3.randomBytes === 'function') {
+        return Uint8Array.from(crypto$3.randomBytes(bytesLength));
+    }
+    throw new Error('crypto.getRandomValues must be defined');
+}
+// // Type tests
+// import { siv, gcm, ctr, ecb, cbc } from '../aes.ts';
+// import { xsalsa20poly1305 } from '../salsa.ts';
+// import { chacha20poly1305, xchacha20poly1305 } from '../chacha.ts';
+// const wsiv = managedNonce(siv);
+// const wgcm = managedNonce(gcm);
+// const wctr = managedNonce(ctr);
+// const wcbc = managedNonce(cbc);
+// const wsalsapoly = managedNonce(xsalsa20poly1305);
+// const wchacha = managedNonce(chacha20poly1305);
+// const wxchacha = managedNonce(xchacha20poly1305);
+// // should fail
+// const wcbc2 = managedNonce(managedNonce(cbc));
+// const wctr = managedNonce(ctr);
+
+const IV_LENGTH = 12;
+function base64Decode$1(s) {
+    return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function base64Encode$1(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+}
+function getIv() {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+        return crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+    }
+    return randomBytes$1(IV_LENGTH);
+}
+function encrypt(plaintext, key) {
+    const keyBytes = base64Decode$1(key);
+    const ivBytes = getIv();
+    const plainBytes = new TextEncoder().encode(plaintext);
+    const aes = gcm(keyBytes, ivBytes);
+    const combined = aes.encrypt(plainBytes);
+    const result = new Uint8Array(ivBytes.length + combined.length);
+    result.set(ivBytes, 0);
+    result.set(combined, ivBytes.length);
+    return base64Encode$1(result);
+}
+function decrypt(data, key) {
+    const keyBytes = base64Decode$1(key);
+    const raw = base64Decode$1(data);
+    const ivBytes = raw.slice(0, IV_LENGTH);
+    const combined = raw.slice(IV_LENGTH);
+    const aes = gcm(keyBytes, ivBytes);
+    const plainBytes = aes.decrypt(combined);
+    return new TextDecoder().decode(plainBytes);
+}
+
+const crypto$2 = typeof globalThis === 'object' && 'crypto' in globalThis ? globalThis.crypto : undefined;
+
+/**
+ * Utilities for hex, bytes, CSPRNG.
+ * @module
+ */
+/*! noble-hashes - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+// We use WebCrypto aka globalThis.crypto, which exists in browsers and node.js 16+.
+// node.js versions earlier than v19 don't declare it in global scope.
+// For node.js, package.json#exports field mapping rewrites import
+// from `crypto` to `cryptoNode`, which imports native module.
+// Makes the utils un-importable in browsers without a bundler.
+// Once node.js 18 is deprecated (2025-04-30), we can just drop the import.
+/** Checks if something is Uint8Array. Be careful: nodejs Buffer will return true. */
+function isBytes(a) {
+    return a instanceof Uint8Array || (ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array');
+}
+/** Asserts something is positive integer. */
+function anumber(n) {
+    if (!Number.isSafeInteger(n) || n < 0)
+        throw new Error('positive integer expected, got ' + n);
+}
+/** Asserts something is Uint8Array. */
+function abytes(b, ...lengths) {
+    if (!isBytes(b))
+        throw new Error('Uint8Array expected');
+    if (lengths.length > 0 && !lengths.includes(b.length))
+        throw new Error('Uint8Array expected of length ' + lengths + ', got length=' + b.length);
+}
+/** Asserts something is hash */
+function ahash(h) {
+    if (typeof h !== 'function' || typeof h.create !== 'function')
+        throw new Error('Hash should be wrapped by utils.createHasher');
+    anumber(h.outputLen);
+    anumber(h.blockLen);
+}
+/** Asserts a hash instance has not been destroyed / finished */
+function aexists(instance, checkFinished = true) {
+    if (instance.destroyed)
+        throw new Error('Hash instance has been destroyed');
+    if (checkFinished && instance.finished)
+        throw new Error('Hash#digest() has already been called');
+}
+/** Asserts output is properly-sized byte array */
+function aoutput(out, instance) {
+    abytes(out);
+    const min = instance.outputLen;
+    if (out.length < min) {
+        throw new Error('digestInto() expects output buffer of length at least ' + min);
+    }
+}
+/** Zeroize a byte array. Warning: JS provides no guarantees. */
+function clean(...arrays) {
+    for (let i = 0; i < arrays.length; i++) {
+        arrays[i].fill(0);
+    }
+}
+/** Create DataView of an array for easy byte-level manipulation. */
+function createView(arr) {
     return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
 }
 /** The rotate right (circular right shift) operation for uint32 */
@@ -159,7 +826,7 @@ const hexes = /* @__PURE__ */ Array.from({ length: 256 }, (_, i) => i.toString(1
  * @example bytesToHex(Uint8Array.from([0xca, 0xfe, 0x01, 0x23])) // 'cafe0123'
  */
 function bytesToHex$1(bytes) {
-    abytes$1(bytes);
+    abytes(bytes);
     // @ts-ignore
     if (hasHexBuiltin)
         return bytes.toHex();
@@ -211,7 +878,7 @@ function hexToBytes(hex) {
  * Converts string to bytes using UTF8 encoding.
  * @example utf8ToBytes('abc') // Uint8Array.from([97, 98, 99])
  */
-function utf8ToBytes$1(str) {
+function utf8ToBytes(str) {
     if (typeof str !== 'string')
         throw new Error('string expected');
     return new Uint8Array(new TextEncoder().encode(str)); // https://bugzil.la/1681809
@@ -221,10 +888,10 @@ function utf8ToBytes$1(str) {
  * Warning: when Uint8Array is passed, it would NOT get copied.
  * Keep in mind for future mutable operations.
  */
-function toBytes$1(data) {
+function toBytes(data) {
     if (typeof data === 'string')
-        data = utf8ToBytes$1(data);
-    abytes$1(data);
+        data = utf8ToBytes(data);
+    abytes(data);
     return data;
 }
 /** Copies several Uint8Arrays into one. */
@@ -232,7 +899,7 @@ function concatBytes(...arrays) {
     let sum = 0;
     for (let i = 0; i < arrays.length; i++) {
         const a = arrays[i];
-        abytes$1(a);
+        abytes(a);
         sum += a.length;
     }
     const res = new Uint8Array(sum);
@@ -248,7 +915,7 @@ class Hash {
 }
 /** Wraps hash function, creating an interface on top of it */
 function createHasher(hashCons) {
-    const hashC = (msg) => hashCons().update(toBytes$1(msg)).digest();
+    const hashC = (msg) => hashCons().update(toBytes(msg)).digest();
     const tmp = hashCons();
     hashC.outputLen = tmp.outputLen;
     hashC.blockLen = tmp.blockLen;
@@ -256,7 +923,7 @@ function createHasher(hashCons) {
     return hashC;
 }
 /** Cryptographically secure PRNG. Uses internal OS-level `crypto.getRandomValues`. */
-function randomBytes$1(bytesLength = 32) {
+function randomBytes(bytesLength = 32) {
     if (crypto$2 && typeof crypto$2.getRandomValues === 'function') {
         return crypto$2.getRandomValues(new Uint8Array(bytesLength));
     }
@@ -285,7 +952,7 @@ function _abool2(value, title = '') {
 // tmp name until v2
 /** Asserts something is Uint8Array. */
 function _abytes2(value, length, title = '') {
-    const bytes = isBytes$1(value);
+    const bytes = isBytes(value);
     const len = value?.length;
     const needsLen = length !== undefined;
     if (!bytes || (needsLen && len !== length)) {
@@ -311,7 +978,7 @@ function bytesToNumberBE(bytes) {
     return hexToNumber(bytesToHex$1(bytes));
 }
 function bytesToNumberLE(bytes) {
-    abytes$1(bytes);
+    abytes(bytes);
     return hexToNumber(bytesToHex$1(Uint8Array.from(bytes).reverse()));
 }
 function numberToBytesBE(n, len) {
@@ -339,7 +1006,7 @@ function ensureBytes(title, hex, expectedLength) {
             throw new Error(title + ' must be hex string or Uint8Array, cause: ' + e);
         }
     }
-    else if (isBytes$1(hex)) {
+    else if (isBytes(hex)) {
         // Uint8Array.from() instead of hash.slice() because node.js Buffer
         // is instance of Uint8Array, and its slice() creates **mutable** copy
         res = Uint8Array.from(hex);
@@ -949,7 +1616,7 @@ function mapHashToField(key, fieldOrder, isLE = false) {
  * @module
  */
 /** Polyfill for Safari 14. https://caniuse.com/mdn-javascript_builtins_dataview_setbiguint64 */
-function setBigUint64$1(view, byteOffset, value, isLE) {
+function setBigUint64(view, byteOffset, value, isLE) {
     if (typeof view.setBigUint64 === 'function')
         return view.setBigUint64(byteOffset, value, isLE);
     const _32n = BigInt(32);
@@ -985,19 +1652,19 @@ class HashMD extends Hash {
         this.padOffset = padOffset;
         this.isLE = isLE;
         this.buffer = new Uint8Array(blockLen);
-        this.view = createView$1(this.buffer);
+        this.view = createView(this.buffer);
     }
     update(data) {
-        aexists$1(this);
-        data = toBytes$1(data);
-        abytes$1(data);
+        aexists(this);
+        data = toBytes(data);
+        abytes(data);
         const { view, buffer, blockLen } = this;
         const len = data.length;
         for (let pos = 0; pos < len;) {
             const take = Math.min(blockLen - this.pos, len - pos);
             // Fast path: we have at least one block in input, cast it to view and process
             if (take === blockLen) {
-                const dataView = createView$1(data);
+                const dataView = createView(data);
                 for (; blockLen <= len - pos; pos += blockLen)
                     this.process(dataView, pos);
                 continue;
@@ -1015,8 +1682,8 @@ class HashMD extends Hash {
         return this;
     }
     digestInto(out) {
-        aexists$1(this);
-        aoutput$1(out, this);
+        aexists(this);
+        aoutput(out, this);
         this.finished = true;
         // Padding
         // We can avoid allocation of buffer for padding completely if it
@@ -1025,7 +1692,7 @@ class HashMD extends Hash {
         let { pos } = this;
         // append the bit '1' to the message
         buffer[pos++] = 0b10000000;
-        clean$1(this.buffer.subarray(pos));
+        clean(this.buffer.subarray(pos));
         // we have less than padOffset left in buffer, so we cannot put length in
         // current block, need process it and pad again
         if (this.padOffset > blockLen - pos) {
@@ -1038,9 +1705,9 @@ class HashMD extends Hash {
         // Note: sha512 requires length to be 128bit integer, but length in JS will overflow before that
         // You need to write around 2 exabytes (u64_max / 8 / (1024**6)) for this to happen.
         // So we just write lowest 64 bits of that value.
-        setBigUint64$1(view, blockLen - 8, BigInt(this.length * 8), isLE);
+        setBigUint64(view, blockLen - 8, BigInt(this.length * 8), isLE);
         this.process(view, 0);
-        const oview = createView$1(out);
+        const oview = createView(out);
         const len = this.outputLen;
         // NOTE: we do division by 4 later, which should be fused in single op with modulo by JIT
         if (len % 4)
@@ -1231,11 +1898,11 @@ class SHA256 extends HashMD {
         this.set(A, B, C, D, E, F, G, H);
     }
     roundClean() {
-        clean$1(SHA256_W);
+        clean(SHA256_W);
     }
     destroy() {
         this.set(0, 0, 0, 0, 0, 0, 0, 0);
-        clean$1(this.buffer);
+        clean(this.buffer);
     }
 }
 // SHA2-512 is slower than sha256 in js because u64 operations are slow.
@@ -1387,10 +2054,10 @@ class SHA512 extends HashMD {
         this.set(Ah, Al, Bh, Bl, Ch, Cl, Dh, Dl, Eh, El, Fh, Fl, Gh, Gl, Hh, Hl);
     }
     roundClean() {
-        clean$1(SHA512_W_H, SHA512_W_L);
+        clean(SHA512_W_H, SHA512_W_L);
     }
     destroy() {
-        clean$1(this.buffer);
+        clean(this.buffer);
         this.set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 }
@@ -1438,7 +2105,7 @@ class HMAC extends Hash {
         this.finished = false;
         this.destroyed = false;
         ahash(hash);
-        const key = toBytes$1(_key);
+        const key = toBytes(_key);
         this.iHash = hash.create();
         if (typeof this.iHash.update !== 'function')
             throw new Error('Expected instance of class which extends utils.Hash');
@@ -1457,16 +2124,16 @@ class HMAC extends Hash {
         for (let i = 0; i < pad.length; i++)
             pad[i] ^= 0x36 ^ 0x5c;
         this.oHash.update(pad);
-        clean$1(pad);
+        clean(pad);
     }
     update(buf) {
-        aexists$1(this);
+        aexists(this);
         this.iHash.update(buf);
         return this;
     }
     digestInto(out) {
-        aexists$1(this);
-        abytes$1(out, this.outputLen);
+        aexists(this);
+        abytes(out, this.outputLen);
         this.finished = true;
         this.iHash.digestInto(out);
         this.oHash.update(out);
@@ -2614,7 +3281,7 @@ function getWLengths(Fp, Fn) {
  */
 function ecdh(Point, ecdhOpts = {}) {
     const { Fn } = Point;
-    const randomBytes_ = ecdhOpts.randomBytes || randomBytes$1;
+    const randomBytes_ = ecdhOpts.randomBytes || randomBytes;
     const lengths = Object.assign(getWLengths(Point.Fp, Fn), { seed: getMinHashLength(Fn.ORDER) });
     function isValidSecretKey(secretKey) {
         try {
@@ -2727,7 +3394,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
         bits2int: 'function',
         bits2int_modN: 'function',
     });
-    const randomBytes = ecdsaOpts.randomBytes || randomBytes$1;
+    const randomBytes$1 = ecdsaOpts.randomBytes || randomBytes;
     const hmac$1 = ecdsaOpts.hmac ||
         ((key, ...msgs) => hmac(hash, key, concatBytes(...msgs)));
     const { Fp, Fn } = Point;
@@ -2919,7 +3586,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
         if (extraEntropy != null && extraEntropy !== false) {
             // K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1) || k')
             // gen random bytes OR pass as-is
-            const e = extraEntropy === true ? randomBytes(lengths.secretKey) : extraEntropy;
+            const e = extraEntropy === true ? randomBytes$1(lengths.secretKey) : extraEntropy;
             seedArgs.push(ensureBytes('extraEntropy', e)); // check for being bytes
         }
         const seed = concatBytes(...seedArgs); // Step D of RFC6979 3.2
@@ -2977,7 +3644,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
     function tryParsingSig(sg) {
         // Try to deduce format
         let sig = undefined;
-        const isHex = typeof sg === 'string' || isBytes$1(sg);
+        const isHex = typeof sg === 'string' || isBytes(sg);
         const isObj = !isHex &&
             sg !== null &&
             typeof sg === 'object' &&
@@ -3216,25 +3883,25 @@ createCurve({ ...p521_CURVE, Fp: Fp521, lowS: false, allowedPrivateKeyLengths: [
 /** @deprecated use `import { p256 } from '@noble/curves/nist.js';` */
 const secp256r1 = p256;
 
-function base64Encode$1(bytes) {
+function base64Encode(bytes) {
     return btoa(String.fromCharCode(...bytes));
 }
-function base64Decode$1(s) {
+function base64Decode(s) {
     return Uint8Array.from(atob(s), c => c.charCodeAt(0));
 }
 function generateKeyPair() {
     const privateKey = secp256r1.utils.randomPrivateKey();
     const publicKey = secp256r1.getPublicKey(privateKey, false);
     return {
-        publicKey: base64Encode$1(publicKey),
-        privateKey: base64Encode$1(privateKey),
+        publicKey: base64Encode(publicKey),
+        privateKey: base64Encode(privateKey),
     };
 }
 function computeSharedSecret(privateKey, publicKey) {
-    const priv = base64Decode$1(privateKey);
-    const pub = base64Decode$1(publicKey);
+    const priv = base64Decode(privateKey);
+    const pub = base64Decode(publicKey);
     const shared = secp256r1.getSharedSecret(priv, pub);
-    return base64Encode$1(shared);
+    return base64Encode(shared);
 }
 
 /**
@@ -3263,753 +3930,10 @@ function hkdfDerive(localKey, remoteKey) {
     return btoa(String.fromCharCode(...okm));
 }
 
-/**
- * Utilities for hex, bytes, CSPRNG.
- * @module
- */
-/*! noble-ciphers - MIT License (c) 2023 Paul Miller (paulmillr.com) */
-/** Checks if something is Uint8Array. Be careful: nodejs Buffer will return true. */
-function isBytes(a) {
-    return a instanceof Uint8Array || (ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array');
-}
-/** Asserts something is Uint8Array. */
-function abytes(b, ...lengths) {
-    if (!isBytes(b))
-        throw new Error('Uint8Array expected');
-    if (lengths.length > 0 && !lengths.includes(b.length))
-        throw new Error('Uint8Array expected of length ' + lengths + ', got length=' + b.length);
-}
-/** Asserts a hash instance has not been destroyed / finished */
-function aexists(instance, checkFinished = true) {
-    if (instance.destroyed)
-        throw new Error('Hash instance has been destroyed');
-    if (checkFinished && instance.finished)
-        throw new Error('Hash#digest() has already been called');
-}
-/** Asserts output is properly-sized byte array */
-function aoutput(out, instance) {
-    abytes(out);
-    const min = instance.outputLen;
-    if (out.length < min) {
-        throw new Error('digestInto() expects output buffer of length at least ' + min);
-    }
-}
-/** Cast u8 / u16 / u32 to u8. */
-function u8(arr) {
-    return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
-}
-/** Cast u8 / u16 / u32 to u32. */
-function u32(arr) {
-    return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
-}
-/** Zeroize a byte array. Warning: JS provides no guarantees. */
-function clean(...arrays) {
-    for (let i = 0; i < arrays.length; i++) {
-        arrays[i].fill(0);
-    }
-}
-/** Create DataView of an array for easy byte-level manipulation. */
-function createView(arr) {
-    return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
-}
-/** Is current platform little-endian? Most are. Big-Endian platform: IBM */
-const isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([0x11223344]).buffer)[0] === 0x44)();
-/**
- * Converts string to bytes using UTF8 encoding.
- * @example utf8ToBytes('abc') // new Uint8Array([97, 98, 99])
- */
-function utf8ToBytes(str) {
-    if (typeof str !== 'string')
-        throw new Error('string expected');
-    return new Uint8Array(new TextEncoder().encode(str)); // https://bugzil.la/1681809
-}
-/**
- * Normalizes (non-hex) string or Uint8Array to Uint8Array.
- * Warning: when Uint8Array is passed, it would NOT get copied.
- * Keep in mind for future mutable operations.
- */
-function toBytes(data) {
-    if (typeof data === 'string')
-        data = utf8ToBytes(data);
-    else if (isBytes(data))
-        data = copyBytes(data);
-    else
-        throw new Error('Uint8Array expected, got ' + typeof data);
-    return data;
-}
-/** Compares 2 uint8array-s in kinda constant time. */
-function equalBytes(a, b) {
-    if (a.length !== b.length)
-        return false;
-    let diff = 0;
-    for (let i = 0; i < a.length; i++)
-        diff |= a[i] ^ b[i];
-    return diff === 0;
-}
-/**
- * Wraps a cipher: validates args, ensures encrypt() can only be called once.
- * @__NO_SIDE_EFFECTS__
- */
-const wrapCipher = (params, constructor) => {
-    function wrappedCipher(key, ...args) {
-        // Validate key
-        abytes(key);
-        // Big-Endian hardware is rare. Just in case someone still decides to run ciphers:
-        if (!isLE)
-            throw new Error('Non little-endian hardware is not yet supported');
-        // Validate nonce if nonceLength is present
-        if (params.nonceLength !== undefined) {
-            const nonce = args[0];
-            if (!nonce)
-                throw new Error('nonce / iv required');
-            if (params.varSizeNonce)
-                abytes(nonce);
-            else
-                abytes(nonce, params.nonceLength);
-        }
-        // Validate AAD if tagLength present
-        const tagl = params.tagLength;
-        if (tagl && args[1] !== undefined) {
-            abytes(args[1]);
-        }
-        const cipher = constructor(key, ...args);
-        const checkOutput = (fnLength, output) => {
-            if (output !== undefined) {
-                if (fnLength !== 2)
-                    throw new Error('cipher output not supported');
-                abytes(output);
-            }
-        };
-        // Create wrapped cipher with validation and single-use encryption
-        let called = false;
-        const wrCipher = {
-            encrypt(data, output) {
-                if (called)
-                    throw new Error('cannot encrypt() twice with same key + nonce');
-                called = true;
-                abytes(data);
-                checkOutput(cipher.encrypt.length, output);
-                return cipher.encrypt(data, output);
-            },
-            decrypt(data, output) {
-                abytes(data);
-                if (tagl && data.length < tagl)
-                    throw new Error('invalid ciphertext length: smaller than tagLength=' + tagl);
-                checkOutput(cipher.decrypt.length, output);
-                return cipher.decrypt(data, output);
-            },
-        };
-        return wrCipher;
-    }
-    Object.assign(wrappedCipher, params);
-    return wrappedCipher;
-};
-/**
- * By default, returns u8a of length.
- * When out is available, it checks it for validity and uses it.
- */
-function getOutput(expectedLength, out, onlyAligned = true) {
-    if (out === undefined)
-        return new Uint8Array(expectedLength);
-    if (out.length !== expectedLength)
-        throw new Error('invalid output length, expected ' + expectedLength + ', got: ' + out.length);
-    if (onlyAligned && !isAligned32(out))
-        throw new Error('invalid output, must be aligned');
-    return out;
-}
-/** Polyfill for Safari 14. */
-function setBigUint64(view, byteOffset, value, isLE) {
-    if (typeof view.setBigUint64 === 'function')
-        return view.setBigUint64(byteOffset, value, isLE);
-    const _32n = BigInt(32);
-    const _u32_max = BigInt(0xffffffff);
-    const wh = Number((value >> _32n) & _u32_max);
-    const wl = Number(value & _u32_max);
-    const h = 0;
-    const l = 4;
-    view.setUint32(byteOffset + h, wh, isLE);
-    view.setUint32(byteOffset + l, wl, isLE);
-}
-function u64Lengths(dataLength, aadLength, isLE) {
-    const num = new Uint8Array(16);
-    const view = createView(num);
-    setBigUint64(view, 0, BigInt(aadLength), isLE);
-    setBigUint64(view, 8, BigInt(dataLength), isLE);
-    return num;
-}
-// Is byte array aligned to 4 byte offset (u32)?
-function isAligned32(bytes) {
-    return bytes.byteOffset % 4 === 0;
-}
-// copy bytes to new u8a (aligned). Because Buffer.slice is broken.
-function copyBytes(bytes) {
-    return Uint8Array.from(bytes);
-}
-
-/**
- * GHash from AES-GCM and its little-endian "mirror image" Polyval from AES-SIV.
- *
- * Implemented in terms of GHash with conversion function for keys
- * GCM GHASH from
- * [NIST SP800-38d](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf),
- * SIV from
- * [RFC 8452](https://datatracker.ietf.org/doc/html/rfc8452).
- *
- * GHASH   modulo: x^128 + x^7   + x^2   + x     + 1
- * POLYVAL modulo: x^128 + x^127 + x^126 + x^121 + 1
- *
- * @module
- */
-// prettier-ignore
-const BLOCK_SIZE$1 = 16;
-// TODO: rewrite
-// temporary padding buffer
-const ZEROS16 = /* @__PURE__ */ new Uint8Array(16);
-const ZEROS32 = u32(ZEROS16);
-const POLY$1 = 0xe1; // v = 2*v % POLY
-// v = 2*v % POLY
-// NOTE: because x + x = 0 (add/sub is same), mul2(x) != x+x
-// We can multiply any number using montgomery ladder and this function (works as double, add is simple xor)
-const mul2$1 = (s0, s1, s2, s3) => {
-    const hiBit = s3 & 1;
-    return {
-        s3: (s2 << 31) | (s3 >>> 1),
-        s2: (s1 << 31) | (s2 >>> 1),
-        s1: (s0 << 31) | (s1 >>> 1),
-        s0: (s0 >>> 1) ^ ((POLY$1 << 24) & -(hiBit & 1)), // reduce % poly
-    };
-};
-const swapLE = (n) => (((n >>> 0) & 0xff) << 24) |
-    (((n >>> 8) & 0xff) << 16) |
-    (((n >>> 16) & 0xff) << 8) |
-    ((n >>> 24) & 0xff) |
-    0;
-/**
- * `mulX_POLYVAL(ByteReverse(H))` from spec
- * @param k mutated in place
- */
-function _toGHASHKey(k) {
-    k.reverse();
-    const hiBit = k[15] & 1;
-    // k >>= 1
-    let carry = 0;
-    for (let i = 0; i < k.length; i++) {
-        const t = k[i];
-        k[i] = (t >>> 1) | carry;
-        carry = (t & 1) << 7;
-    }
-    k[0] ^= -hiBit & 0xe1; // if (hiBit) n ^= 0xe1000000000000000000000000000000;
-    return k;
-}
-const estimateWindow = (bytes) => {
-    if (bytes > 64 * 1024)
-        return 8;
-    if (bytes > 1024)
-        return 4;
-    return 2;
-};
-class GHASH {
-    // We select bits per window adaptively based on expectedLength
-    constructor(key, expectedLength) {
-        this.blockLen = BLOCK_SIZE$1;
-        this.outputLen = BLOCK_SIZE$1;
-        this.s0 = 0;
-        this.s1 = 0;
-        this.s2 = 0;
-        this.s3 = 0;
-        this.finished = false;
-        key = toBytes(key);
-        abytes(key, 16);
-        const kView = createView(key);
-        let k0 = kView.getUint32(0, false);
-        let k1 = kView.getUint32(4, false);
-        let k2 = kView.getUint32(8, false);
-        let k3 = kView.getUint32(12, false);
-        // generate table of doubled keys (half of montgomery ladder)
-        const doubles = [];
-        for (let i = 0; i < 128; i++) {
-            doubles.push({ s0: swapLE(k0), s1: swapLE(k1), s2: swapLE(k2), s3: swapLE(k3) });
-            ({ s0: k0, s1: k1, s2: k2, s3: k3 } = mul2$1(k0, k1, k2, k3));
-        }
-        const W = estimateWindow(expectedLength || 1024);
-        if (![1, 2, 4, 8].includes(W))
-            throw new Error('ghash: invalid window size, expected 2, 4 or 8');
-        this.W = W;
-        const bits = 128; // always 128 bits;
-        const windows = bits / W;
-        const windowSize = (this.windowSize = 2 ** W);
-        const items = [];
-        // Create precompute table for window of W bits
-        for (let w = 0; w < windows; w++) {
-            // truth table: 00, 01, 10, 11
-            for (let byte = 0; byte < windowSize; byte++) {
-                // prettier-ignore
-                let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-                for (let j = 0; j < W; j++) {
-                    const bit = (byte >>> (W - j - 1)) & 1;
-                    if (!bit)
-                        continue;
-                    const { s0: d0, s1: d1, s2: d2, s3: d3 } = doubles[W * w + j];
-                    (s0 ^= d0), (s1 ^= d1), (s2 ^= d2), (s3 ^= d3);
-                }
-                items.push({ s0, s1, s2, s3 });
-            }
-        }
-        this.t = items;
-    }
-    _updateBlock(s0, s1, s2, s3) {
-        (s0 ^= this.s0), (s1 ^= this.s1), (s2 ^= this.s2), (s3 ^= this.s3);
-        const { W, t, windowSize } = this;
-        // prettier-ignore
-        let o0 = 0, o1 = 0, o2 = 0, o3 = 0;
-        const mask = (1 << W) - 1; // 2**W will kill performance.
-        let w = 0;
-        for (const num of [s0, s1, s2, s3]) {
-            for (let bytePos = 0; bytePos < 4; bytePos++) {
-                const byte = (num >>> (8 * bytePos)) & 0xff;
-                for (let bitPos = 8 / W - 1; bitPos >= 0; bitPos--) {
-                    const bit = (byte >>> (W * bitPos)) & mask;
-                    const { s0: e0, s1: e1, s2: e2, s3: e3 } = t[w * windowSize + bit];
-                    (o0 ^= e0), (o1 ^= e1), (o2 ^= e2), (o3 ^= e3);
-                    w += 1;
-                }
-            }
-        }
-        this.s0 = o0;
-        this.s1 = o1;
-        this.s2 = o2;
-        this.s3 = o3;
-    }
-    update(data) {
-        aexists(this);
-        data = toBytes(data);
-        abytes(data);
-        const b32 = u32(data);
-        const blocks = Math.floor(data.length / BLOCK_SIZE$1);
-        const left = data.length % BLOCK_SIZE$1;
-        for (let i = 0; i < blocks; i++) {
-            this._updateBlock(b32[i * 4 + 0], b32[i * 4 + 1], b32[i * 4 + 2], b32[i * 4 + 3]);
-        }
-        if (left) {
-            ZEROS16.set(data.subarray(blocks * BLOCK_SIZE$1));
-            this._updateBlock(ZEROS32[0], ZEROS32[1], ZEROS32[2], ZEROS32[3]);
-            clean(ZEROS32); // clean tmp buffer
-        }
-        return this;
-    }
-    destroy() {
-        const { t } = this;
-        // clean precompute table
-        for (const elm of t) {
-            (elm.s0 = 0), (elm.s1 = 0), (elm.s2 = 0), (elm.s3 = 0);
-        }
-    }
-    digestInto(out) {
-        aexists(this);
-        aoutput(out, this);
-        this.finished = true;
-        const { s0, s1, s2, s3 } = this;
-        const o32 = u32(out);
-        o32[0] = s0;
-        o32[1] = s1;
-        o32[2] = s2;
-        o32[3] = s3;
-        return out;
-    }
-    digest() {
-        const res = new Uint8Array(BLOCK_SIZE$1);
-        this.digestInto(res);
-        this.destroy();
-        return res;
-    }
-}
-class Polyval extends GHASH {
-    constructor(key, expectedLength) {
-        key = toBytes(key);
-        abytes(key);
-        const ghKey = _toGHASHKey(copyBytes(key));
-        super(ghKey, expectedLength);
-        clean(ghKey);
-    }
-    update(data) {
-        data = toBytes(data);
-        aexists(this);
-        const b32 = u32(data);
-        const left = data.length % BLOCK_SIZE$1;
-        const blocks = Math.floor(data.length / BLOCK_SIZE$1);
-        for (let i = 0; i < blocks; i++) {
-            this._updateBlock(swapLE(b32[i * 4 + 3]), swapLE(b32[i * 4 + 2]), swapLE(b32[i * 4 + 1]), swapLE(b32[i * 4 + 0]));
-        }
-        if (left) {
-            ZEROS16.set(data.subarray(blocks * BLOCK_SIZE$1));
-            this._updateBlock(swapLE(ZEROS32[3]), swapLE(ZEROS32[2]), swapLE(ZEROS32[1]), swapLE(ZEROS32[0]));
-            clean(ZEROS32);
-        }
-        return this;
-    }
-    digestInto(out) {
-        aexists(this);
-        aoutput(out, this);
-        this.finished = true;
-        // tmp ugly hack
-        const { s0, s1, s2, s3 } = this;
-        const o32 = u32(out);
-        o32[0] = s0;
-        o32[1] = s1;
-        o32[2] = s2;
-        o32[3] = s3;
-        return out.reverse();
-    }
-}
-function wrapConstructorWithKey(hashCons) {
-    const hashC = (msg, key) => hashCons(key, msg.length).update(toBytes(msg)).digest();
-    const tmp = hashCons(new Uint8Array(16), 0);
-    hashC.outputLen = tmp.outputLen;
-    hashC.blockLen = tmp.blockLen;
-    hashC.create = (key, expectedLength) => hashCons(key, expectedLength);
-    return hashC;
-}
-/** GHash MAC for AES-GCM. */
-const ghash = wrapConstructorWithKey((key, expectedLength) => new GHASH(key, expectedLength));
-/** Polyval MAC for AES-SIV. */
-wrapConstructorWithKey((key, expectedLength) => new Polyval(key, expectedLength));
-
-/**
- * [AES](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard)
- * a.k.a. Advanced Encryption Standard
- * is a variant of Rijndael block cipher, standardized by NIST in 2001.
- * We provide the fastest available pure JS implementation.
- *
- * Data is split into 128-bit blocks. Encrypted in 10/12/14 rounds (128/192/256 bits). In every round:
- * 1. **S-box**, table substitution
- * 2. **Shift rows**, cyclic shift left of all rows of data array
- * 3. **Mix columns**, multiplying every column by fixed polynomial
- * 4. **Add round key**, round_key xor i-th column of array
- *
- * Check out [FIPS-197](https://csrc.nist.gov/files/pubs/fips/197/final/docs/fips-197.pdf)
- * and [original proposal](https://csrc.nist.gov/csrc/media/projects/cryptographic-standards-and-guidelines/documents/aes-development/rijndael-ammended.pdf)
- * @module
- */
-const BLOCK_SIZE = 16;
-const BLOCK_SIZE32 = 4;
-const EMPTY_BLOCK = /* @__PURE__ */ new Uint8Array(BLOCK_SIZE);
-const POLY = 0x11b; // 1 + x + x**3 + x**4 + x**8
-// TODO: remove multiplication, binary ops only
-function mul2(n) {
-    return (n << 1) ^ (POLY & -(n >> 7));
-}
-function mul(a, b) {
-    let res = 0;
-    for (; b > 0; b >>= 1) {
-        // Montgomery ladder
-        res ^= a & -(b & 1); // if (b&1) res ^=a (but const-time).
-        a = mul2(a); // a = 2*a
-    }
-    return res;
-}
-// AES S-box is generated using finite field inversion,
-// an affine transform, and xor of a constant 0x63.
-const sbox = /* @__PURE__ */ (() => {
-    const t = new Uint8Array(256);
-    for (let i = 0, x = 1; i < 256; i++, x ^= mul2(x))
-        t[i] = x;
-    const box = new Uint8Array(256);
-    box[0] = 0x63; // first elm
-    for (let i = 0; i < 255; i++) {
-        let x = t[255 - i];
-        x |= x << 8;
-        box[t[i]] = (x ^ (x >> 4) ^ (x >> 5) ^ (x >> 6) ^ (x >> 7) ^ 0x63) & 0xff;
-    }
-    clean(t);
-    return box;
-})();
-// Rotate u32 by 8
-const rotr32_8 = (n) => (n << 24) | (n >>> 8);
-const rotl32_8 = (n) => (n << 8) | (n >>> 24);
-// T-table is optimization suggested in 5.2 of original proposal (missed from FIPS-197). Changes:
-// - LE instead of BE
-// - bigger tables: T0 and T1 are merged into T01 table and T2 & T3 into T23;
-//   so index is u16, instead of u8. This speeds up things, unexpectedly
-function genTtable(sbox, fn) {
-    if (sbox.length !== 256)
-        throw new Error('Wrong sbox length');
-    const T0 = new Uint32Array(256).map((_, j) => fn(sbox[j]));
-    const T1 = T0.map(rotl32_8);
-    const T2 = T1.map(rotl32_8);
-    const T3 = T2.map(rotl32_8);
-    const T01 = new Uint32Array(256 * 256);
-    const T23 = new Uint32Array(256 * 256);
-    const sbox2 = new Uint16Array(256 * 256);
-    for (let i = 0; i < 256; i++) {
-        for (let j = 0; j < 256; j++) {
-            const idx = i * 256 + j;
-            T01[idx] = T0[i] ^ T1[j];
-            T23[idx] = T2[i] ^ T3[j];
-            sbox2[idx] = (sbox[i] << 8) | sbox[j];
-        }
-    }
-    return { sbox, sbox2, T0, T1, T2, T3, T01, T23 };
-}
-const tableEncoding = /* @__PURE__ */ genTtable(sbox, (s) => (mul(s, 3) << 24) | (s << 16) | (s << 8) | mul(s, 2));
-const xPowers = /* @__PURE__ */ (() => {
-    const p = new Uint8Array(16);
-    for (let i = 0, x = 1; i < 16; i++, x = mul2(x))
-        p[i] = x;
-    return p;
-})();
-/** Key expansion used in CTR. */
-function expandKeyLE(key) {
-    abytes(key);
-    const len = key.length;
-    if (![16, 24, 32].includes(len))
-        throw new Error('aes: invalid key size, should be 16, 24 or 32, got ' + len);
-    const { sbox2 } = tableEncoding;
-    const toClean = [];
-    if (!isAligned32(key))
-        toClean.push((key = copyBytes(key)));
-    const k32 = u32(key);
-    const Nk = k32.length;
-    const subByte = (n) => applySbox(sbox2, n, n, n, n);
-    const xk = new Uint32Array(len + 28); // expanded key
-    xk.set(k32);
-    // 4.3.1 Key expansion
-    for (let i = Nk; i < xk.length; i++) {
-        let t = xk[i - 1];
-        if (i % Nk === 0)
-            t = subByte(rotr32_8(t)) ^ xPowers[i / Nk - 1];
-        else if (Nk > 6 && i % Nk === 4)
-            t = subByte(t);
-        xk[i] = xk[i - Nk] ^ t;
-    }
-    clean(...toClean);
-    return xk;
-}
-// Apply tables
-function apply0123(T01, T23, s0, s1, s2, s3) {
-    return (T01[((s0 << 8) & 0xff00) | ((s1 >>> 8) & 0xff)] ^
-        T23[((s2 >>> 8) & 0xff00) | ((s3 >>> 24) & 0xff)]);
-}
-function applySbox(sbox2, s0, s1, s2, s3) {
-    return (sbox2[(s0 & 0xff) | (s1 & 0xff00)] |
-        (sbox2[((s2 >>> 16) & 0xff) | ((s3 >>> 16) & 0xff00)] << 16));
-}
-function encrypt$1(xk, s0, s1, s2, s3) {
-    const { sbox2, T01, T23 } = tableEncoding;
-    let k = 0;
-    (s0 ^= xk[k++]), (s1 ^= xk[k++]), (s2 ^= xk[k++]), (s3 ^= xk[k++]);
-    const rounds = xk.length / 4 - 2;
-    for (let i = 0; i < rounds; i++) {
-        const t0 = xk[k++] ^ apply0123(T01, T23, s0, s1, s2, s3);
-        const t1 = xk[k++] ^ apply0123(T01, T23, s1, s2, s3, s0);
-        const t2 = xk[k++] ^ apply0123(T01, T23, s2, s3, s0, s1);
-        const t3 = xk[k++] ^ apply0123(T01, T23, s3, s0, s1, s2);
-        (s0 = t0), (s1 = t1), (s2 = t2), (s3 = t3);
-    }
-    // last round (without mixcolumns, so using SBOX2 table)
-    const t0 = xk[k++] ^ applySbox(sbox2, s0, s1, s2, s3);
-    const t1 = xk[k++] ^ applySbox(sbox2, s1, s2, s3, s0);
-    const t2 = xk[k++] ^ applySbox(sbox2, s2, s3, s0, s1);
-    const t3 = xk[k++] ^ applySbox(sbox2, s3, s0, s1, s2);
-    return { s0: t0, s1: t1, s2: t2, s3: t3 };
-}
-// AES CTR with overflowing 32 bit counter
-// It's possible to do 32le significantly simpler (and probably faster) by using u32.
-// But, we need both, and perf bottleneck is in ghash anyway.
-function ctr32(xk, isLE, nonce, src, dst) {
-    abytes(nonce, BLOCK_SIZE);
-    abytes(src);
-    dst = getOutput(src.length, dst);
-    const ctr = nonce; // write new value to nonce, so it can be re-used
-    const c32 = u32(ctr);
-    const view = createView(ctr);
-    const src32 = u32(src);
-    const dst32 = u32(dst);
-    const ctrPos = isLE ? 0 : 12;
-    const srcLen = src.length;
-    // Fill block (empty, ctr=0)
-    let ctrNum = view.getUint32(ctrPos, isLE); // read current counter value
-    let { s0, s1, s2, s3 } = encrypt$1(xk, c32[0], c32[1], c32[2], c32[3]);
-    // process blocks
-    for (let i = 0; i + 4 <= src32.length; i += 4) {
-        dst32[i + 0] = src32[i + 0] ^ s0;
-        dst32[i + 1] = src32[i + 1] ^ s1;
-        dst32[i + 2] = src32[i + 2] ^ s2;
-        dst32[i + 3] = src32[i + 3] ^ s3;
-        ctrNum = (ctrNum + 1) >>> 0; // u32 wrap
-        view.setUint32(ctrPos, ctrNum, isLE);
-        ({ s0, s1, s2, s3 } = encrypt$1(xk, c32[0], c32[1], c32[2], c32[3]));
-    }
-    // leftovers (less than a block)
-    const start = BLOCK_SIZE * Math.floor(src32.length / BLOCK_SIZE32);
-    if (start < srcLen) {
-        const b32 = new Uint32Array([s0, s1, s2, s3]);
-        const buf = u8(b32);
-        for (let i = start, pos = 0; i < srcLen; i++, pos++)
-            dst[i] = src[i] ^ buf[pos];
-        clean(b32);
-    }
-    return dst;
-}
-// TODO: merge with chacha, however gcm has bitLen while chacha has byteLen
-function computeTag(fn, isLE, key, data, AAD) {
-    const aadLength = AAD ? AAD.length : 0;
-    const h = fn.create(key, data.length + aadLength);
-    if (AAD)
-        h.update(AAD);
-    const num = u64Lengths(8 * data.length, 8 * aadLength, isLE);
-    h.update(data);
-    h.update(num);
-    const res = h.digest();
-    clean(num);
-    return res;
-}
-/**
- * GCM: Galois/Counter Mode.
- * Modern, parallel version of CTR, with MAC.
- * Be careful: MACs can be forged.
- * Unsafe to use random nonces under the same key, due to collision chance.
- * As for nonce size, prefer 12-byte, instead of 8-byte.
- */
-const gcm = /* @__PURE__ */ wrapCipher({ blockSize: 16, nonceLength: 12, tagLength: 16, varSizeNonce: true }, function aesgcm(key, nonce, AAD) {
-    // NIST 800-38d doesn't enforce minimum nonce length.
-    // We enforce 8 bytes for compat with openssl.
-    // 12 bytes are recommended. More than 12 bytes would be converted into 12.
-    if (nonce.length < 8)
-        throw new Error('aes/gcm: invalid nonce length');
-    const tagLength = 16;
-    function _computeTag(authKey, tagMask, data) {
-        const tag = computeTag(ghash, false, authKey, data, AAD);
-        for (let i = 0; i < tagMask.length; i++)
-            tag[i] ^= tagMask[i];
-        return tag;
-    }
-    function deriveKeys() {
-        const xk = expandKeyLE(key);
-        const authKey = EMPTY_BLOCK.slice();
-        const counter = EMPTY_BLOCK.slice();
-        ctr32(xk, false, counter, counter, authKey);
-        // NIST 800-38d, page 15: different behavior for 96-bit and non-96-bit nonces
-        if (nonce.length === 12) {
-            counter.set(nonce);
-        }
-        else {
-            const nonceLen = EMPTY_BLOCK.slice();
-            const view = createView(nonceLen);
-            setBigUint64(view, 8, BigInt(nonce.length * 8), false);
-            // ghash(nonce || u64be(0) || u64be(nonceLen*8))
-            const g = ghash.create(authKey).update(nonce).update(nonceLen);
-            g.digestInto(counter); // digestInto doesn't trigger '.destroy'
-            g.destroy();
-        }
-        const tagMask = ctr32(xk, false, counter, EMPTY_BLOCK);
-        return { xk, authKey, counter, tagMask };
-    }
-    return {
-        encrypt(plaintext) {
-            const { xk, authKey, counter, tagMask } = deriveKeys();
-            const out = new Uint8Array(plaintext.length + tagLength);
-            const toClean = [xk, authKey, counter, tagMask];
-            if (!isAligned32(plaintext))
-                toClean.push((plaintext = copyBytes(plaintext)));
-            ctr32(xk, false, counter, plaintext, out.subarray(0, plaintext.length));
-            const tag = _computeTag(authKey, tagMask, out.subarray(0, out.length - tagLength));
-            toClean.push(tag);
-            out.set(tag, plaintext.length);
-            clean(...toClean);
-            return out;
-        },
-        decrypt(ciphertext) {
-            const { xk, authKey, counter, tagMask } = deriveKeys();
-            const toClean = [xk, authKey, tagMask, counter];
-            if (!isAligned32(ciphertext))
-                toClean.push((ciphertext = copyBytes(ciphertext)));
-            const data = ciphertext.subarray(0, -tagLength);
-            const passedTag = ciphertext.subarray(-tagLength);
-            const tag = _computeTag(authKey, tagMask, data);
-            toClean.push(tag);
-            if (!equalBytes(tag, passedTag))
-                throw new Error('aes/gcm: invalid ghash tag');
-            const out = ctr32(xk, false, counter, data);
-            clean(...toClean);
-            return out;
-        },
-    };
-});
-
-const crypto$1 = typeof globalThis === 'object' && 'crypto' in globalThis ? globalThis.crypto : undefined;
-
-/**
- * WebCrypto-based AES gcm/ctr/cbc, `managedNonce` and `randomBytes`.
- * We use WebCrypto aka globalThis.crypto, which exists in browsers and node.js 16+.
- * node.js versions earlier than v19 don't declare it in global scope.
- * For node.js, package.js on#exports field mapping rewrites import
- * from `crypto` to `cryptoNode`, which imports native module.
- * Makes the utils un-importable in browsers without a bundler.
- * Once node.js 18 is deprecated, we can just drop the import.
- * @module
- */
-// Use full path so that Node.js can rewrite it to `cryptoNode.js`.
-/**
- * Secure PRNG. Uses `crypto.getRandomValues`, which defers to OS.
- */
-function randomBytes(bytesLength = 32) {
-    if (crypto$1 && typeof crypto$1.getRandomValues === 'function') {
-        return crypto$1.getRandomValues(new Uint8Array(bytesLength));
-    }
-    // Legacy Node.js compatibility
-    if (crypto$1 && typeof crypto$1.randomBytes === 'function') {
-        return Uint8Array.from(crypto$1.randomBytes(bytesLength));
-    }
-    throw new Error('crypto.getRandomValues must be defined');
-}
-// // Type tests
-// import { siv, gcm, ctr, ecb, cbc } from '../aes.ts';
-// import { xsalsa20poly1305 } from '../salsa.ts';
-// import { chacha20poly1305, xchacha20poly1305 } from '../chacha.ts';
-// const wsiv = managedNonce(siv);
-// const wgcm = managedNonce(gcm);
-// const wctr = managedNonce(ctr);
-// const wcbc = managedNonce(cbc);
-// const wsalsapoly = managedNonce(xsalsa20poly1305);
-// const wchacha = managedNonce(chacha20poly1305);
-// const wxchacha = managedNonce(xchacha20poly1305);
-// // should fail
-// const wcbc2 = managedNonce(managedNonce(cbc));
-// const wctr = managedNonce(ctr);
-
-const IV_LENGTH = 12;
-function base64Decode(s) {
-    return Uint8Array.from(atob(s), c => c.charCodeAt(0));
-}
-function base64Encode(bytes) {
-    return btoa(String.fromCharCode(...bytes));
-}
-function getIv() {
-    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-        return crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-    }
-    return randomBytes(IV_LENGTH);
-}
-function encrypt(plaintext, key) {
-    const keyBytes = base64Decode(key);
-    const ivBytes = getIv();
-    const plainBytes = new TextEncoder().encode(plaintext);
-    const aes = gcm(keyBytes, ivBytes);
-    const combined = aes.encrypt(plainBytes);
-    const result = new Uint8Array(ivBytes.length + combined.length);
-    result.set(ivBytes, 0);
-    result.set(combined, ivBytes.length);
-    return base64Encode(result);
-}
-function decrypt(data, key) {
-    const keyBytes = base64Decode(key);
-    const raw = base64Decode(data);
-    const ivBytes = raw.slice(0, IV_LENGTH);
-    const combined = raw.slice(IV_LENGTH);
-    const aes = gcm(keyBytes, ivBytes);
-    const plainBytes = aes.decrypt(combined);
-    return new TextDecoder().decode(plainBytes);
-}
+const CATEGORY = {
+    TRANSPORT: 'transport'};
+const SUPERISLAND_TERMINATE_VALUE = '__END__';
+const SUPERISLAND_FEATURE_KEY = 'si_feature_id';
 
 /**
 
@@ -4089,11 +4013,11 @@ class SHA1 extends HashMD {
         this.set(A, B, C, D, E);
     }
     roundClean() {
-        clean$1(SHA1_W);
+        clean(SHA1_W);
     }
     destroy() {
         this.set(0, 0, 0, 0, 0);
-        clean$1(this.buffer);
+        clean(this.buffer);
     }
 }
 /** SHA1 (RFC 3174) legacy hash function. It was cryptographically broken. */
@@ -4145,7 +4069,7 @@ function computeFeatureId(superPkg, paramV2, instanceId) {
     const raw = stableFields.join('|');
     return bytesToHex(sha1(raw));
 }
-function diff(oldState, newState) {
+function diff$1(oldState, newState) {
     const result = {};
     let changed = false;
     if (newState.title !== undefined && newState.title !== oldState.title) {
@@ -4255,7 +4179,7 @@ class SuperIslandSendManager {
             }
             return { isFull: true, payload: buildFullPayload(featureId, newState) };
         }
-        const diffResult = diff(oldState, newState);
+        const diffResult = diff$1(oldState, newState);
         if (!diffResult) {
             return { isFull: false, payload: null };
         }
@@ -4412,6 +4336,28 @@ class RemoteStore {
     }
 }
 
+const DATA_HEADERS = {
+    DATA: 'DATA',
+    NOTIFICATION: 'DATA_NOTIFICATION',
+    SUPERISLAND: 'DATA_SUPERISLAND',
+    MEDIAPLAY: 'DATA_MEDIAPLAY',
+    ICON_REQUEST: 'DATA_ICON_REQUEST',
+    ICON_RESPONSE: 'DATA_ICON_RESPONSE',
+    APP_LIST_REQUEST: 'DATA_APP_LIST_REQUEST',
+    APP_LIST_RESPONSE: 'DATA_APP_LIST_RESPONSE',
+    MEDIA_CONTROL: 'DATA_MEDIA_CONTROL',
+    CLIPBOARD: 'DATA_CLIPBOARD',
+    FTP: 'DATA_FTP',
+    STATUS: 'DATA_STATUS',
+    APP_LAUNCH: 'DATA_APP_LAUNCH',
+};
+const LINE_PREFIX = {
+    HANDSHAKE: 'HANDSHAKE',
+    ACCEPT: 'ACCEPT',
+    REJECT: 'REJECT',
+    HEARTBEAT_TCP: 'HEARTBEAT_TCP',
+};
+
 const ROUTE_TABLE = {
     'DATA': 'onNotification',
     'DATA_NOTIFICATION': 'onNotification',
@@ -4535,6 +4481,12 @@ function encodeMessage(obj) {
 }
 function decodeMessage(str) {
     return JSON.parse(str);
+}
+
+function parseBatteryStatus(raw) {
+    const isCharging = raw.startsWith('+');
+    const level = parseInt(raw.substring(1), 10);
+    return { level: isNaN(level) ? 0 : level, isCharging };
 }
 
 class ProtocolRouter {
@@ -4776,5 +4728,51 @@ class FilterEngine {
     }
 }
 
-export { CATEGORY, DATA_HEADERS, DEVICE_TYPE, FilterEngine, LINE_PREFIX, MESSAGE_PRIORITY, NOTIFICATION_TYPE, PRIORITY_LEVEL, PROTOCOL_VERSION, ProtocolRouter, ProtocolSender, ROUTE_TABLE, RemoteStore, STATUS_TYPE, SUPERISLAND_FEATURE_KEY, SUPERISLAND_TERMINATE_VALUE, SuperIslandSendManager, buildDeltaPayload, buildEndPayload, buildFullPayload, buildMediaPlayDelta, buildMediaPlayEnd, buildMediaPlayFull, classifyNotification, computeDedupKey, computeFeatureId, computeSharedSecret, decodeMessage, decrypt, diff, diffMediaPlay, encodeMessage, encrypt, extractMetadata, formatBatteryStatus, generateKeyPair, hkdfDerive, isDataHeader, isLinePrefix, parseBatteryStatus, parseDataLine, parseHandshake, parseHeartbeat, parseLine, processNotification, shouldSendFull };
+const crypto$1 = {
+    aesEncrypt: encrypt,
+    aesDecrypt: decrypt,
+    ecdhGenerateKeyPair: generateKeyPair,
+    ecdhDeriveSharedSecret: computeSharedSecret,
+    hkdfDerive,
+};
+const diff = {
+    superIsland: {
+        computeFeatureId,
+        diff: diff$1,
+        buildFullPayload,
+        buildDeltaPayload,
+        buildEndPayload,
+        SuperIslandSendManager,
+    },
+    mediaPlay: {
+        diffMediaPlay,
+        shouldSendFull,
+        buildMediaPlayFull,
+        buildMediaPlayDelta,
+        buildMediaPlayEnd,
+    },
+    RemoteStore,
+};
+const protocol = {
+    ROUTE_TABLE,
+    isDataHeader,
+    isLinePrefix,
+    parseLine,
+    parseDataLine,
+    parseHandshake,
+    parseHeartbeat,
+    encodeMessage,
+    decodeMessage,
+    ProtocolRouter,
+    ProtocolSender,
+};
+const notification = {
+    classifyNotification,
+    processNotification,
+    extractMetadata,
+    computeDedupKey,
+    FilterEngine,
+};
+
+export { crypto$1 as crypto, diff, notification, protocol };
 //# sourceMappingURL=core.esm.js.map
