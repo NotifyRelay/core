@@ -1,5 +1,8 @@
 node_modules/
-dist/
+dist/*
+!dist/core.umd.js
+!dist/core.esm.js
+!dist/core.d.ts
 *.js.map
 coverage/
 .tmp/
