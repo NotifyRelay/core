@@ -21,5 +21,6 @@ export function computeSharedSecret(privateKey: string, publicKey: string): stri
   const priv = base64Decode(privateKey);
   const pub = base64Decode(publicKey);
   const shared = secp256r1.getSharedSecret(priv, pub);
-  return base64Encode(shared);
+  const sharedX = shared.slice(1, 33);
+  return base64Encode(sharedX);
 }
