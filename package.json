@@ -1,7 +1,7 @@
 {
   "name": "@notify-relay/core",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Notify-Relay 跨平台核心逻辑库 — 类型定义、差异协议、协议路由、加密层",
   "main": "dist/core.umd.js",
   "module": "dist/core.esm.js",

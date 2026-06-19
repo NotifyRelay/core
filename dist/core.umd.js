@@ -4735,6 +4735,377 @@
         }
     }
 
+    function action(type, extra) {
+        return { type, ...extra };
+    }
+
+    class CoreEngine {
+        constructor() {
+            this.localInfo = null;
+            this.sharedSecrets = new Map();
+            this.pendingHandshakes = new Map();
+            this.superIslandMgr = new SuperIslandSendManager();
+            this.remoteStore = new RemoteStore();
+            this.mediaLastState = new Map();
+        }
+        // ==================== Lifecycle ====================
+        setLocalInfo(infoJson) {
+            this.localInfo = JSON.parse(infoJson);
+        }
+        // ==================== Device management ====================
+        setSharedSecret(deviceUuid, secret) {
+            this.sharedSecrets.set(deviceUuid, secret);
+        }
+        getSharedSecret(deviceUuid) {
+            return this.sharedSecrets.get(deviceUuid) || null;
+        }
+        removeSharedSecret(deviceUuid) {
+            this.sharedSecrets.delete(deviceUuid);
+        }
+        // ==================== Incoming line processing ====================
+        processLine(line, connId, senderIp) {
+            try {
+                const parsed = parseLine(line);
+                switch (parsed.type) {
+                    case 'HANDSHAKE':
+                        return JSON.stringify(this._handleHandshake(parsed, connId));
+                    case 'ENCRYPTED_DATA':
+                        return JSON.stringify(this._handleEncryptedData(parsed, senderIp));
+                    case 'HEARTBEAT_TCP':
+                        return JSON.stringify(this._handleHeartbeat(parsed, senderIp));
+                    case 'ACCEPT':
+                        return JSON.stringify(this._handleAccept(parsed));
+                    case 'REJECT':
+                        return JSON.stringify([action('noop')]);
+                    default:
+                        return JSON.stringify([action('noop')]);
+                }
+            }
+            catch {
+                return JSON.stringify([action('noop')]);
+            }
+        }
+        completeHandshake(connId, accepted, sharedSecret) {
+            try {
+                const pending = this.pendingHandshakes.get(connId);
+                if (!pending)
+                    return JSON.stringify([action('noop')]);
+                this.pendingHandshakes.delete(connId);
+                if (!this.localInfo)
+                    return JSON.stringify([action('noop')]);
+                if (accepted) {
+                    let secret = sharedSecret;
+                    if (!secret) {
+                        secret = hkdfDerive(this.localInfo.publicKey, pending.handshake.publicKey);
+                    }
+                    this.sharedSecrets.set(pending.handshake.uuid, secret);
+                    const results = [
+                        action('send_line', { connId, line: this._buildAcceptLine() }),
+                        action('set_shared_secret', { deviceUuid: pending.handshake.uuid, sharedSecret: secret }),
+                        action('device_connected', {
+                            deviceUuid: pending.handshake.uuid,
+                            data: {
+                                uuid: pending.handshake.uuid,
+                                publicKey: pending.handshake.publicKey,
+                                ipAddress: pending.handshake.ipAddress,
+                                batteryLevel: pending.handshake.batteryLevel,
+                                isCharging: pending.handshake.isCharging,
+                                deviceType: pending.handshake.deviceType,
+                            },
+                        }),
+                    ];
+                    return JSON.stringify(results);
+                }
+                return JSON.stringify([action('send_line', { connId, line: `REJECT:${this.localInfo.uuid}\n` })]);
+            }
+            catch {
+                return JSON.stringify([action('noop')]);
+            }
+        }
+        // ==================== Message building ====================
+        buildMessage(header, payloadJson, deviceUuid) {
+            try {
+                const payload = JSON.parse(payloadJson);
+                const line = this._encryptMessage(header, payload, deviceUuid);
+                return line || '';
+            }
+            catch {
+                return '';
+            }
+        }
+        buildSuperIslandData(deviceUuid, featureId, stateJson) {
+            try {
+                const state = JSON.parse(stateJson);
+                const result = this.superIslandMgr.updateAndGetPayload(deviceUuid, featureId, state);
+                if (!result.payload)
+                    return '';
+                return this._encryptMessage('DATA_SUPERISLAND', result.payload, deviceUuid) || '';
+            }
+            catch {
+                return '';
+            }
+        }
+        buildSuperIslandEnd(deviceUuid, featureId, stateJson) {
+            try {
+                const state = stateJson ? JSON.parse(stateJson) : undefined;
+                this.superIslandMgr.markForceFull(deviceUuid, featureId);
+                const payload = buildEndPayload(featureId, state);
+                return this._encryptMessage('DATA_SUPERISLAND', payload, deviceUuid) || '';
+            }
+            catch {
+                return '';
+            }
+        }
+        buildMediaPlayData(deviceUuid, stateJson) {
+            try {
+                const state = JSON.parse(stateJson);
+                const mediaKey = 'global_media_session';
+                if (!this.mediaLastState.has(deviceUuid)) {
+                    this.mediaLastState.set(deviceUuid, new Map());
+                }
+                const deviceMap = this.mediaLastState.get(deviceUuid);
+                const lastState = deviceMap.get(mediaKey);
+                const now = Date.now();
+                const diff = lastState ? diffMediaPlay(lastState, state) : null;
+                const needFull = !lastState || (diff?.coverUrl !== undefined && diff.coverUrl !== null)
+                    || (now - (lastState.sentTime || 0) > 6000);
+                let payload;
+                if (needFull) {
+                    payload = buildMediaPlayFull(state);
+                }
+                else if (diff) {
+                    payload = buildMediaPlayDelta(diff);
+                }
+                else {
+                    return '';
+                }
+                deviceMap.set(mediaKey, { ...state, sentTime: now });
+                return this._encryptMessage('DATA_MEDIAPLAY', payload, deviceUuid) || '';
+            }
+            catch {
+                return '';
+            }
+        }
+        buildMediaPlayEnd(deviceUuid) {
+            try {
+                if (this.mediaLastState.has(deviceUuid)) {
+                    this.mediaLastState.get(deviceUuid).delete('global_media_session');
+                }
+                const payload = buildMediaPlayEnd();
+                return this._encryptMessage('DATA_MEDIAPLAY', payload, deviceUuid) || '';
+            }
+            catch {
+                return '';
+            }
+        }
+        // ==================== ACK handling ====================
+        handleSuperIslandAck(deviceUuid, featureId) {
+            try {
+                this.superIslandMgr.ackReceived(deviceUuid, featureId);
+            }
+            catch {
+                // ignore
+            }
+        }
+        getSuperIslandState(deviceUuid, featureId) {
+            try {
+                const state = this.remoteStore.getState(deviceUuid, featureId);
+                return state ? JSON.stringify(state) : '';
+            }
+            catch {
+                return '';
+            }
+        }
+        // ==================== Private: Handshake ====================
+        _handleHandshake(parsed, connId) {
+            if (!this.localInfo)
+                return [action('noop')];
+            const existingSecret = this.sharedSecrets.get(parsed.uuid);
+            if (existingSecret) {
+                return [
+                    action('send_line', { connId, line: this._buildAcceptLine() }),
+                    action('device_connected', {
+                        deviceUuid: parsed.uuid,
+                        data: {
+                            uuid: parsed.uuid,
+                            publicKey: parsed.publicKey,
+                            ipAddress: parsed.ipAddress,
+                            batteryLevel: parsed.batteryLevel,
+                            isCharging: parsed.isCharging,
+                            deviceType: parsed.deviceType,
+                        },
+                    }),
+                ];
+            }
+            this.pendingHandshakes.set(connId, { handshake: parsed, timestamp: Date.now() });
+            return [action('handshake_request', {
+                    connId,
+                    data: {
+                        remoteUuid: parsed.uuid,
+                        remotePubKey: parsed.publicKey,
+                        remoteIp: parsed.ipAddress,
+                        remoteBattery: parsed.batteryLevel,
+                        remoteIsCharging: parsed.isCharging,
+                        remoteDeviceType: parsed.deviceType,
+                        displayName: parsed.uuid,
+                    },
+                })];
+        }
+        // ==================== Private: Encrypted data ====================
+        _handleEncryptedData(parsed, _senderIp) {
+            const secret = this.sharedSecrets.get(parsed.senderUuid);
+            if (!secret)
+                return [action('noop')];
+            let decrypted;
+            try {
+                decrypted = decrypt(parsed.encryptedPayload, secret);
+            }
+            catch {
+                return [action('noop')];
+            }
+            const header = parsed.header;
+            const senderUuid = parsed.senderUuid;
+            switch (header) {
+                case 'DATA':
+                case 'DATA_NOTIFICATION':
+                    return this._routeDataAction('notification', decrypted, senderUuid);
+                case 'DATA_SUPERISLAND':
+                    return this._processSuperIsland(decrypted, senderUuid);
+                case 'DATA_MEDIAPLAY':
+                    return this._routeDataAction('media_play', decrypted, senderUuid);
+                case 'DATA_CLIPBOARD':
+                    return this._routeDataAction('clipboard', decrypted, senderUuid);
+                case 'DATA_ICON_REQUEST':
+                    return this._routeDataAction('icon_request', decrypted, senderUuid);
+                case 'DATA_ICON_RESPONSE':
+                    return this._routeDataAction('icon_response', decrypted, senderUuid);
+                case 'DATA_APP_LIST_REQUEST':
+                    return this._routeDataAction('app_list_request', decrypted, senderUuid);
+                case 'DATA_APP_LIST_RESPONSE':
+                    return this._routeDataAction('app_list_response', decrypted, senderUuid);
+                case 'DATA_MEDIA_CONTROL':
+                    return this._routeDataAction('media_control', decrypted, senderUuid);
+                case 'DATA_FTP':
+                    return this._routeDataAction('ftp_message', decrypted, senderUuid);
+                case 'DATA_APP_LAUNCH':
+                    return this._routeDataAction('app_launch', decrypted, senderUuid);
+                case 'DATA_STATUS':
+                    return this._routeDataAction('status_response', decrypted, senderUuid);
+                default:
+                    return [action('noop')];
+            }
+        }
+        _routeDataAction(actionType, decrypted, senderUuid) {
+            try {
+                const message = JSON.parse(decrypted);
+                return [action(actionType, { senderUuid, message })];
+            }
+            catch {
+                return [action('noop')];
+            }
+        }
+        // ==================== Private: SuperIsland processor ====================
+        _processSuperIsland(decrypted, senderUuid) {
+            try {
+                const json = JSON.parse(decrypted);
+                const siType = json.type || '';
+                if (siType === 'SI_ACK') {
+                    const featureId = json.featureKeyValue || '';
+                    if (featureId) {
+                        this.superIslandMgr.ackReceived(senderUuid, featureId);
+                    }
+                    return [action('noop')];
+                }
+                const pkg = json.packageName || '';
+                const paramV2Raw = json.param_v2_raw || '';
+                const termVal = json.terminateValue || '';
+                const explicitFeatureKey = json.featureKeyValue || '';
+                const isEnd = termVal === SUPERISLAND_TERMINATE_VALUE;
+                const featureId = explicitFeatureKey || computeFeatureId(pkg, paramV2Raw);
+                const sourceKey = [senderUuid, pkg, featureId].filter(Boolean).join('|');
+                if (isEnd) {
+                    this.remoteStore.applyIncoming(senderUuid, featureId, json);
+                    return [action('super_island', {
+                            senderUuid,
+                            message: { ...json, featureId, sourceKey, isEnd: true },
+                        })];
+                }
+                this.remoteStore.applyIncoming(senderUuid, featureId, json);
+                const actions = [];
+                const recvHash = json.hash || '';
+                if (recvHash) {
+                    const ackPayload = {
+                        originalHeader: 'DATA_SUPERISLAND',
+                        result: 'success',
+                        action: 'SI_ACK',
+                        hash: recvHash,
+                        featureKeyName: 'si_feature_id',
+                        featureKeyValue: featureId,
+                    };
+                    const ackLine = this._encryptMessage('DATA_STATUS', ackPayload, senderUuid);
+                    if (ackLine) {
+                        actions.push(action('send_encrypted', { targetUuid: senderUuid, line: ackLine }));
+                    }
+                }
+                actions.push(action('super_island', {
+                    senderUuid,
+                    message: { ...json, featureId, sourceKey, isEnd: false },
+                }));
+                return actions;
+            }
+            catch {
+                return [action('noop')];
+            }
+        }
+        // ==================== Private: Heartbeat ====================
+        _handleHeartbeat(parsed, senderIp) {
+            try {
+                const battery = this._parseBattery(parsed.batteryStatus);
+                return [action('heartbeat', {
+                        data: {
+                            uuid: parsed.uuid,
+                            displayName: parsed.displayName,
+                            port: parsed.port,
+                            ip: senderIp || '',
+                            batteryLevel: battery.level,
+                            isCharging: battery.isCharging,
+                            deviceType: parsed.deviceType,
+                        },
+                    })];
+            }
+            catch {
+                return [action('noop')];
+            }
+        }
+        // ==================== Private: Accept ====================
+        _handleAccept(parsed) {
+            return [action('device_connected', {
+                    deviceUuid: parsed.uuid,
+                })];
+        }
+        // ==================== Private: Helpers ====================
+        _encryptMessage(header, payload, targetUuid) {
+            if (!this.localInfo)
+                return null;
+            const secret = this.sharedSecrets.get(targetUuid);
+            if (!secret)
+                return null;
+            const encrypted = encrypt(JSON.stringify(payload), secret);
+            return `${header}:${this.localInfo.uuid}:${this.localInfo.publicKey}:${encrypted}\n`;
+        }
+        _buildAcceptLine() {
+            const li = this.localInfo;
+            const battery = li.isCharging ? `+${li.batteryLevel}` : `${li.batteryLevel}`;
+            return `ACCEPT:${li.uuid}:${li.publicKey}:${li.ipAddress}:${battery}:${li.deviceType}\n`;
+        }
+        _parseBattery(status) {
+            const isCharging = status.startsWith('+');
+            const raw = isCharging ? status.substring(1) : status;
+            const level = parseInt(raw, 10);
+            return { level: isNaN(level) ? 0 : Math.min(100, Math.max(0, level)), isCharging };
+        }
+    }
+
     const crypto$1 = {
         aesEncrypt: encrypt,
         aesDecrypt: decrypt,
@@ -4781,6 +5152,7 @@
         FilterEngine,
     };
 
+    exports.CoreEngine = CoreEngine;
     exports.crypto = crypto$1;
     exports.diff = diff;
     exports.notification = notification;

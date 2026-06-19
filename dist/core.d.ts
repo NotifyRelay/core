@@ -378,6 +378,46 @@ declare class FilterEngine {
     getRules(): FilterRule[];
 }
 
+interface LocalDeviceInfo {
+    uuid: string;
+    publicKey: string;
+    deviceType: string;
+    ipAddress: string;
+    batteryLevel: number;
+    isCharging: boolean;
+    displayName?: string;
+}
+declare class CoreEngine {
+    private localInfo;
+    private sharedSecrets;
+    private pendingHandshakes;
+    private superIslandMgr;
+    private remoteStore;
+    private mediaLastState;
+    setLocalInfo(infoJson: string): void;
+    setSharedSecret(deviceUuid: string, secret: string): void;
+    getSharedSecret(deviceUuid: string): string | null;
+    removeSharedSecret(deviceUuid: string): void;
+    processLine(line: string, connId: string, senderIp?: string): string;
+    completeHandshake(connId: string, accepted: boolean, sharedSecret?: string): string;
+    buildMessage(header: string, payloadJson: string, deviceUuid: string): string;
+    buildSuperIslandData(deviceUuid: string, featureId: string, stateJson: string): string;
+    buildSuperIslandEnd(deviceUuid: string, featureId: string, stateJson?: string): string;
+    buildMediaPlayData(deviceUuid: string, stateJson: string): string;
+    buildMediaPlayEnd(deviceUuid: string): string;
+    handleSuperIslandAck(deviceUuid: string, featureId: string): void;
+    getSuperIslandState(deviceUuid: string, featureId: string): string;
+    private _handleHandshake;
+    private _handleEncryptedData;
+    private _routeDataAction;
+    private _processSuperIsland;
+    private _handleHeartbeat;
+    private _handleAccept;
+    private _encryptMessage;
+    private _buildAcceptLine;
+    private _parseBattery;
+}
+
 declare const crypto: {
     aesEncrypt: typeof encrypt;
     aesDecrypt: typeof decrypt;
@@ -424,4 +464,5 @@ declare const notification: {
     FilterEngine: typeof FilterEngine;
 };
 
-export { crypto, diff, notification, protocol };
+export { CoreEngine, crypto, diff, notification, protocol };
+export type { LocalDeviceInfo };

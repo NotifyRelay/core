@@ -10,6 +10,8 @@ import { ProtocolRouter } from './protocol/router';
 import { ProtocolSender } from './protocol/sender';
 import { classifyNotification, processNotification, extractMetadata, computeDedupKey } from './notification/processor';
 import { FilterEngine } from './notification/filter';
+import { CoreEngine } from './engine/CoreEngine';
+import type { LocalDeviceInfo } from './engine/CoreEngine';
 
 export const crypto = {
   aesEncrypt: encrypt,
@@ -59,3 +61,6 @@ export const notification = {
   computeDedupKey,
   FilterEngine,
 };
+
+export { CoreEngine };
+export type { LocalDeviceInfo };
