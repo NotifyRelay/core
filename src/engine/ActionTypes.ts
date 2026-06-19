@@ -18,7 +18,6 @@ export type ActionType =
   | 'status_response'
   | 'send_line'
   | 'send_data'
-  | 'set_shared_secret'
   | 'noop';
 
 export interface Action {
@@ -30,7 +29,6 @@ export interface Action {
   senderUuid?: string;
   message?: Record<string, unknown>;
   deviceUuid?: string;
-  sharedSecret?: string;
   [key: string]: unknown;
 }
 

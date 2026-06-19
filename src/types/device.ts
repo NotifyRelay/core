@@ -16,7 +16,6 @@ export interface DeviceInfo {
 export interface AuthInfo {
   deviceUuid: string;
   publicKey: string;
-  sharedSecret?: string;
   authedAt: number;
   label?: string;
 }

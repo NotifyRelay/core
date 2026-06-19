@@ -25,7 +25,6 @@ interface HandshakeState {
 
 export class CoreEngine {
   private localInfo: LocalDeviceInfo | null = null;
-  private sharedSecrets: Map<string, string> = new Map();
   private pendingHandshakes: Map<string, HandshakeState> = new Map();
   private superIslandMgr = new SuperIslandSendManager();
   private remoteStore = new RemoteStore();
@@ -35,20 +34,6 @@ export class CoreEngine {
 
   setLocalInfo(infoJson: string): void {
     this.localInfo = JSON.parse(infoJson) as LocalDeviceInfo;
-  }
-
-  // ==================== Device management ====================
-
-  setSharedSecret(deviceUuid: string, secret: string): void {
-    this.sharedSecrets.set(deviceUuid, secret);
-  }
-
-  getSharedSecret(deviceUuid: string): string | null {
-    return this.sharedSecrets.get(deviceUuid) || null;
-  }
-
-  removeSharedSecret(deviceUuid: string): void {
-    this.sharedSecrets.delete(deviceUuid);
   }
 
   // ==================== Incoming line processing ====================
@@ -76,7 +61,7 @@ export class CoreEngine {
     }
   }
 
-  completeHandshake(connId: string, accepted: boolean, sharedSecret?: string): string {
+  completeHandshake(connId: string, accepted: boolean): string {
     try {
       const pending = this.pendingHandshakes.get(connId);
       if (!pending) return JSON.stringify([action('noop')]);
@@ -86,16 +71,8 @@ export class CoreEngine {
       if (!this.localInfo) return JSON.stringify([action('noop')]);
 
       if (accepted) {
-        const secret = sharedSecret;
-        if (!secret) {
-          return JSON.stringify([action('noop')]);
-        }
-
-        this.sharedSecrets.set(pending.handshake.uuid, secret);
-
         const results: Action[] = [
           action('send_line', { connId, line: this._buildAcceptLine() }),
-          action('set_shared_secret', { deviceUuid: pending.handshake.uuid, sharedSecret: secret }),
           action('device_connected', {
             deviceUuid: pending.handshake.uuid,
             data: {
@@ -218,24 +195,6 @@ export class CoreEngine {
 
   private _handleHandshake(parsed: HandshakePayload & { type: 'HANDSHAKE' }, connId: string): Action[] {
     if (!this.localInfo) return [action('noop')];
-
-    const existingSecret = this.sharedSecrets.get(parsed.uuid);
-    if (existingSecret) {
-      return [
-        action('send_line', { connId, line: this._buildAcceptLine() }),
-        action('device_connected', {
-          deviceUuid: parsed.uuid,
-          data: {
-            uuid: parsed.uuid,
-            publicKey: parsed.publicKey,
-            ipAddress: parsed.ipAddress,
-            batteryLevel: parsed.batteryLevel,
-            isCharging: parsed.isCharging,
-            deviceType: parsed.deviceType,
-          },
-        }),
-      ];
-    }
 
     this.pendingHandshakes.set(connId, { handshake: parsed, timestamp: Date.now() });
     return [action('handshake_request', {
