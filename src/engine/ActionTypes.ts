@@ -17,7 +17,7 @@ export type ActionType =
   | 'app_launch'
   | 'status_response'
   | 'send_line'
-  | 'send_encrypted'
+  | 'send_data'
   | 'set_shared_secret'
   | 'noop';
 

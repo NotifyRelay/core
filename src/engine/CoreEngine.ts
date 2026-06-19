@@ -1,7 +1,5 @@
 import type { SuperIslandState, MediaPlayState } from '../types/notification';
 import type { HandshakePayload } from '../types/device';
-import { encrypt, decrypt } from '../crypto/aes';
-import { hkdfDerive } from '../crypto/hkdf';
 import { computeFeatureId, buildEndPayload, SuperIslandSendManager } from '../diff/superisland';
 import { diffMediaPlay, buildMediaPlayFull, buildMediaPlayDelta, buildMediaPlayEnd } from '../diff/mediaplay';
 import { RemoteStore } from '../diff/store';
@@ -88,9 +86,9 @@ export class CoreEngine {
       if (!this.localInfo) return JSON.stringify([action('noop')]);
 
       if (accepted) {
-        let secret = sharedSecret;
+        const secret = sharedSecret;
         if (!secret) {
-          secret = hkdfDerive(this.localInfo.publicKey, pending.handshake.publicKey);
+          return JSON.stringify([action('noop')]);
         }
 
         this.sharedSecrets.set(pending.handshake.uuid, secret);
@@ -257,56 +255,47 @@ export class CoreEngine {
   // ==================== Private: Encrypted data ====================
 
   private _handleEncryptedData(parsed: { header: string; senderUuid: string; encryptedPayload: string }, _senderIp?: string): Action[] {
-    const secret = this.sharedSecrets.get(parsed.senderUuid);
-    if (!secret) return [action('noop')];
-
-    let decrypted: string;
-    try {
-      decrypted = decrypt(parsed.encryptedPayload, secret);
-    } catch {
-      return [action('noop')];
-    }
-
+    const payload = parsed.encryptedPayload;
     const header = parsed.header;
     const senderUuid = parsed.senderUuid;
 
     switch (header) {
       case 'DATA':
       case 'DATA_NOTIFICATION':
-        return this._routeDataAction('notification', decrypted, senderUuid);
+        return this._routeDataAction('notification', payload, senderUuid);
 
       case 'DATA_SUPERISLAND':
-        return this._processSuperIsland(decrypted, senderUuid);
+        return this._processSuperIsland(payload, senderUuid);
 
       case 'DATA_MEDIAPLAY':
-        return this._routeDataAction('media_play', decrypted, senderUuid);
+        return this._routeDataAction('media_play', payload, senderUuid);
 
       case 'DATA_CLIPBOARD':
-        return this._routeDataAction('clipboard', decrypted, senderUuid);
+        return this._routeDataAction('clipboard', payload, senderUuid);
 
       case 'DATA_ICON_REQUEST':
-        return this._routeDataAction('icon_request', decrypted, senderUuid);
+        return this._routeDataAction('icon_request', payload, senderUuid);
 
       case 'DATA_ICON_RESPONSE':
-        return this._routeDataAction('icon_response', decrypted, senderUuid);
+        return this._routeDataAction('icon_response', payload, senderUuid);
 
       case 'DATA_APP_LIST_REQUEST':
-        return this._routeDataAction('app_list_request', decrypted, senderUuid);
+        return this._routeDataAction('app_list_request', payload, senderUuid);
 
       case 'DATA_APP_LIST_RESPONSE':
-        return this._routeDataAction('app_list_response', decrypted, senderUuid);
+        return this._routeDataAction('app_list_response', payload, senderUuid);
 
       case 'DATA_MEDIA_CONTROL':
-        return this._routeDataAction('media_control', decrypted, senderUuid);
+        return this._routeDataAction('media_control', payload, senderUuid);
 
       case 'DATA_FTP':
-        return this._routeDataAction('ftp_message', decrypted, senderUuid);
+        return this._routeDataAction('ftp_message', payload, senderUuid);
 
       case 'DATA_APP_LAUNCH':
-        return this._routeDataAction('app_launch', decrypted, senderUuid);
+        return this._routeDataAction('app_launch', payload, senderUuid);
 
       case 'DATA_STATUS':
-        return this._routeDataAction('status_response', decrypted, senderUuid);
+        return this._routeDataAction('status_response', payload, senderUuid);
 
       default:
         return [action('noop')];
@@ -370,7 +359,7 @@ export class CoreEngine {
         };
         const ackLine = this._encryptMessage('DATA_STATUS', ackPayload, senderUuid);
         if (ackLine) {
-          actions.push(action('send_encrypted', { targetUuid: senderUuid, line: ackLine }));
+          actions.push(action('send_data', { targetUuid: senderUuid, line: ackLine }));
         }
       }
 
@@ -416,12 +405,13 @@ export class CoreEngine {
 
   // ==================== Private: Helpers ====================
 
-  private _encryptMessage(header: string, payload: object, targetUuid: string): string | null {
+  private _buildDataLine(header: string, payload: object): string | null {
     if (!this.localInfo) return null;
-    const secret = this.sharedSecrets.get(targetUuid);
-    if (!secret) return null;
-    const encrypted = encrypt(JSON.stringify(payload), secret);
-    return `${header}:${this.localInfo.uuid}:${this.localInfo.publicKey}:${encrypted}\n`;
+    return `${header}:${this.localInfo.uuid}:${this.localInfo.publicKey}:${JSON.stringify(payload)}\n`;
+  }
+
+  private _encryptMessage(header: string, payload: object, _targetUuid: string): string | null {
+    return this._buildDataLine(header, payload);
   }
 
   private _buildAcceptLine(): string {

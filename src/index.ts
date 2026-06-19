@@ -1,6 +1,3 @@
-import { encrypt, decrypt } from './crypto/aes';
-import { generateKeyPair, computeSharedSecret } from './crypto/ecdh';
-import { hkdfDerive } from './crypto/hkdf';
 import { computeFeatureId, diff as diffStates, buildFullPayload, buildDeltaPayload, buildEndPayload, SuperIslandSendManager } from './diff/superisland';
 import { diffMediaPlay, shouldSendFull, buildMediaPlayFull, buildMediaPlayDelta, buildMediaPlayEnd } from './diff/mediaplay';
 import { RemoteStore } from './diff/store';
@@ -12,14 +9,6 @@ import { classifyNotification, processNotification, extractMetadata, computeDedu
 import { FilterEngine } from './notification/filter';
 import { CoreEngine } from './engine/CoreEngine';
 import type { LocalDeviceInfo } from './engine/CoreEngine';
-
-export const crypto = {
-  aesEncrypt: encrypt,
-  aesDecrypt: decrypt,
-  ecdhGenerateKeyPair: generateKeyPair,
-  ecdhDeriveSharedSecret: computeSharedSecret,
-  hkdfDerive,
-};
 
 export const diff = {
   superIsland: {
