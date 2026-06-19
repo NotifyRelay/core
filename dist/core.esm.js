@@ -4450,8 +4450,9 @@ function parseDataLine(line) {
 function parseHandshake(payload) {
     const parts = payload.split(':');
     const batteryStatus = parts[4] || '0';
-    const isCharging = batteryStatus.startsWith('+');
-    const rawLevel = parseInt(isCharging ? batteryStatus.substring(1) : batteryStatus, 10);
+    // 格式：85+ 或 85（电量在前，充电符号在后）
+    const isCharging = batteryStatus.endsWith('+');
+    const rawLevel = parseInt(isCharging ? batteryStatus.slice(0, -1) : batteryStatus, 10);
     const batteryLevel = isNaN(rawLevel) ? 0 : Math.max(0, Math.min(100, rawLevel));
     return {
         uuid: parts[1],
