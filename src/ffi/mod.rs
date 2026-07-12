@@ -86,8 +86,10 @@ pub extern "C" fn nrc_ecdh_has_keypair(ctx_ptr: *mut std::ffi::c_void) -> i32 {
 #[no_mangle]
 pub extern "C" fn nrc_ecdh_derive_shared_secret(
     ctx_ptr: *mut std::ffi::c_void,
+    peer_uuid: *const c_char,
     peer_pub_key_b64: *const c_char,
 ) -> i32 {
+    let uuid = unsafe { from_cstr(peer_uuid).to_string() };
     let peer = unsafe { from_cstr(peer_pub_key_b64).to_string() };
     with_ctx(ctx_ptr, |ctx| {
         if let Some(ref priv_key) = ctx.crypto.local_key {
@@ -95,9 +97,8 @@ pub extern "C" fn nrc_ecdh_derive_shared_secret(
                 Ok(shared) => {
                     let aes_key = hkdf::derive_session_key(&shared);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                    let device_id = uuid::Uuid::new_v4().to_string();
                     ctx.crypto.device_keys.insert(
-                        device_id,
+                        uuid,
                         crypto::DeviceKeyEntry {
                             remote_pub_key: peer.clone(),
                             aes_key_b64: b64,
@@ -116,19 +117,22 @@ pub extern "C" fn nrc_ecdh_derive_shared_secret(
 #[no_mangle]
 pub extern "C" fn nrc_migrate_shared_secret(
     ctx_ptr: *mut std::ffi::c_void,
-    secret: *const u8,
+    device_uuid: *const c_char,
+    aes_key: *const u8,
     len: u32,
 ) -> i32 {
-    if secret.is_null() || len == 0 {
+    if aes_key.is_null() || len == 0 {
         return -1;
     }
-    let secret_bytes = unsafe { std::slice::from_raw_parts(secret, len as usize) };
+    let uuid = unsafe { from_cstr(device_uuid) };
+    let key_bytes = unsafe { std::slice::from_raw_parts(aes_key, len as usize) };
+    if key_bytes.len() != 32 {
+        return -1;
+    }
     with_ctx(ctx_ptr, |ctx| {
-        let aes_key = hkdf::derive_session_key(secret_bytes);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-        let device_id = uuid::Uuid::new_v4().to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         ctx.crypto.device_keys.insert(
-            device_id,
+            uuid.to_string(),
             crypto::DeviceKeyEntry {
                 remote_pub_key: String::new(),
                 aes_key_b64: b64,
@@ -139,25 +143,39 @@ pub extern "C" fn nrc_migrate_shared_secret(
 }
 
 #[no_mangle]
+pub extern "C" fn nrc_remove_device(
+    ctx_ptr: *mut std::ffi::c_void,
+    device_uuid: *const c_char,
+) -> i32 {
+    let uuid = unsafe { from_cstr(device_uuid) };
+    with_ctx(ctx_ptr, |ctx| {
+        ctx.crypto.device_keys.remove(uuid);
+        0
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn nrc_encrypt_message(
     ctx_ptr: *mut std::ffi::c_void,
     header_prefix: *const c_char,
     local_uuid: *const c_char,
     local_pub_key: *const c_char,
+    remote_uuid: *const c_char,
     plaintext: *const c_char,
 ) -> *mut c_char {
     let header = unsafe { from_cstr(header_prefix) };
     let uuid = unsafe { from_cstr(local_uuid) };
     let pub_key = unsafe { from_cstr(local_pub_key) };
+    let remote = unsafe { from_cstr(remote_uuid) };
     let text = unsafe { from_cstr(plaintext) };
 
     with_ctx(ctx_ptr, |ctx| {
-        let default_key = match ctx.crypto.device_keys.values().next() {
+        let key_b64 = match ctx.crypto.device_keys.get(remote) {
             Some(k) => k.aes_key_b64.clone(),
             None => return std::ptr::null_mut(),
         };
         let key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&default_key)
+            .decode(&key_b64)
             .ok();
         let key_arr: [u8; 32] = match key_bytes {
             Some(b) if b.len() == 32 => {
@@ -190,12 +208,12 @@ pub extern "C" fn nrc_decrypt_message(
             Some(f) => f,
             None => return std::ptr::null_mut(),
         };
-        let default_key = match ctx.crypto.device_keys.values().next() {
+        let key_b64 = match ctx.crypto.device_keys.get(fields.local_uuid) {
             Some(k) => k.aes_key_b64.clone(),
             None => return std::ptr::null_mut(),
         };
         let key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&default_key)
+            .decode(&key_b64)
             .ok();
         let key_arr: [u8; 32] = match key_bytes {
             Some(b) if b.len() == 32 => {
