@@ -290,7 +290,7 @@ pub extern "C" fn nrc_parse_heartbeat(
 ) -> *mut c_char {
     let l = unsafe { from_cstr(line) };
     let result = crate::heartbeat::parse_udp_heartbeat(l)
-        .map(|(u, n, p, b, d)| format!("{}:{}:{}:{:+}:{}", u, n, p, b, d))
+        .map(|(u, n, p, b, d)| crate::protocol::codec::encode_udp_broadcast(&u, &n, p, b, &d))
         .unwrap_or_default();
     to_cstr(&result)
 }

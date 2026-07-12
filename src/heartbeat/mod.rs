@@ -1,3 +1,5 @@
+use crate::protocol::codec;
+
 pub struct HeartbeatState;
 
 impl HeartbeatState {
@@ -13,7 +15,7 @@ pub fn format_udp_heartbeat(
     battery: i32,
     device_type: &str,
 ) -> String {
-    format!("{}:{}:{}:{:+}:{}", uuid, name_b64, port, battery, device_type)
+    codec::encode_udp_broadcast(uuid, name_b64, port, battery, device_type)
 }
 
 pub fn format_tcp_heartbeat(
@@ -21,20 +23,19 @@ pub fn format_tcp_heartbeat(
     name_b64: &str,
     port: u16,
     battery: i32,
+    device_type: &str,
 ) -> String {
-    format!("HEARTBEAT_TCP:{}:{}:{}:{:+}", uuid, name_b64, port, battery)
+    codec::encode_heartbeat_tcp(uuid, name_b64, port, battery, device_type)
 }
 
 pub fn parse_udp_heartbeat(line: &str) -> Option<(String, String, u16, i32, String)> {
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    Some((
-        parts[0].to_string(),
-        parts[1].to_string(),
-        parts[2].parse().unwrap_or(23333),
-        parts[3].parse().unwrap_or(0),
-        parts[4].to_string(),
-    ))
+    codec::decode_discovery_line(line).map(|f| {
+        (
+            f.uuid.to_string(),
+            f.name_b64.to_string(),
+            f.port,
+            f.battery,
+            f.device_type.to_string(),
+        )
+    })
 }

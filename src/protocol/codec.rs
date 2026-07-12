@@ -3,6 +3,34 @@ use crate::protocol::header::ProtocolHeader;
 pub const DEFAULT_TCP_PORT: u16 = 23333;
 pub const DEFAULT_UDP_PORT: u16 = 23334;
 
+fn battery_pairing(battery: i32) -> String {
+    if battery >= 0 {
+        format!("{}+", battery)
+    } else {
+        format!("{}", battery.abs())
+    }
+}
+
+fn parse_battery_pairing(raw: &str) -> i32 {
+    if raw.ends_with('+') {
+        raw.trim_end_matches('+').parse().unwrap_or(0)
+    } else {
+        -raw.parse::<i32>().unwrap_or(0)
+    }
+}
+
+fn battery_hb(battery: i32) -> String {
+    if battery >= 0 {
+        format!("+{}", battery)
+    } else {
+        format!("{}", battery)
+    }
+}
+
+fn parse_battery_hb(raw: &str) -> i32 {
+    raw.parse().unwrap_or(0)
+}
+
 pub fn encode_pairing_init(
     uuid: &str,
     tmp_pub_key: &str,
@@ -11,8 +39,8 @@ pub fn encode_pairing_init(
     device_type: &str,
 ) -> String {
     format!(
-        "PAIRING_INIT:{}:{}:{}:{:+}:{}",
-        uuid, tmp_pub_key, ip, battery, device_type
+        "PAIRING_INIT:{}:{}:{}:{}:{}",
+        uuid, tmp_pub_key, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -26,8 +54,8 @@ pub fn encode_pairing_resp(
     device_type: &str,
 ) -> String {
     format!(
-        "PAIRING_RESP:{}:{}:{}:{}:{}:{:+}:{}",
-        uuid, tmp_pub, lt_pub, encrypted_code, ip, battery, device_type
+        "PAIRING_RESP:{}:{}:{}:{}:{}:{}:{}",
+        uuid, tmp_pub, lt_pub, encrypted_code, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -40,8 +68,8 @@ pub fn encode_accept(
     device_type: &str,
 ) -> String {
     format!(
-        "ACCEPT:{}:{}:{}:{}:{:+}:{}",
-        code, uuid, lt_pub_key, ip, battery, device_type
+        "ACCEPT:{}:{}:{}:{}:{}:{}",
+        code, uuid, lt_pub_key, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -57,8 +85,8 @@ pub fn encode_handshake(
     device_type: &str,
 ) -> String {
     format!(
-        "HANDSHAKE:{}:{}:{}:{:+}:{}",
-        uuid, pub_key, ip, battery, device_type
+        "HANDSHAKE:{}:{}:{}:{}:{}",
+        uuid, pub_key, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -67,10 +95,11 @@ pub fn encode_heartbeat_tcp(
     name: &str,
     port: u16,
     battery: i32,
+    device_type: &str,
 ) -> String {
     format!(
-        "HEARTBEAT_TCP:{}:{}:{}:{:+}",
-        uuid, name, port, battery
+        "HEARTBEAT_TCP:{}:{}:{}:{}:{}",
+        uuid, name, port, battery_hb(battery), device_type
     )
 }
 
@@ -94,8 +123,21 @@ pub fn encode_discovery_manual(
     device_type: &str,
 ) -> String {
     format!(
-        "NOTIFYRELAY_DISCOVER_MANUAL:{}:{}:{}:{:+}:{}",
-        uuid, name_b64, port, battery, device_type
+        "NOTIFYRELAY_DISCOVER_MANUAL:{}:{}:{}:{}:{}",
+        uuid, name_b64, port, battery_hb(battery), device_type
+    )
+}
+
+pub fn encode_udp_broadcast(
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        uuid, name_b64, port, battery_hb(battery), device_type
     )
 }
 
@@ -152,6 +194,24 @@ pub struct HeartbeatTcpFields<'a> {
     pub name: &'a str,
     pub port: u16,
     pub battery: i32,
+    pub device_type: &'a str,
+}
+
+#[derive(Debug)]
+pub struct DiscoveryFields<'a> {
+    pub uuid: &'a str,
+    pub name_b64: &'a str,
+    pub port: u16,
+    pub battery: i32,
+    pub device_type: &'a str,
+}
+
+fn split_parts<'a>(line: &'a str, prefix: &str) -> Vec<&'a str> {
+    if let Some(payload) = line.strip_prefix(prefix) {
+        payload.split(':').collect()
+    } else {
+        line.split(':').collect()
+    }
 }
 
 pub fn decode_pairing_init(line: &str) -> Option<PairingInitFields<'_>> {
@@ -159,16 +219,16 @@ pub fn decode_pairing_init(line: &str) -> Option<PairingInitFields<'_>> {
     if !matches!(h, ProtocolHeader::PairingInit) {
         return None;
     }
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 6 {
+    let parts = split_parts(line, "PAIRING_INIT:");
+    if parts.len() < 5 {
         return None;
     }
     Some(PairingInitFields {
-        uuid: parts[1],
-        tmp_pub_key: parts[2],
-        ip: parts[3],
-        battery: parts[4].parse().unwrap_or(0),
-        device_type: parts[5],
+        uuid: parts[0],
+        tmp_pub_key: parts[1],
+        ip: parts[2],
+        battery: parse_battery_pairing(parts[3]),
+        device_type: parts[4],
     })
 }
 
@@ -177,18 +237,18 @@ pub fn decode_pairing_resp(line: &str) -> Option<PairingRespFields<'_>> {
     if !matches!(h, ProtocolHeader::PairingResp) {
         return None;
     }
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 8 {
+    let parts = split_parts(line, "PAIRING_RESP:");
+    if parts.len() < 7 {
         return None;
     }
     Some(PairingRespFields {
-        uuid: parts[1],
-        tmp_pub: parts[2],
-        lt_pub: parts[3],
-        encrypted_code: parts[4],
-        ip: parts[5],
-        battery: parts[6].parse().unwrap_or(0),
-        device_type: parts[7],
+        uuid: parts[0],
+        tmp_pub: parts[1],
+        lt_pub: parts[2],
+        encrypted_code: parts[3],
+        ip: parts[4],
+        battery: parse_battery_pairing(parts[5]),
+        device_type: parts[6],
     })
 }
 
@@ -197,17 +257,17 @@ pub fn decode_accept(line: &str) -> Option<AcceptFields<'_>> {
     if !matches!(h, ProtocolHeader::Accept) {
         return None;
     }
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 7 {
+    let parts = split_parts(line, "ACCEPT:");
+    if parts.len() < 6 {
         return None;
     }
     Some(AcceptFields {
-        code: parts[1],
-        uuid: parts[2],
-        lt_pub_key: parts[3],
-        ip: parts[4],
-        battery: parts[5].parse().unwrap_or(0),
-        device_type: parts[6],
+        code: parts[0],
+        uuid: parts[1],
+        lt_pub_key: parts[2],
+        ip: parts[3],
+        battery: parse_battery_pairing(parts[4]),
+        device_type: parts[5],
     })
 }
 
@@ -216,16 +276,16 @@ pub fn decode_handshake(line: &str) -> Option<HandshakeFields<'_>> {
     if !matches!(h, ProtocolHeader::Handshake) {
         return None;
     }
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 6 {
+    let parts = split_parts(line, "HANDSHAKE:");
+    if parts.len() < 5 {
         return None;
     }
     Some(HandshakeFields {
-        uuid: parts[1],
-        pub_key: parts[2],
-        ip: parts[3],
-        battery: parts[4].parse().unwrap_or(0),
-        device_type: parts[5],
+        uuid: parts[0],
+        pub_key: parts[1],
+        ip: parts[2],
+        battery: parse_battery_pairing(parts[3]),
+        device_type: parts[4],
     })
 }
 
@@ -251,25 +311,17 @@ pub fn decode_heartbeat_tcp(line: &str) -> Option<HeartbeatTcpFields<'_>> {
     if !matches!(h, ProtocolHeader::HeartbeatTcp) {
         return None;
     }
-    let parts: Vec<&str> = line.split(':').collect();
+    let parts = split_parts(line, "HEARTBEAT_TCP:");
     if parts.len() < 5 {
         return None;
     }
     Some(HeartbeatTcpFields {
-        uuid: parts[1],
-        name: parts[2],
-        port: parts[3].parse().unwrap_or(DEFAULT_TCP_PORT),
-        battery: parts[4].parse().unwrap_or(0),
+        uuid: parts[0],
+        name: parts[1],
+        port: parts[2].parse().unwrap_or(DEFAULT_TCP_PORT),
+        battery: parse_battery_hb(parts[3]),
+        device_type: parts[4],
     })
-}
-
-#[derive(Debug)]
-pub struct DiscoveryFields<'a> {
-    pub uuid: &'a str,
-    pub name_b64: &'a str,
-    pub port: u16,
-    pub battery: i32,
-    pub device_type: &'a str,
 }
 
 pub fn decode_discovery_line(line: &str) -> Option<DiscoveryFields<'_>> {
@@ -281,7 +333,7 @@ pub fn decode_discovery_line(line: &str) -> Option<DiscoveryFields<'_>> {
         uuid: parts[0],
         name_b64: parts[1],
         port: parts[2].parse().unwrap_or(DEFAULT_TCP_PORT),
-        battery: parts[3].parse().unwrap_or(0),
+        battery: parse_battery_hb(parts[3]),
         device_type: parts[4],
     })
 }

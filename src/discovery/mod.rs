@@ -1,3 +1,5 @@
+use crate::protocol::codec;
+
 pub struct DiscoveryState;
 
 impl DiscoveryState {
@@ -13,5 +15,5 @@ pub fn format_discovery_broadcast(
     battery: i32,
     device_type: &str,
 ) -> String {
-    format!("{}:{}:{}:{:+}:{}", uuid, name_b64, port, battery, device_type)
+    codec::encode_udp_broadcast(uuid, name_b64, port, battery, device_type)
 }
