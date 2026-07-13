@@ -60,7 +60,6 @@ pub fn encode_pairing_resp(
 }
 
 pub fn encode_accept(
-    code: &str,
     uuid: &str,
     lt_pub_key: &str,
     ip: &str,
@@ -68,8 +67,8 @@ pub fn encode_accept(
     device_type: &str,
 ) -> String {
     format!(
-        "ACCEPT:{}:{}:{}:{}:{}:{}",
-        code, uuid, lt_pub_key, ip, battery_pairing(battery), device_type
+        "ACCEPT:{}:{}:{}:{}:{}",
+        uuid, lt_pub_key, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -163,7 +162,6 @@ pub struct PairingRespFields<'a> {
 
 #[derive(Debug)]
 pub struct AcceptFields<'a> {
-    pub code: &'a str,
     pub uuid: &'a str,
     pub lt_pub_key: &'a str,
     pub ip: &'a str,
@@ -258,16 +256,15 @@ pub fn decode_accept(line: &str) -> Option<AcceptFields<'_>> {
         return None;
     }
     let parts = split_parts(line, "ACCEPT:");
-    if parts.len() < 6 {
+    if parts.len() < 5 {
         return None;
     }
     Some(AcceptFields {
-        code: parts[0],
-        uuid: parts[1],
-        lt_pub_key: parts[2],
-        ip: parts[3],
-        battery: parse_battery_pairing(parts[4]),
-        device_type: parts[5],
+        uuid: parts[0],
+        lt_pub_key: parts[1],
+        ip: parts[2],
+        battery: parse_battery_pairing(parts[3]),
+        device_type: parts[4],
     })
 }
 

@@ -461,19 +461,17 @@ pub extern "C" fn nrc_format_pairing_resp(
 
 #[no_mangle]
 pub extern "C" fn nrc_format_accept(
-    code: *const c_char,
     uuid: *const c_char,
     lt_pub_key: *const c_char,
     ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) -> *mut c_char {
-    let c = unsafe { from_cstr(code) };
     let u = unsafe { from_cstr(uuid) };
     let l = unsafe { from_cstr(lt_pub_key) };
     let i = unsafe { from_cstr(ip) };
     let d = unsafe { from_cstr(device_type) };
-    to_cstr(&crate::protocol::codec::encode_accept(c, u, l, i, battery, d))
+    to_cstr(&crate::protocol::codec::encode_accept(u, l, i, battery, d))
 }
 
 #[no_mangle]
