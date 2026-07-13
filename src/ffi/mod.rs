@@ -373,6 +373,125 @@ pub extern "C" fn nrc_import_state(
 }
 
 #[no_mangle]
+pub extern "C" fn nrc_format_tcp_heartbeat(
+    uuid: *const c_char,
+    name_b64: *const c_char,
+    port: u16,
+    battery: i32,
+    device_type: *const c_char,
+) -> *mut c_char {
+    let u = unsafe { from_cstr(uuid) };
+    let n = unsafe { from_cstr(name_b64) };
+    let dt = unsafe { from_cstr(device_type) };
+    let result = crate::heartbeat::format_tcp_heartbeat(u, n, port, battery, dt);
+    to_cstr(&result)
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_parse_heartbeat_json(line: *const c_char) -> *mut c_char {
+    let l = unsafe { from_cstr(line) };
+    let result = crate::heartbeat::parse_udp_heartbeat(l).map(
+        |(uuid, name, port, battery, device_type)| {
+            serde_json::json!({
+                "uuid": uuid,
+                "name_b64": name,
+                "port": port,
+                "battery": battery,
+                "device_type": device_type,
+            })
+        },
+    );
+    match result {
+        Some(json) => to_cstr(&json.to_string()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_parse_heartbeat_tcp_json(line: *const c_char) -> *mut c_char {
+    let l = unsafe { from_cstr(line) };
+    let result = crate::protocol::codec::decode_heartbeat_tcp(l).map(|f| {
+        serde_json::json!({
+            "uuid": f.uuid,
+            "name_b64": f.name,
+            "port": f.port,
+            "battery": f.battery,
+            "device_type": f.device_type,
+        })
+    });
+    match result {
+        Some(json) => to_cstr(&json.to_string()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_format_pairing_init(
+    uuid: *const c_char,
+    tmp_pub_key: *const c_char,
+    ip: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+) -> *mut c_char {
+    let u = unsafe { from_cstr(uuid) };
+    let t = unsafe { from_cstr(tmp_pub_key) };
+    let i = unsafe { from_cstr(ip) };
+    let d = unsafe { from_cstr(device_type) };
+    to_cstr(&crate::protocol::codec::encode_pairing_init(u, t, i, battery, d))
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_format_pairing_resp(
+    uuid: *const c_char,
+    tmp_pub: *const c_char,
+    lt_pub: *const c_char,
+    encrypted_code: *const c_char,
+    ip: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+) -> *mut c_char {
+    let u = unsafe { from_cstr(uuid) };
+    let t = unsafe { from_cstr(tmp_pub) };
+    let l = unsafe { from_cstr(lt_pub) };
+    let e = unsafe { from_cstr(encrypted_code) };
+    let i = unsafe { from_cstr(ip) };
+    let d = unsafe { from_cstr(device_type) };
+    to_cstr(&crate::protocol::codec::encode_pairing_resp(u, t, l, e, i, battery, d))
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_format_accept(
+    code: *const c_char,
+    uuid: *const c_char,
+    lt_pub_key: *const c_char,
+    ip: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+) -> *mut c_char {
+    let c = unsafe { from_cstr(code) };
+    let u = unsafe { from_cstr(uuid) };
+    let l = unsafe { from_cstr(lt_pub_key) };
+    let i = unsafe { from_cstr(ip) };
+    let d = unsafe { from_cstr(device_type) };
+    to_cstr(&crate::protocol::codec::encode_accept(c, u, l, i, battery, d))
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_format_handshake(
+    uuid: *const c_char,
+    pub_key: *const c_char,
+    ip: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+) -> *mut c_char {
+    let u = unsafe { from_cstr(uuid) };
+    let p = unsafe { from_cstr(pub_key) };
+    let i = unsafe { from_cstr(ip) };
+    let d = unsafe { from_cstr(device_type) };
+    to_cstr(&crate::protocol::codec::encode_handshake(u, p, i, battery, d))
+}
+
+#[no_mangle]
 pub extern "C" fn nrc_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
