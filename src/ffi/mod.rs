@@ -8,9 +8,6 @@ use crate::{
     SafeContext,
 };
 
-type NrcMessageCallback = extern "C" fn(*const c_char, *const c_char, *mut std::ffi::c_void);
-type NrcPairingCallback = extern "C" fn(*const c_char, *const c_char, *const c_char, *mut std::ffi::c_void);
-
 fn to_cstr(s: &str) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
@@ -234,64 +231,137 @@ pub extern "C" fn nrc_decrypt_message(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_process_line(
+pub extern "C" fn nrc_decode_line(
     ctx_ptr: *mut std::ffi::c_void,
     line: *const c_char,
-    on_message: Option<NrcMessageCallback>,
-    on_pairing: Option<NrcPairingCallback>,
-    user_data: *mut std::ffi::c_void,
-) -> i32 {
+) -> *mut c_char {
     let line_str = unsafe { from_cstr(line) };
     if line_str.is_empty() {
-        return -1;
+        return std::ptr::null_mut();
     }
-    with_ctx(ctx_ptr, |ctx| {
-        let header = crate::protocol::header::ProtocolHeader::parse(line_str);
-        let header_str = header.to_string();
 
-        match header {
-            crate::protocol::header::ProtocolHeader::Data(_) => {
-                if let Some(ref cb) = on_message {
-                    if let Some(fields) = crate::protocol::codec::decode_data_message(line_str) {
-                        let h_cstr = CString::new(fields.header)
-                            .unwrap_or_default();
-                        let p_cstr = CString::new(fields.encrypted_payload)
-                            .unwrap_or_default();
-                        cb(h_cstr.as_ptr(), p_cstr.as_ptr(), user_data);
+    let header = crate::protocol::header::ProtocolHeader::parse(line_str);
+
+    match header {
+        crate::protocol::header::ProtocolHeader::Data(hdr) => {
+            with_ctx(ctx_ptr, |ctx| {
+                let fields = match crate::protocol::codec::decode_data_message(line_str) {
+                    Some(f) => f,
+                    None => return std::ptr::null_mut(),
+                };
+                let key_b64 = match ctx.crypto.device_keys.get(fields.local_uuid) {
+                    Some(k) => k.aes_key_b64.clone(),
+                    None => return std::ptr::null_mut(),
+                };
+                let key_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&key_b64).ok();
+                let key_arr: [u8; 32] = match key_bytes {
+                    Some(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
                     }
+                    _ => return std::ptr::null_mut(),
+                };
+                match crate::crypto::aes::decrypt(&key_arr, fields.encrypted_payload) {
+                    Ok(plain) => {
+                        let plaintext = String::from_utf8_lossy(&plain).to_string();
+                        let json = serde_json::json!({
+                            "header": hdr,
+                            "type": "data",
+                            "local_uuid": fields.local_uuid,
+                            "plaintext": plaintext,
+                        });
+                        to_cstr(&json.to_string())
+                    }
+                    Err(_) => std::ptr::null_mut(),
                 }
-                ctx.router.process_line(line_str);
-                0
-            }
-            crate::protocol::header::ProtocolHeader::PairingInit
-            | crate::protocol::header::ProtocolHeader::PairingResp
-            | crate::protocol::header::ProtocolHeader::Accept
-            | crate::protocol::header::ProtocolHeader::Handshake => {
-                if let Some(ref cb) = on_pairing {
-                    let parts: Vec<&str> = line_str.splitn(4, ':').collect();
-                    let uuid = if parts.len() > 1 { parts[1] } else { "" };
-                    let pub_key = if parts.len() > 2 { parts[2] } else { "" };
-                    let h_cstr = CString::new(header_str).unwrap_or_default();
-                    let u_cstr = CString::new(uuid).unwrap_or_default();
-                    let p_cstr = CString::new(pub_key).unwrap_or_default();
-                    cb(h_cstr.as_ptr(), u_cstr.as_ptr(), p_cstr.as_ptr(), user_data);
+            })
+        }
+        crate::protocol::header::ProtocolHeader::Handshake => {
+            match crate::protocol::codec::decode_handshake(line_str) {
+                Some(f) => {
+                    let json = serde_json::json!({
+                        "header": "HANDSHAKE",
+                        "uuid": f.uuid,
+                        "pub_key": f.pub_key,
+                        "ip": f.ip,
+                        "battery": f.battery,
+                        "device_type": f.device_type,
+                    });
+                    to_cstr(&json.to_string())
                 }
-                ctx.router.process_line(line_str);
-                0
-            }
-            _ => {
-                ctx.router.process_line(line_str);
-                -1
+                None => std::ptr::null_mut(),
             }
         }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_parse_protocol_header(line: *const c_char) -> *mut c_char {
-    let line_str = unsafe { from_cstr(line) };
-    let header = crate::protocol::header::ProtocolHeader::parse(line_str);
-    to_cstr(&header.to_string())
+        crate::protocol::header::ProtocolHeader::PairingInit => {
+            match crate::protocol::codec::decode_pairing_init(line_str) {
+                Some(f) => {
+                    let json = serde_json::json!({
+                        "header": "PAIRING_INIT",
+                        "uuid": f.uuid,
+                        "tmp_pub_key": f.tmp_pub_key,
+                        "ip": f.ip,
+                        "battery": f.battery,
+                        "device_type": f.device_type,
+                    });
+                    to_cstr(&json.to_string())
+                }
+                None => std::ptr::null_mut(),
+            }
+        }
+        crate::protocol::header::ProtocolHeader::PairingResp => {
+            match crate::protocol::codec::decode_pairing_resp(line_str) {
+                Some(f) => {
+                    let json = serde_json::json!({
+                        "header": "PAIRING_RESP",
+                        "uuid": f.uuid,
+                        "tmp_pub": f.tmp_pub,
+                        "lt_pub": f.lt_pub,
+                        "encrypted_code": f.encrypted_code,
+                        "ip": f.ip,
+                        "battery": f.battery,
+                        "device_type": f.device_type,
+                    });
+                    to_cstr(&json.to_string())
+                }
+                None => std::ptr::null_mut(),
+            }
+        }
+        crate::protocol::header::ProtocolHeader::Accept => {
+            match crate::protocol::codec::decode_accept(line_str) {
+                Some(f) => {
+                    let json = serde_json::json!({
+                        "header": "ACCEPT",
+                        "uuid": f.uuid,
+                        "lt_pub_key": f.lt_pub_key,
+                        "ip": f.ip,
+                        "battery": f.battery,
+                        "device_type": f.device_type,
+                    });
+                    to_cstr(&json.to_string())
+                }
+                None => std::ptr::null_mut(),
+            }
+        }
+        crate::protocol::header::ProtocolHeader::HeartbeatTcp => {
+            match crate::protocol::codec::decode_heartbeat_tcp(line_str) {
+                Some(f) => {
+                    let json = serde_json::json!({
+                        "header": "HEARTBEAT_TCP",
+                        "uuid": f.uuid,
+                        "name_b64": f.name,
+                        "port": f.port,
+                        "battery": f.battery,
+                        "device_type": f.device_type,
+                    });
+                    to_cstr(&json.to_string())
+                }
+                None => std::ptr::null_mut(),
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
