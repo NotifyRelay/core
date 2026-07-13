@@ -288,6 +288,13 @@ pub extern "C" fn nrc_process_line(
 }
 
 #[no_mangle]
+pub extern "C" fn nrc_parse_protocol_header(line: *const c_char) -> *mut c_char {
+    let line_str = unsafe { from_cstr(line) };
+    let header = crate::protocol::header::ProtocolHeader::parse(line_str);
+    to_cstr(&header.to_string())
+}
+
+#[no_mangle]
 pub extern "C" fn nrc_format_heartbeat(
     uuid: *const c_char,
     name: *const c_char,
