@@ -1,74 +1,88 @@
-use crate::protocol::{
-    codec,
-    header::ProtocolHeader,
-};
+use std::os::raw::c_char;
+use std::os::raw::c_void;
 
-pub type MessageCallback = Box<dyn Fn(&str, &str) + Send + 'static>;
-pub type PairingCallback = Box<dyn Fn(&str, &str, &str) + Send + 'static>;
+pub type OnHandshakeCb =
+    Option<extern "C" fn(*const c_char, *const c_char, *const c_char, i32, *const c_char, *mut c_void)>;
+pub type OnPairingInitCb =
+    Option<extern "C" fn(*const c_char, *const c_char, *const c_char, i32, *const c_char, *mut c_void)>;
+pub type OnPairingRespCb = Option<
+    extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        i32,
+        *const c_char,
+        *mut c_void,
+    ),
+>;
+pub type OnAcceptCb =
+    Option<extern "C" fn(*const c_char, *const c_char, *const c_char, i32, *const c_char, *mut c_void)>;
+pub type OnRejectCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+pub type OnHeartbeatTcpCb = Option<
+    extern "C" fn(
+        *const c_char,
+        *const c_char,
+        u16,
+        i32,
+        *const c_char,
+        *const c_char,
+        *mut c_void,
+    ),
+>;
+pub type OnDiscoverManualCb =
+    Option<extern "C" fn(*const c_char, *const c_char, u16, i32, *const c_char, *mut c_void)>;
+pub type OnDataCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
 
 pub struct Router {
-    pub on_message: Option<MessageCallback>,
-    pub on_pairing: Option<PairingCallback>,
+    pub user_data: *mut c_void,
+    pub on_handshake: OnHandshakeCb,
+    pub on_pairing_init: OnPairingInitCb,
+    pub on_pairing_resp: OnPairingRespCb,
+    pub on_accept: OnAcceptCb,
+    pub on_reject: OnRejectCb,
+    pub on_heartbeat_tcp: OnHeartbeatTcpCb,
+    pub on_discover_manual: OnDiscoverManualCb,
+    pub on_notification: OnDataCb,
+    pub on_media_play: OnDataCb,
+    pub on_icon_request: OnDataCb,
+    pub on_icon_response: OnDataCb,
+    pub on_app_list_request: OnDataCb,
+    pub on_app_list_response: OnDataCb,
+    pub on_media_control: OnDataCb,
+    pub on_ftp: OnDataCb,
+    pub on_clipboard: OnDataCb,
+    pub on_status: OnDataCb,
+    pub on_app_launch: OnDataCb,
+    pub on_superisland: OnDataCb,
+    pub on_unknown_data: OnDataCb,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
-            on_message: None,
-            on_pairing: None,
-        }
-    }
-
-    pub fn set_callbacks(
-        &mut self,
-        on_msg: Option<MessageCallback>,
-        on_pairing: Option<PairingCallback>,
-    ) {
-        self.on_message = on_msg;
-        self.on_pairing = on_pairing;
-    }
-
-    pub fn process_line(&self, line: &str) {
-        let header = ProtocolHeader::parse(line);
-        match header {
-            ProtocolHeader::PairingInit => {
-                if let Some(fields) = codec::decode_pairing_init(line) {
-                    if let Some(ref cb) = self.on_pairing {
-                        cb("PAIRING_INIT", fields.uuid, fields.tmp_pub_key);
-                    }
-                }
-            }
-            ProtocolHeader::PairingResp => {
-                if let Some(fields) = codec::decode_pairing_resp(line) {
-                    if let Some(ref cb) = self.on_pairing {
-                        cb("PAIRING_RESP", fields.uuid, fields.encrypted_code);
-                    }
-                }
-            }
-            ProtocolHeader::Accept => {
-                if let Some(fields) = codec::decode_accept(line) {
-                    if let Some(ref cb) = self.on_pairing {
-                        cb("ACCEPT", fields.uuid, fields.lt_pub_key);
-                    }
-                }
-            }
-            ProtocolHeader::Handshake => {
-                if let Some(fields) = codec::decode_handshake(line) {
-                    if let Some(ref cb) = self.on_pairing {
-                        cb("HANDSHAKE", fields.uuid, fields.pub_key);
-                    }
-                }
-            }
-            ProtocolHeader::Data(_) => {
-                if let Some(fields) = codec::decode_data_message(line) {
-                    if let Some(ref cb) = self.on_message {
-                        cb(fields.header, fields.encrypted_payload);
-                    }
-                }
-            }
-            _ => {
-                log::debug!("unhandled protocol line: {}", line);
-            }
+            user_data: std::ptr::null_mut(),
+            on_handshake: None,
+            on_pairing_init: None,
+            on_pairing_resp: None,
+            on_accept: None,
+            on_reject: None,
+            on_heartbeat_tcp: None,
+            on_discover_manual: None,
+            on_notification: None,
+            on_media_play: None,
+            on_icon_request: None,
+            on_icon_response: None,
+            on_app_list_request: None,
+            on_app_list_response: None,
+            on_media_control: None,
+            on_ftp: None,
+            on_clipboard: None,
+            on_status: None,
+            on_app_launch: None,
+            on_superisland: None,
+            on_unknown_data: None,
         }
     }
 }
