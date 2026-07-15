@@ -968,3 +968,39 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
         }
     }
 }
+
+// ==================== JSON creator helpers ====================
+
+fn create_json_impl<T>(input: &str) -> Option<String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    serde_json::from_str::<T>(input)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+}
+
+macro_rules! make_create_fn {
+    ($name:ident, $ty:ty) => {
+        #[no_mangle]
+        pub extern "C" fn $name(input: *const c_char) -> *mut c_char {
+            let s = unsafe { from_cstr(input) };
+            match create_json_impl::<$ty>(s) {
+                Some(j) => to_cstr(&j),
+                None => std::ptr::null_mut(),
+            }
+        }
+    };
+}
+
+make_create_fn!(nrc_create_notification_json, crate::models::Notification);
+make_create_fn!(nrc_create_clipboard_json, crate::models::ClipboardData);
+make_create_fn!(nrc_create_media_control_json, crate::models::MediaControl);
+make_create_fn!(nrc_create_media_payload_json, crate::models::MediaPayload);
+make_create_fn!(nrc_create_icon_request_json, crate::models::IconRequest);
+make_create_fn!(nrc_create_icon_response_json, crate::models::IconResponse);
+make_create_fn!(nrc_create_app_list_request_json, crate::models::AppListRequest);
+make_create_fn!(nrc_create_app_list_response_json, crate::models::AppListResponse);
+make_create_fn!(nrc_create_ftp_message_json, crate::models::FtpMessage);
+make_create_fn!(nrc_create_status_message_json, crate::models::StatusMessage);
+make_create_fn!(nrc_create_app_launch_json, crate::models::AppLaunch);

@@ -21,28 +21,43 @@ pub struct Notification {
 pub struct MediaPayload {
     pub package_name: String,
     pub app_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     pub time: i64,
     pub is_locked: bool,
     pub media_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminate_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub feature_key_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub feature_key_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pics: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub param_v2_raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub changes: Option<MediaPayloadChanges>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaPayloadChanges {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub param_v2_raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pics: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pics_removed: Option<Vec<String>>,
 }
 
@@ -52,6 +67,7 @@ pub struct MediaPayloadChanges {
 #[serde(rename_all = "camelCase")]
 pub struct MediaControl {
     pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
 }
 
@@ -70,7 +86,9 @@ pub struct ClipboardData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IconRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub package_names: Option<Vec<String>>,
     pub time: i64,
 }
@@ -78,9 +96,13 @@ pub struct IconRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IconResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<IconItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub missing: Option<serde_json::Value>,
     pub time: i64,
 }
@@ -123,9 +145,13 @@ pub struct AppInfo {
 #[serde(rename_all = "camelCase")]
 pub struct FtpMessage {
     pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }
 
@@ -136,11 +162,17 @@ pub struct FtpMessage {
 pub struct StatusMessage {
     pub original_header: String,
     pub result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub feature_key_value: Option<String>,
 }
 
@@ -151,5 +183,6 @@ pub struct StatusMessage {
 pub struct AppLaunch {
     pub action: String,
     pub package_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_id: Option<i32>,
 }
