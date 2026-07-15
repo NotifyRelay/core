@@ -1,8 +1,54 @@
 ﻿use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 
 use base64::Engine;
+
+// ==================== Log bridge (platform-customizable) ====================
+
+type LogCb = extern "C" fn(i32, *const c_char);
+
+static LOG_CB: AtomicUsize = AtomicUsize::new(0);
+static LOG_INIT: Once = Once::new();
+
+struct PlatformLogBridge;
+
+impl log::Log for PlatformLogBridge {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        let val = LOG_CB.load(Ordering::Relaxed);
+        if val == 0 {
+            return;
+        }
+        let cb: LogCb = unsafe { std::mem::transmute(val) };
+        if let Ok(c_msg) = CString::new(format!("{}", record.args())) {
+            cb(record.level() as i32, c_msg.as_ptr());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOG_BRIDGE: PlatformLogBridge = PlatformLogBridge;
+
+fn init_log_bridge() {
+    LOG_INIT.call_once(|| {
+        log::set_logger(&LOG_BRIDGE).ok();
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_set_log_callback(cb: Option<LogCb>) {
+    let val = match cb {
+        Some(f) => f as usize,
+        None => 0,
+    };
+    LOG_CB.store(val, Ordering::Release);
+}
 
 use crate::{
     crypto::{self, aes, ecdh, hkdf},
@@ -40,6 +86,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn nrc_init() -> *mut c_void {
+    init_log_bridge();
     let ctx = Box::new(std::sync::Mutex::new(CoreContext::new()));
     Box::into_raw(ctx) as *mut c_void
 }
@@ -587,18 +634,28 @@ make_cb_setter!(nrc_set_on_unknown_data_cb, crate::router::OnDataCb, on_unknown_
 
 fn dispatch_data(cb: crate::router::OnDataCb, local_uuid: &str, plaintext: &str, ud: *mut c_void) {
     if let Some(cb) = cb {
+        log::debug!("dispatch_data: uuid={}, len={}", local_uuid, plaintext.len());
         let uuid_c = CString::new(local_uuid).unwrap_or_default();
         let text_c = CString::new(plaintext).unwrap_or_default();
         cb(uuid_c.as_ptr(), text_c.as_ptr(), ud);
+    } else {
+        log::warn!("dispatch_data: no callback for uuid={}", local_uuid);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || line.is_null() { return -1; }
+    if ctx_ptr.is_null() || line.is_null() {
+        log::error!("process_line: null pointer");
+        return -1;
+    }
     let line_str = unsafe { from_cstr(line) };
-    if line_str.is_empty() { return -1; }
+    if line_str.is_empty() {
+        log::error!("process_line: empty line");
+        return -1;
+    }
     let header = ProtocolHeader::parse(line_str);
+    log::debug!("process_line: type={:?}", header);
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     match header {
         ProtocolHeader::Handshake => {
@@ -611,10 +668,16 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let pk = CString::new(f.pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
+                    log::debug!("process_line: dispatching HANDSHAKE uuid={}", f.uuid);
                     cb(uuid.as_ptr(), pk.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_handshake callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode HANDSHAKE");
+                -1
+            }
         }
         ProtocolHeader::PairingInit => {
             if let Some(f) = codec::decode_pairing_init(line_str) {
@@ -626,10 +689,16 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let tmp = CString::new(f.tmp_pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
+                    log::debug!("process_line: dispatching PAIRING_INIT uuid={}", f.uuid);
                     cb(uuid.as_ptr(), tmp.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_pairing_init callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode PAIRING_INIT");
+                -1
+            }
         }
         ProtocolHeader::PairingResp => {
             if let Some(f) = codec::decode_pairing_resp(line_str) {
@@ -643,10 +712,16 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let enc = CString::new(f.encrypted_code).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
+                    log::debug!("process_line: dispatching PAIRING_RESP uuid={}", f.uuid);
                     cb(uuid.as_ptr(), tmp.as_ptr(), lt.as_ptr(), enc.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_pairing_resp callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode PAIRING_RESP");
+                -1
+            }
         }
         ProtocolHeader::Accept => {
             if let Some(f) = codec::decode_accept(line_str) {
@@ -658,10 +733,16 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let lt = CString::new(f.lt_pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
+                    log::debug!("process_line: dispatching ACCEPT uuid={}", f.uuid);
                     cb(uuid.as_ptr(), lt.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_accept callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode ACCEPT");
+                -1
+            }
         }
         ProtocolHeader::Reject => {
             if let Some(payload) = line_str.strip_prefix("REJECT:") {
@@ -669,11 +750,17 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                 let cb = guard.router.on_reject; let ud = guard.router.user_data;
                 drop(guard);
                 if let Some(cb) = cb {
+                    log::debug!("process_line: dispatching REJECT uuid={}", payload);
                     let uuid_c = CString::new(payload).unwrap_or_default();
                     cb(uuid_c.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_reject callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode REJECT");
+                -1
+            }
         }
         ProtocolHeader::HeartbeatTcp => {
             if let Some(f) = codec::decode_heartbeat_tcp(line_str) {
@@ -685,10 +772,16 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let name = CString::new(f.name).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
                     let ip = CString::new("").unwrap_or_default();
+                    log::debug!("process_line: dispatching HEARTBEAT_TCP uuid={}", f.uuid);
                     cb(uuid.as_ptr(), name.as_ptr(), f.port, f.battery, dt.as_ptr(), ip.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_heartbeat_tcp callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode HEARTBEAT_TCP");
+                -1
+            }
         }
         ProtocolHeader::DiscoverManual => {
             if let Some(f) = codec::decode_discovery_line(line_str) {
@@ -699,14 +792,31 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                     let uuid = CString::new(f.uuid).unwrap_or_default();
                     let name = CString::new(f.name_b64).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
+                    log::debug!("process_line: dispatching DISCOVER_MANUAL uuid={}", f.uuid);
                     cb(uuid.as_ptr(), name.as_ptr(), f.port, f.battery, dt.as_ptr(), ud);
+                } else {
+                    log::warn!("process_line: on_discover_manual callback not registered");
                 }
                 0
-            } else { -1 }
+            } else {
+                log::error!("process_line: failed to decode DISCOVER_MANUAL");
+                -1
+            }
         }
         ProtocolHeader::Data(hdr) => {
-            let fields = match codec::decode_data_message(line_str) { Some(f) => f, None => return -1 };
-            let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+            log::debug!("process_line: DATA message header={}", hdr);
+            let fields = match codec::decode_data_message(line_str) {
+                Some(f) => f, None => {
+                    log::error!("process_line: failed to decode DATA message");
+                    return -1;
+                }
+            };
+            let guard = match ctx.lock() {
+                Ok(g) => g, Err(_) => {
+                    log::error!("process_line: lock failed for DATA message");
+                    return -1;
+                }
+            };
             let key_b64 = guard.crypto.device_keys.get(fields.local_uuid)
                 .map(|k| k.aes_key_b64.clone());
             let (cb_notif, cb_media, cb_icon_req, cb_icon_resp,
@@ -719,16 +829,30 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                  r.user_data)
             };
             drop(guard);
-            let key_b64 = match key_b64 { Some(k) => k, None => return -1 };
+            let key_b64 = match key_b64 {
+                Some(k) => k, None => {
+                    log::warn!("process_line: no key for uuid={}, header={}", fields.local_uuid, hdr);
+                    return -1;
+                }
+            };
             let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
-                Ok(b) if b.len() == 32 => b, _ => return -1,
+                Ok(b) if b.len() == 32 => b, _ => {
+                    log::error!("process_line: invalid key for uuid={}", fields.local_uuid);
+                    return -1;
+                }
             };
             let mut key_arr = [0u8; 32]; key_arr.copy_from_slice(&key_bytes);
+            log::debug!("process_line: decrypting DATA header={}, uuid={}, payload_len={}",
+                hdr, fields.local_uuid, fields.encrypted_payload.len());
             let plain = match aes::decrypt(&key_arr, fields.encrypted_payload) {
-                Ok(p) => p, Err(_) => return -1,
+                Ok(p) => p, Err(_) => {
+                    log::error!("process_line: decryption failed header={}, uuid={}", hdr, fields.local_uuid);
+                    return -1;
+                }
             };
             let plaintext = String::from_utf8_lossy(&plain).to_string();
             let uuid_s = fields.local_uuid;
+            log::info!("process_line: DATA decrypted header={}, uuid={}, plaintext_len={}", hdr, uuid_s, plaintext.len());
             match hdr {
                 "DATA_NOTIFICATION" => dispatch_data(cb_notif, uuid_s, &plaintext, ud),
                 "DATA_MEDIAPLAY" => dispatch_data(cb_media, uuid_s, &plaintext, ud),
@@ -746,6 +870,9 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
             }
             0
         }
-        _ => -1,
+        _ => {
+            log::warn!("process_line: unhandled message type");
+            -1
+        }
     }
 }
