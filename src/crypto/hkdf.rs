@@ -3,6 +3,12 @@ use sha2::Sha256;
 
 pub const PAIRING_CODE_INFO: &[u8] = b"pairing-code-encryption";
 pub const SESSION_KEY_INFO: &[u8] = b"NotifyRelay-ECDH-v1";
+pub const LOCAL_STATE_SALT: &[u8] = b"notify-relay-local-state-v1";
+pub const LOCAL_STATE_INFO: &[u8] = b"local-state-key";
+
+pub fn derive_local_state_key(device_uuid: &str) -> [u8; 32] {
+    derive_key(device_uuid.as_bytes(), LOCAL_STATE_INFO, Some(LOCAL_STATE_SALT))
+}
 
 fn derive_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> [u8; 32] {
     let default_salt = [0u8; 32];

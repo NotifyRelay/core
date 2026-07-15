@@ -381,6 +381,45 @@ pub extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_char) ->
     })
 }
 
+// ==================== Local state encryption (device-uuid-keyed) ====================
+
+#[no_mangle]
+pub extern "C" fn nrc_encrypt_local_state(
+    ctx_ptr: *mut c_void,
+    plaintext: *const c_char,
+    device_uuid: *const c_char,
+) -> *mut c_char {
+    let text = unsafe { from_cstr(plaintext) };
+    let uuid = unsafe { from_cstr(device_uuid) };
+    with_ctx(ctx_ptr, |_ctx| {
+        let key = hkdf::derive_local_state_key(uuid);
+        match aes::encrypt(&key, text.as_bytes()) {
+            Ok(enc) => to_cstr(&enc),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_decrypt_local_state(
+    ctx_ptr: *mut c_void,
+    encrypted_b64: *const c_char,
+    device_uuid: *const c_char,
+) -> *mut c_char {
+    let enc = unsafe { from_cstr(encrypted_b64) };
+    let uuid = unsafe { from_cstr(device_uuid) };
+    with_ctx(ctx_ptr, |_ctx| {
+        let key = hkdf::derive_local_state_key(uuid);
+        match aes::decrypt(&key, enc) {
+            Ok(plain) => {
+                let s = String::from_utf8_lossy(&plain).to_string();
+                to_cstr(&s)
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
 // ==================== Message encrypt/decrypt (original) ====================
 
 #[no_mangle]
