@@ -184,7 +184,8 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
         }
         ProtocolHeader::HeartbeatTcp => {
             if let Some(f) = codec::decode_heartbeat_tcp(line_str) {
-                let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                guard.heartbeat.record(&f.uuid);
                 let cb = guard.router.on_heartbeat_tcp; let ud = guard.router.user_data;
                 drop(guard);
                 if let Some(cb) = cb {
@@ -330,7 +331,8 @@ pub extern "C" fn nrc_process_udp_broadcast(ctx_ptr: *mut c_void, line: *const c
         Some((uuid, name_b64, port, battery, device_type)) => {
             let (cb, ud) = {
                 let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                guard.heartbeat.record(&uuid);
                 (guard.router.on_heartbeat_udp, guard.router.user_data)
             };
             if let Some(cb_fn) = cb {

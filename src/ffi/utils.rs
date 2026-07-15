@@ -84,6 +84,67 @@ pub extern "C" fn nrc_parse_heartbeat_with_cb(
 }
 
 #[no_mangle]
+pub extern "C" fn nrc_heartbeat_tick(ctx_ptr: *mut c_void, timeout_sec: i64) -> i32 {
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+    let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
+    let cb = guard.router.on_device_timeout;
+    let ud = guard.router.user_data;
+    drop(guard);
+    let count = timed_out.len() as i32;
+    for uuid in &timed_out {
+        if let Some(cb_fn) = cb {
+            if let Ok(c_uuid) = CString::new(uuid.as_str()) {
+                cb_fn(c_uuid.as_ptr(), ud);
+            }
+        }
+    }
+    count
+}
+
+/// 检查去重并标记 pending。返回 1 = 应发送，0 = 重复
+#[no_mangle]
+pub extern "C" fn nrc_dedup_check_and_pend(
+    ctx_ptr: *mut c_void,
+    dedup_key: *const c_char,
+    ttl_ms: i64,
+) -> i32 {
+    let key = unsafe { from_cstr(dedup_key) };
+    if key.is_empty() { return 0; }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return 0 };
+    if guard.dedup.check_and_pend(key, ttl_ms) { 1 } else { 0 }
+}
+
+/// 标记发送成功（从 pending 移至 sent）
+#[no_mangle]
+pub extern "C" fn nrc_dedup_mark_sent(ctx_ptr: *mut c_void, dedup_key: *const c_char) {
+    let key = unsafe { from_cstr(dedup_key) };
+    if key.is_empty() { return; }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
+    guard.dedup.mark_sent(key);
+}
+
+/// 清除 pending（发送失败时）
+#[no_mangle]
+pub extern "C" fn nrc_dedup_clear_pending(ctx_ptr: *mut c_void, dedup_key: *const c_char) {
+    let key = unsafe { from_cstr(dedup_key) };
+    if key.is_empty() { return; }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
+    guard.dedup.clear_pending(key);
+}
+
+/// 清理过期的已发送记录
+#[no_mangle]
+pub extern "C" fn nrc_dedup_cleanup(ctx_ptr: *mut c_void, now_ms: i64, ttl_ms: i64) {
+    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
+    guard.dedup.cleanup(now_ms, ttl_ms);
+}
+
+#[no_mangle]
 pub extern "C" fn nrc_parse_heartbeat_tcp_with_cb(
     line: *const c_char,
     cb: Option<extern "C" fn(*const c_char, *const c_char, u16, i32, *const c_char, *const c_char, *mut c_void)>,

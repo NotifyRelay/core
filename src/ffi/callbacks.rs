@@ -36,6 +36,8 @@ make_cb_setter!(nrc_set_on_send_cb, crate::router::OnSendCb, on_send);
 make_cb_setter!(nrc_set_on_send_udp_cb, crate::router::OnSendCb, on_send_udp);
 make_cb_setter!(nrc_set_on_heartbeat_udp_cb, crate::router::OnHeartbeatUdpCb, on_heartbeat_udp);
 
+make_cb_setter!(nrc_set_on_device_timeout_cb, crate::router::OnDeviceTimeoutCb, on_device_timeout);
+
 #[no_mangle]
 pub extern "C" fn nrc_set_user_data(ctx_ptr: *mut c_void, user_data: *mut c_void) {
     with_ctx(ctx_ptr, |ctx| { ctx.router.user_data = user_data; });

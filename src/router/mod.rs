@@ -44,6 +44,8 @@ pub type OnHeartbeatUdpCb = Option<
     ),
 >;
 
+pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+
 pub struct Router {
     pub user_data: *mut c_void,
     pub on_handshake: OnHandshakeCb,
@@ -68,6 +70,7 @@ pub struct Router {
     pub on_send: OnSendCb,
     pub on_send_udp: OnSendCb,
     pub on_heartbeat_udp: OnHeartbeatUdpCb,
+    pub on_device_timeout: OnDeviceTimeoutCb,
 }
 
 impl Router {
@@ -96,6 +99,7 @@ impl Router {
             on_send: None,
             on_send_udp: None,
             on_heartbeat_udp: None,
+            on_device_timeout: None,
         }
     }
 }
