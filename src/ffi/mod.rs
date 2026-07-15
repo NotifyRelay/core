@@ -902,18 +902,62 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
             let uuid_s = fields.local_uuid;
             log::info!("处理消息: DATA 解密成功 header={}, uuid={}, 明文长度={}", hdr, uuid_s, plaintext.len());
             match hdr {
-                "DATA_NOTIFICATION" => dispatch_data(cb_notif, uuid_s, &plaintext, ud),
-                "DATA_MEDIAPLAY" => dispatch_data(cb_media, uuid_s, &plaintext, ud),
-                "DATA_ICON_REQUEST" => dispatch_data(cb_icon_req, uuid_s, &plaintext, ud),
-                "DATA_ICON_RESPONSE" => dispatch_data(cb_icon_resp, uuid_s, &plaintext, ud),
-                "DATA_APP_LIST_REQUEST" => dispatch_data(cb_app_req, uuid_s, &plaintext, ud),
-                "DATA_APP_LIST_RESPONSE" => dispatch_data(cb_app_resp, uuid_s, &plaintext, ud),
-                "DATA_MEDIA_CONTROL" => dispatch_data(cb_ctrl, uuid_s, &plaintext, ud),
-                "DATA_FTP" => dispatch_data(cb_ftp, uuid_s, &plaintext, ud),
-                "DATA_CLIPBOARD" => dispatch_data(cb_clip, uuid_s, &plaintext, ud),
-                "DATA_STATUS" => dispatch_data(cb_status, uuid_s, &plaintext, ud),
-                "DATA_APP_LAUNCH" => dispatch_data(cb_launch, uuid_s, &plaintext, ud),
-                "DATA_SUPERISLAND" => dispatch_data(cb_super, uuid_s, &plaintext, ud),
+                "DATA_NOTIFICATION" => {
+                    let n = serde_json::from_str::<crate::models::Notification>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_notif, uuid_s, &n, ud);
+                }
+                "DATA_MEDIAPLAY" | "DATA_SUPERISLAND" => {
+                    let n = serde_json::from_str::<crate::models::MediaPayload>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    let cb = if hdr == "DATA_MEDIAPLAY" { cb_media } else { cb_super };
+                    dispatch_data(cb, uuid_s, &n, ud);
+                }
+                "DATA_ICON_REQUEST" => {
+                    let n = serde_json::from_str::<crate::models::IconRequest>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_icon_req, uuid_s, &n, ud);
+                }
+                "DATA_ICON_RESPONSE" => {
+                    let n = serde_json::from_str::<crate::models::IconResponse>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_icon_resp, uuid_s, &n, ud);
+                }
+                "DATA_APP_LIST_REQUEST" => {
+                    let n = serde_json::from_str::<crate::models::AppListRequest>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_app_req, uuid_s, &n, ud);
+                }
+                "DATA_APP_LIST_RESPONSE" => {
+                    let n = serde_json::from_str::<crate::models::AppListResponse>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_app_resp, uuid_s, &n, ud);
+                }
+                "DATA_MEDIA_CONTROL" => {
+                    let n = serde_json::from_str::<crate::models::MediaControl>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_ctrl, uuid_s, &n, ud);
+                }
+                "DATA_FTP" => {
+                    let n = serde_json::from_str::<crate::models::FtpMessage>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_ftp, uuid_s, &n, ud);
+                }
+                "DATA_CLIPBOARD" => {
+                    let n = serde_json::from_str::<crate::models::ClipboardData>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_clip, uuid_s, &n, ud);
+                }
+                "DATA_STATUS" => {
+                    let n = serde_json::from_str::<crate::models::StatusMessage>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_status, uuid_s, &n, ud);
+                }
+                "DATA_APP_LAUNCH" => {
+                    let n = serde_json::from_str::<crate::models::AppLaunch>(&plaintext)
+                        .ok().and_then(|v| serde_json::to_string(&v).ok()).unwrap_or(plaintext.clone());
+                    dispatch_data(cb_launch, uuid_s, &n, ud);
+                }
                 _ => dispatch_data(cb_unk, uuid_s, &plaintext, ud),
             }
             0
