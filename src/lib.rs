@@ -9,6 +9,12 @@ pub mod ffi;
 use p256::SecretKey;
 use std::sync::Mutex;
 
+pub struct DeviceState {
+    pub peer_tmp_pub: Option<String>,
+    pub peer_lt_pub: Option<String>,
+    pub decrypted_code: Option<String>,
+}
+
 pub struct CoreContext {
     pub crypto: crypto::CryptoState,
     pub router: router::Router,
@@ -17,6 +23,13 @@ pub struct CoreContext {
     pub ephemeral_key: Option<SecretKey>,
     pub ephemeral_pub_b64: Option<String>,
     pub pairing_key: Option<[u8; 32]>,
+    pub pairing_ctx: Option<PairingContext>,
+}
+
+pub struct PairingContext {
+    pub peer_tmp_pub: String,
+    pub peer_lt_pub: Option<String>,
+    pub decrypted_code: Option<String>,
 }
 
 impl CoreContext {
@@ -29,6 +42,7 @@ impl CoreContext {
             ephemeral_key: None,
             ephemeral_pub_b64: None,
             pairing_key: None,
+            pairing_ctx: None,
         }
     }
 }

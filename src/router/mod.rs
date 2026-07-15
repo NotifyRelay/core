@@ -32,6 +32,17 @@ pub type OnHeartbeatTcpCb = Option<
     ),
 >;
 pub type OnDataCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
+pub type OnSendCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+pub type OnHeartbeatUdpCb = Option<
+    extern "C" fn(
+        *const c_char,
+        *const c_char,
+        u16,
+        i32,
+        *const c_char,
+        *mut c_void,
+    ),
+>;
 
 pub struct Router {
     pub user_data: *mut c_void,
@@ -54,6 +65,9 @@ pub struct Router {
     pub on_app_launch: OnDataCb,
     pub on_superisland: OnDataCb,
     pub on_unknown_data: OnDataCb,
+    pub on_send: OnSendCb,
+    pub on_send_udp: OnSendCb,
+    pub on_heartbeat_udp: OnHeartbeatUdpCb,
 }
 
 impl Router {
@@ -79,6 +93,9 @@ impl Router {
             on_app_launch: None,
             on_superisland: None,
             on_unknown_data: None,
+            on_send: None,
+            on_send_udp: None,
+            on_heartbeat_udp: None,
         }
     }
 }
