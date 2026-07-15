@@ -608,38 +608,6 @@ pub extern "C" fn nrc_format_discovery(uuid: *const c_char, name: *const c_char,
     to_cstr(&codec::encode_udp_broadcast(u, &n_b64, port, battery, dt))
 }
 
-fn decode_b64_or_raw(encoded: &str) -> String {
-    String::from_utf8(
-        base64::engine::general_purpose::STANDARD.decode(encoded).unwrap_or_default()
-    ).unwrap_or_else(|_| encoded.to_string())
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_parse_heartbeat_json(line: *const c_char) -> *mut c_char {
-    let l = unsafe { from_cstr(line) };
-    match crate::heartbeat::parse_udp_heartbeat(l) {
-        Some((uuid, name_b64, port, battery, device_type)) => {
-            let name = decode_b64_or_raw(&name_b64);
-            to_cstr(&serde_json::json!({ "uuid": uuid, "name_b64": name_b64, "name": name,
-                "port": port, "battery": battery, "device_type": device_type }).to_string())
-        },
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_parse_heartbeat_tcp_json(line: *const c_char) -> *mut c_char {
-    let l = unsafe { from_cstr(line) };
-    match codec::decode_heartbeat_tcp(l) {
-        Some(f) => {
-            let name = decode_b64_or_raw(&f.name);
-            to_cstr(&serde_json::json!({ "uuid": f.uuid, "name_b64": f.name, "name": name,
-                "port": f.port, "battery": f.battery, "device_type": f.device_type }).to_string())
-        },
-        None => std::ptr::null_mut(),
-    }
-}
-
 // ==================== Unified send functions (for established connections) ====================
 
 fn encode_name_b64(name: &str) -> String {
