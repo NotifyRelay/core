@@ -548,14 +548,18 @@ pub extern "C" fn nrc_decode_line(ctx_ptr: *mut c_void, line: *const c_char) -> 
     }
 }
 
-// ==================== Format helpers (kept as-is) ====================
+// ==================== Format helpers ====================
 
 #[no_mangle]
 pub extern "C" fn nrc_format_heartbeat(uuid: *const c_char, name: *const c_char,
     port: u16, battery: i32, device_type: *const c_char) -> *mut c_char {
-    let u = unsafe { from_cstr(uuid) }; let n = unsafe { from_cstr(name) };
+    let u = unsafe { from_cstr(uuid) }; let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let dt = unsafe { from_cstr(device_type) };
-    to_cstr(&crate::heartbeat::format_udp_heartbeat(u, n, port, battery, dt))
+    to_cstr(&crate::heartbeat::format_udp_heartbeat(u, &n_b64, port, battery, dt))
+}
+
+fn encode_name_b64(name: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(name)
 }
 
 #[no_mangle]
@@ -570,17 +574,17 @@ pub extern "C" fn nrc_parse_heartbeat(line: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn nrc_format_discovery(uuid: *const c_char, name: *const c_char,
     port: u16, battery: i32, device_type: *const c_char) -> *mut c_char {
-    let u = unsafe { from_cstr(uuid) }; let n = unsafe { from_cstr(name) };
+    let u = unsafe { from_cstr(uuid) }; let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let dt = unsafe { from_cstr(device_type) };
-    to_cstr(&crate::discovery::format_discovery_broadcast(u, n, port, battery, dt))
+    to_cstr(&crate::discovery::format_discovery_broadcast(u, &n_b64, port, battery, dt))
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_format_tcp_heartbeat(uuid: *const c_char, name_b64: *const c_char,
+pub extern "C" fn nrc_format_tcp_heartbeat(uuid: *const c_char, name: *const c_char,
     port: u16, battery: i32, device_type: *const c_char) -> *mut c_char {
-    let u = unsafe { from_cstr(uuid) }; let n = unsafe { from_cstr(name_b64) };
+    let u = unsafe { from_cstr(uuid) }; let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let dt = unsafe { from_cstr(device_type) };
-    to_cstr(&crate::heartbeat::format_tcp_heartbeat(u, n, port, battery, dt))
+    to_cstr(&crate::heartbeat::format_tcp_heartbeat(u, &n_b64, port, battery, dt))
 }
 
 fn decode_b64_or_raw(encoded: &str) -> String {
@@ -959,38 +963,26 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
     }
 }
 
-// ==================== JSON creator helpers ====================
+// ==================== Simplified decrypt (no protocol line needed) ====================
 
-fn create_json_impl<T>(input: &str) -> Option<String>
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    serde_json::from_str::<T>(input)
-        .ok()
-        .and_then(|v| serde_json::to_string(&v).ok())
-}
-
-macro_rules! make_create_fn {
-    ($name:ident, $ty:ty) => {
-        #[no_mangle]
-        pub extern "C" fn $name(input: *const c_char) -> *mut c_char {
-            let s = unsafe { from_cstr(input) };
-            match create_json_impl::<$ty>(s) {
-                Some(j) => to_cstr(&j),
-                None => std::ptr::null_mut(),
-            }
+#[no_mangle]
+pub extern "C" fn nrc_decrypt_payload(
+    ctx_ptr: *mut c_void, local_uuid: *const c_char, encrypted_b64: *const c_char,
+) -> *mut c_char {
+    let uuid = unsafe { from_cstr(local_uuid) };
+    let enc = unsafe { from_cstr(encrypted_b64) };
+    with_ctx(ctx_ptr, |ctx| {
+        let key_b64 = match ctx.crypto.device_keys.get(uuid) {
+            Some(k) => k.aes_key_b64.clone(), None => return std::ptr::null_mut(),
+        };
+        let key_bytes = base64::engine::general_purpose::STANDARD.decode(&key_b64).ok();
+        let key_arr: [u8; 32] = match key_bytes {
+            Some(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+            _ => return std::ptr::null_mut(),
+        };
+        match aes::decrypt(&key_arr, enc) {
+            Ok(plain) => { let s = String::from_utf8_lossy(&plain).to_string(); to_cstr(&s) }
+            Err(_) => std::ptr::null_mut(),
         }
-    };
+    })
 }
-
-make_create_fn!(nrc_create_notification_json, crate::models::Notification);
-make_create_fn!(nrc_create_clipboard_json, crate::models::ClipboardData);
-make_create_fn!(nrc_create_media_control_json, crate::models::MediaControl);
-make_create_fn!(nrc_create_media_payload_json, crate::models::MediaPayload);
-make_create_fn!(nrc_create_icon_request_json, crate::models::IconRequest);
-make_create_fn!(nrc_create_icon_response_json, crate::models::IconResponse);
-make_create_fn!(nrc_create_app_list_request_json, crate::models::AppListRequest);
-make_create_fn!(nrc_create_app_list_response_json, crate::models::AppListResponse);
-make_create_fn!(nrc_create_ftp_message_json, crate::models::FtpMessage);
-make_create_fn!(nrc_create_status_message_json, crate::models::StatusMessage);
-make_create_fn!(nrc_create_app_launch_json, crate::models::AppLaunch);
