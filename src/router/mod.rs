@@ -31,8 +31,6 @@ pub type OnHeartbeatTcpCb = Option<
         *mut c_void,
     ),
 >;
-pub type OnDiscoverManualCb =
-    Option<extern "C" fn(*const c_char, *const c_char, u16, i32, *const c_char, *mut c_void)>;
 pub type OnDataCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
 
 pub struct Router {
@@ -43,7 +41,6 @@ pub struct Router {
     pub on_accept: OnAcceptCb,
     pub on_reject: OnRejectCb,
     pub on_heartbeat_tcp: OnHeartbeatTcpCb,
-    pub on_discover_manual: OnDiscoverManualCb,
     pub on_notification: OnDataCb,
     pub on_media_play: OnDataCb,
     pub on_icon_request: OnDataCb,
@@ -69,7 +66,6 @@ impl Router {
             on_accept: None,
             on_reject: None,
             on_heartbeat_tcp: None,
-            on_discover_manual: None,
             on_notification: None,
             on_media_play: None,
             on_icon_request: None,

@@ -9,7 +9,6 @@ pub enum ProtocolHeader<'a> {
     Handshake,
     Data(&'a str),
     HeartbeatTcp,
-    DiscoverManual,
     Unknown(&'a str),
 }
 
@@ -24,7 +23,6 @@ impl<'a> ProtocolHeader<'a> {
                 "REJECT" => Self::Reject,
                 "HANDSHAKE" => Self::Handshake,
                 "HEARTBEAT_TCP" => Self::HeartbeatTcp,
-                "NOTIFYRELAY_DISCOVER_MANUAL" => Self::DiscoverManual,
                 _ if prefix.starts_with("DATA") => Self::Data(prefix),
                 _ => Self::Unknown(prefix),
             }
@@ -47,7 +45,6 @@ impl fmt::Display for ProtocolHeader<'_> {
             Self::Reject => write!(f, "REJECT"),
             Self::Handshake => write!(f, "HANDSHAKE"),
             Self::HeartbeatTcp => write!(f, "HEARTBEAT_TCP"),
-            Self::DiscoverManual => write!(f, "NOTIFYRELAY_DISCOVER_MANUAL"),
             Self::Data(h) => write!(f, "{}", h),
             Self::Unknown(h) => write!(f, "{}", h),
         }

@@ -29,13 +29,15 @@ pub fn format_tcp_heartbeat(
 }
 
 pub fn parse_udp_heartbeat(line: &str) -> Option<(String, String, u16, i32, String)> {
-    codec::decode_discovery_line(line).map(|f| {
-        (
-            f.uuid.to_string(),
-            f.name_b64.to_string(),
-            f.port,
-            f.battery,
-            f.device_type.to_string(),
-        )
-    })
+    let parts: Vec<&str> = line.split(':').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].parse().unwrap_or(codec::DEFAULT_TCP_PORT),
+        parts[3].parse().unwrap_or(0),
+        parts[4].to_string(),
+    ))
 }

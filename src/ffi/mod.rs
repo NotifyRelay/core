@@ -673,7 +673,6 @@ make_cb_setter!(nrc_set_on_pairing_resp_cb, crate::router::OnPairingRespCb, on_p
 make_cb_setter!(nrc_set_on_accept_cb, crate::router::OnAcceptCb, on_accept);
 make_cb_setter!(nrc_set_on_reject_cb, crate::router::OnRejectCb, on_reject);
 make_cb_setter!(nrc_set_on_heartbeat_tcp_cb, crate::router::OnHeartbeatTcpCb, on_heartbeat_tcp);
-make_cb_setter!(nrc_set_on_discover_manual_cb, crate::router::OnDiscoverManualCb, on_discover_manual);
 
 make_cb_setter!(nrc_set_on_notification_cb, crate::router::OnDataCb, on_notification);
 make_cb_setter!(nrc_set_on_media_play_cb, crate::router::OnDataCb, on_media_play);
@@ -839,26 +838,6 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
                  0
             } else {
                 log::error!("处理消息: HEARTBEAT_TCP 解析失败");
-                -1
-            }
-        }
-        ProtocolHeader::DiscoverManual => {
-            if let Some(f) = codec::decode_discovery_line(line_str) {
-                let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
-                let cb = guard.router.on_discover_manual; let ud = guard.router.user_data;
-                drop(guard);
-                if let Some(cb) = cb {
-                    let uuid = CString::new(f.uuid).unwrap_or_default();
-                    let name = CString::new(f.name_b64).unwrap_or_default();
-                    let dt = CString::new(f.device_type).unwrap_or_default();
-                    log::debug!("处理消息: 分发 DISCOVER_MANUAL uuid={}", f.uuid);
-                    cb(uuid.as_ptr(), name.as_ptr(), f.port, f.battery, dt.as_ptr(), ud);
-                } else {
-                    log::warn!("处理消息: DISCOVER_MANUAL 回调未注册");
-                }
-                 0
-            } else {
-                log::error!("处理消息: DISCOVER_MANUAL 解析失败");
                 -1
             }
         }

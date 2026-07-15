@@ -114,19 +114,6 @@ pub fn encode_data_message(
     )
 }
 
-pub fn encode_discovery_manual(
-    uuid: &str,
-    name_b64: &str,
-    port: u16,
-    battery: i32,
-    device_type: &str,
-) -> String {
-    format!(
-        "NOTIFYRELAY_DISCOVER_MANUAL:{}:{}:{}:{}:{}",
-        uuid, name_b64, port, battery_hb(battery), device_type
-    )
-}
-
 pub fn encode_udp_broadcast(
     uuid: &str,
     name_b64: &str,
@@ -190,15 +177,6 @@ pub struct DataMessageFields<'a> {
 pub struct HeartbeatTcpFields<'a> {
     pub uuid: &'a str,
     pub name: &'a str,
-    pub port: u16,
-    pub battery: i32,
-    pub device_type: &'a str,
-}
-
-#[derive(Debug)]
-pub struct DiscoveryFields<'a> {
-    pub uuid: &'a str,
-    pub name_b64: &'a str,
     pub port: u16,
     pub battery: i32,
     pub device_type: &'a str,
@@ -321,16 +299,4 @@ pub fn decode_heartbeat_tcp(line: &str) -> Option<HeartbeatTcpFields<'_>> {
     })
 }
 
-pub fn decode_discovery_line(line: &str) -> Option<DiscoveryFields<'_>> {
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    Some(DiscoveryFields {
-        uuid: parts[0],
-        name_b64: parts[1],
-        port: parts[2].parse().unwrap_or(DEFAULT_TCP_PORT),
-        battery: parse_battery_hb(parts[3]),
-        device_type: parts[4],
-    })
-}
+
