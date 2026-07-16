@@ -218,7 +218,10 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 drop(guard);
                 if let Some(cb) = cb {
                     let uuid = CString::new(f.uuid).unwrap_or_default();
-                    let name = CString::new(f.name).unwrap_or_default();
+                    let name_decoded = String::from_utf8(
+                        base64::engine::general_purpose::STANDARD.decode(&f.name).unwrap_or_default()
+                    ).unwrap_or(f.name.to_string());
+                    let name = CString::new(name_decoded).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
                     let ip = CString::new("").unwrap_or_default();
                     cb(uuid.as_ptr(), name.as_ptr(), f.port, f.battery, dt.as_ptr(), ip.as_ptr(), ud);
