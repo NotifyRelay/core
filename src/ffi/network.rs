@@ -58,7 +58,14 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
         None
     };
 
-    let on_message_cb = None; // 消息处理由平台通过 processLine 完成
+    let on_message_cb = {
+        let ctx_usize = ctx_ptr as usize;
+        Some(Arc::new(move |uuid: String, line: String| {
+            let ctx_ptr = ctx_usize as *mut c_void;
+            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+            super::processing::process_line(ctx, &line);
+        }) as Arc<dyn Fn(String, String) + Send + Sync>)
+    };
 
     let on_error_cb = if let Some(cb) = on_tcp_error {
         Some(Arc::new(move |error: String| {

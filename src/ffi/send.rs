@@ -8,19 +8,25 @@ use crate::{crypto::aes, protocol::codec, crypto::ecdh, crypto::hkdf, CoreContex
 
 use super::common::{encode_name_b64, from_cstr, with_ctx};
 
-fn do_send(ctx: &CoreContext, line: &str) {
-    if let Some(cb) = ctx.router.on_send {
-        if let Ok(c_line) = CString::new(line) {
-            cb(c_line.as_ptr(), ctx.router.user_data);
+fn do_send(ctx: &CoreContext, uuid: &str, line: &str) {
+    let data = format!("{}\n", line);
+    match ctx.network.tcp.lock() {
+        Ok(mut tcp) => {
+            if let Some(session) = tcp.sessions.get_mut(uuid) {
+                if let Err(e) = session.stream.write_all(data.as_bytes()) {
+                    log::error!("发送消息失败 uuid={}, error={}", uuid, e);
+                }
+            } else {
+                log::warn!("设备未连接 uuid={}", uuid);
+            }
         }
+        Err(e) => log::error!("加锁失败: {}", e),
     }
 }
 
-fn do_send_udp(ctx: &CoreContext, line: &str) {
-    if let Some(cb) = ctx.router.on_send_udp {
-        if let Ok(c_line) = CString::new(line) {
-            cb(c_line.as_ptr(), ctx.router.user_data);
-        }
+fn do_send_udp(_ctx: &CoreContext, line: &str) {
+    if let Err(e) = crate::network::send_udp_broadcast(line) {
+        log::error!("UDP 广播失败: {}", e);
     }
 }
 
@@ -33,7 +39,7 @@ pub extern "C" fn nrc_send_handshake(ctx_ptr: *mut c_void, uuid: *const c_char,
     let i = unsafe { from_cstr(ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &codec::encode_handshake(&u, &p, &i, battery, &d));
+        do_send(ctx, &u, &codec::encode_handshake(&u, &p, &i, battery, &d));
     });
 }
 
@@ -47,7 +53,7 @@ pub extern "C" fn nrc_send_pairing_init(ctx_ptr: *mut c_void, uuid: *const c_cha
         let (secret, b64) = ecdh::generate_keypair();
         ctx.ephemeral_key = Some(secret);
         ctx.ephemeral_pub_b64 = Some(b64.clone());
-        do_send(ctx, &codec::encode_pairing_init(&u, &b64, &i, battery, &d));
+        do_send(ctx, &u, &codec::encode_pairing_init(&u, &b64, &i, battery, &d));
     });
 }
 
@@ -78,7 +84,7 @@ pub extern "C" fn nrc_send_pairing_resp(ctx_ptr: *mut c_void, uuid: *const c_cha
         let encrypted = ctx.pairing_key.and_then(|key| {
             aes::encrypt(&key, code.as_bytes()).ok()
         }).unwrap_or_default();
-        do_send(ctx, &codec::encode_pairing_resp(&u, &tmp_pub, &l, &encrypted, &i, battery, &d));
+        do_send(ctx, &u, &codec::encode_pairing_resp(&u, &tmp_pub, &l, &encrypted, &i, battery, &d));
     });
 }
 
@@ -91,7 +97,7 @@ pub extern "C" fn nrc_send_accept(ctx_ptr: *mut c_void, uuid: *const c_char,
     let i = unsafe { from_cstr(ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &codec::encode_accept(&u, &l, &i, battery, &d));
+        do_send(ctx, &u, &codec::encode_accept(&u, &l, &i, battery, &d));
     });
 }
 
@@ -99,7 +105,7 @@ pub extern "C" fn nrc_send_accept(ctx_ptr: *mut c_void, uuid: *const c_char,
 pub extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_char) {
     let u = unsafe { from_cstr(uuid).to_string() };
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &codec::encode_reject(&u));
+        do_send(ctx, &u, &codec::encode_reject(&u));
     });
 }
 
@@ -110,7 +116,7 @@ pub extern "C" fn nrc_send_heartbeat_tcp(ctx_ptr: *mut c_void, uuid: *const c_ch
     let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let d = unsafe { from_cstr(device_type).to_string() };
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &codec::encode_heartbeat_tcp(&u, &n_b64, port, battery, &d));
+        do_send(ctx, &u, &codec::encode_heartbeat_tcp(&u, &n_b64, port, battery, &d));
     });
 }
 
@@ -155,7 +161,7 @@ pub extern "C" fn nrc_send_data_message(ctx_ptr: *mut c_void, header: *const c_c
         let mut key_arr = [0u8; 32]; key_arr.copy_from_slice(&key_bytes);
         if let Ok(encrypted) = aes::encrypt(&key_arr, text.as_bytes()) {
             let msg = codec::encode_data_message(&hdr, &uuid, &pub_key, &encrypted);
-            do_send(ctx, &msg);
+            do_send(ctx, &uuid, &msg);
         }
     });
 }

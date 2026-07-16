@@ -336,6 +336,89 @@ pub fn remove_device_session(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
     }
 }
 
+/// UDP 广播端口
+const UDP_BROADCAST_PORT: u16 = 23334;
+
+/// 发送 UDP 广播消息（支持多子网）
+pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
+    use std::net::UdpSocket;
+
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("绑定 UDP 失败: {}", e))?;
+    socket.set_broadcast(true)
+        .map_err(|e| format!("设置广播失败: {}", e))?;
+
+    let data = message.as_bytes();
+
+    // 发送有限广播作为兜底
+    socket.send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
+        .map_err(|e| format!("有限广播失败: {}", e))?;
+
+    // Android/Linux: 使用 getifaddrs 枚举网络接口，发送定向广播
+    #[cfg(target_os = "android")]
+    {
+        send_to_all_subnets(&socket, data)?;
+    }
+
+    Ok(())
+}
+
+/// 向所有子网发送定向广播（Android/Linux）
+#[cfg(target_os = "android")]
+fn send_to_all_subnets(socket: &std::net::UdpSocket, data: &[u8]) -> Result<(), String> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return Err("getifaddrs 失败".to_string());
+        }
+
+        let mut ptr = ifaddrs;
+        while !ptr.is_null() {
+            let entry = &*ptr;
+
+            // 只处理 IPv4 地址
+            if let Some(addr) = entry.ifa_addr {
+                if (*addr).sa_family == libc::AF_INET as libc::sa_family_t {
+                    let sockaddr = &*(addr as *const libc::sockaddr_in);
+                    let ip = Ipv4Addr::from(sin_addr_to_bytes(sockaddr.sin_addr));
+
+                    // 跳过回环地址和 0.0.0.0
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        // 计算子网广播地址（假设 /24 子网）
+                        let ip_bytes = ip.octets();
+                        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
+                        let broadcast_addr = SocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
+
+                        if let Err(e) = socket.send_to(data, broadcast_addr) {
+                            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
+                        }
+                    }
+                }
+            }
+
+            ptr = (*entry).ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
+    }
+
+    Ok(())
+}
+
+/// 将 sin_addr 转换为字节数组
+#[cfg(target_os = "android")]
+unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
+    let s_addr = addr.s_addr;
+    [
+        (s_addr & 0xFF) as u8,
+        ((s_addr >> 8) & 0xFF) as u8,
+        ((s_addr >> 16) & 0xFF) as u8,
+        ((s_addr >> 24) & 0xFF) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

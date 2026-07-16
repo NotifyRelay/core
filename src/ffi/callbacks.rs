@@ -32,8 +32,7 @@ make_cb_setter!(nrc_set_on_app_launch_cb, crate::router::OnDataCb, on_app_launch
 make_cb_setter!(nrc_set_on_superisland_cb, crate::router::OnDataCb, on_superisland);
 make_cb_setter!(nrc_set_on_unknown_data_cb, crate::router::OnDataCb, on_unknown_data);
 
-make_cb_setter!(nrc_set_on_send_cb, crate::router::OnSendCb, on_send);
-make_cb_setter!(nrc_set_on_send_udp_cb, crate::router::OnSendCb, on_send_udp);
+
 make_cb_setter!(nrc_set_on_heartbeat_udp_cb, crate::router::OnHeartbeatUdpCb, on_heartbeat_udp);
 
 make_cb_setter!(nrc_set_on_device_timeout_cb, crate::router::OnDeviceTimeoutCb, on_device_timeout);

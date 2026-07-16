@@ -23,20 +23,14 @@ fn dispatch_data(cb: crate::router::OnDataCb, local_uuid: &str, plaintext: &str,
     }
 }
 
-#[no_mangle]
-pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || line.is_null() {
-        log::error!("处理消息: 空指针");
-        return -1;
-    }
-    let line_str = unsafe { from_cstr(line) };
+/// 内部消息处理函数，供 FFI 和 TCP 回调共用
+pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
     if line_str.is_empty() {
         log::error!("处理消息: 空行");
         return -1;
     }
     let header = ProtocolHeader::parse(line_str);
     log::debug!("处理消息: 类型={:?}", header);
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     match header {
         ProtocolHeader::Handshake => {
             if let Some(f) = codec::decode_handshake(line_str) {
@@ -320,6 +314,18 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
             -1
         }
     }
+}
+
+/// FFI 入口：处理接收到的消息行
+#[no_mangle]
+pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
+    if ctx_ptr.is_null() || line.is_null() {
+        log::error!("处理消息: 空指针");
+        return -1;
+    }
+    let line_str = unsafe { from_cstr(line) };
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    process_line(ctx, line_str)
 }
 
 #[no_mangle]
