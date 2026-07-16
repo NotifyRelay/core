@@ -63,16 +63,18 @@ pub extern "C" fn nrc_send_handshake(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     pub_key: *const c_char,
-    ip: *const c_char,
+    local_ip: *const c_char,
+    target_ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) -> i32 {
     let u = unsafe { from_cstr(uuid).to_string() };
     let p = unsafe { from_cstr(pub_key).to_string() };
-    let i = unsafe { from_cstr(ip).to_string() };
+    let li = unsafe { from_cstr(local_ip).to_string() };
+    let ti = unsafe { from_cstr(target_ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
-    let msg = codec::encode_handshake(&u, &p, &i, battery, &d);
+    let msg = codec::encode_handshake(&u, &p, &li, battery, &d);
 
     // 尝试通过已有 TCP 会话发送
     let sent = with_ctx(ctx_ptr, |ctx| do_send(ctx, &u, &msg));
@@ -80,9 +82,9 @@ pub extern "C" fn nrc_send_handshake(
         return 0;
     }
 
-    // 否则通过 oneshot 发送到 ip:port
+    // 否则通过 oneshot 发送到 target_ip:port
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    oneshot_send_and_process(ctx, &i, port, &msg)
+    oneshot_send_and_process(ctx, &ti, port, &msg)
 }
 
 /// 发送 PAIRING_INIT（发起方），自动完成完整配对流程
