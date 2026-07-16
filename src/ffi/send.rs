@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::io::Write;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 
