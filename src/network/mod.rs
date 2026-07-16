@@ -222,34 +222,45 @@ fn handle_connection(
             let line = buffer.trim().to_string();
             buffer.clear();
 
-            // 解析第一行获取 UUID（假设格式为 HANDSHAKE:UUID:...）
+            // 从任意消息中提取 UUID（第二字段）
+            // 格式: HEADER:uuid:... 或 HANDSHAKE:uuid:...
             if let Some(f) = codec::decode_handshake(&line) {
                 uuid = f.uuid.to_string();
-                log::info!("设备已连接: uuid={}, ip={}", uuid, ip);
-
-                // 添加到会话
-                {
-                    let mut state = state.lock().unwrap();
-                    state.sessions.insert(uuid.clone(), TcpSession {
-                        stream: stream.try_clone().expect("克隆流失败"),
-                        uuid: uuid.clone(),
-                        ip: ip.clone(),
-                        buffer: String::new(),
-                    });
+            } else if let Some(pos) = line.find(':') {
+                let rest = &line[pos + 1..];
+                if let Some(end) = rest.find(':') {
+                    uuid = rest[..end].to_string();
+                } else if !rest.is_empty() {
+                    uuid = rest.to_string();
                 }
+            }
 
-                // 通知设备连接
-                if let Some(ref cb) = on_connected {
-                    cb(uuid.clone(), ip.clone());
-                }
-
-                // 处理第一行消息
-                if let Some(ref cb) = on_message {
-                    cb(uuid.clone(), line);
-                }
-            } else {
-                log::warn!("第一行不是有效的握手消息: {}", line);
+            if uuid.is_empty() {
+                log::warn!("无法从消息中提取 UUID: {}", &line[..line.len().min(80)]);
                 return;
+            }
+
+            log::info!("设备已连接: uuid={}, ip={}, 第一行={}", uuid, ip, &line[..line.len().min(40)]);
+
+            // 添加到会话
+            {
+                let mut state = state.lock().unwrap();
+                state.sessions.insert(uuid.clone(), TcpSession {
+                    stream: stream.try_clone().expect("克隆流失败"),
+                    uuid: uuid.clone(),
+                    ip: ip.clone(),
+                    buffer: String::new(),
+                });
+            }
+
+            // 通知设备连接
+            if let Some(ref cb) = on_connected {
+                cb(uuid.clone(), ip.clone());
+            }
+
+            // 处理第一行消息
+            if let Some(ref cb) = on_message {
+                cb(uuid.clone(), line);
             }
         }
         Err(e) => {
