@@ -379,7 +379,8 @@ fn send_to_all_subnets(socket: &std::net::UdpSocket, data: &[u8]) -> Result<(), 
             let entry = &*ptr;
 
             // 只处理 IPv4 地址
-            if let Some(addr) = entry.ifa_addr {
+            if !entry.ifa_addr.is_null() {
+                let addr = entry.ifa_addr;
                 if (*addr).sa_family == libc::AF_INET as libc::sa_family_t {
                     let sockaddr = &*(addr as *const libc::sockaddr_in);
                     let ip = Ipv4Addr::from(sin_addr_to_bytes(sockaddr.sin_addr));
