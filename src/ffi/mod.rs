@@ -9,6 +9,7 @@ pub mod callbacks;
 pub mod processing;
 pub mod utils;
 pub mod network;
+pub mod filter;
 
 pub use common::*;
 pub use lifecycle::*;
@@ -21,3 +22,4 @@ pub use callbacks::*;
 pub use processing::*;
 pub use utils::*;
 pub use network::*;
+pub use filter::*;

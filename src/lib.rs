@@ -6,6 +6,7 @@ mod discovery;
 mod network;
 mod dedup;
 mod models;
+mod filter;
 pub mod ffi;
 
 use p256::SecretKey;
@@ -24,6 +25,7 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub network: network::NetworkState,
     pub dedup: dedup::DedupState,
+    pub filter: ffi::filter::FilterState,
     pub ephemeral_key: Option<SecretKey>,
     pub ephemeral_pub_b64: Option<String>,
     pub pairing_key: Option<[u8; 32]>,
@@ -45,6 +47,7 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             network: network::NetworkState::new(),
             dedup: dedup::DedupState::new(),
+            filter: ffi::filter::FilterState::new(),
             ephemeral_key: None,
             ephemeral_pub_b64: None,
             pairing_key: None,

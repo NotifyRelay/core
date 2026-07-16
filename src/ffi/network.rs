@@ -232,3 +232,24 @@ pub extern "C" fn nrc_remove_device_session(ctx_ptr: *mut c_void, uuid: *const c
     crate::network::remove_device_session(network_state, &uuid_str);
     0
 }
+
+use super::common::to_cstr;
+
+#[no_mangle]
+pub extern "C" fn nrc_oneshot_send_receive(ip: *const c_char, port: u16, payload: *const c_char, connect_timeout_ms: u32, read_timeout_ms: u32) -> *mut c_char {
+    if ip.is_null() || payload.is_null() { return to_cstr(""); }
+    let ip_str = unsafe { from_cstr(ip) };
+    let payload_str = unsafe { from_cstr(payload) };
+    match crate::network::oneshot_send_receive(ip_str, port, payload_str, connect_timeout_ms, read_timeout_ms) {
+        Some(response) => to_cstr(&response),
+        None => to_cstr(""),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_oneshot_send_only(ip: *const c_char, port: u16, payload: *const c_char, connect_timeout_ms: u32) -> i32 {
+    if ip.is_null() || payload.is_null() { return 0; }
+    let ip_str = unsafe { from_cstr(ip) };
+    let payload_str = unsafe { from_cstr(payload) };
+    if crate::network::oneshot_send_only(ip_str, port, payload_str, connect_timeout_ms) { 1 } else { 0 }
+}

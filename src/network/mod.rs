@@ -435,6 +435,32 @@ unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
     ]
 }
 
+use std::time::Duration;
+
+pub fn oneshot_send_receive(ip: &str, port: u16, payload: &str, connect_timeout_ms: u32, read_timeout_ms: u32) -> Option<String> {
+    let addr = format!("{}:{}", ip, port);
+    let stream = TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(connect_timeout_ms as u64)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms as u64))).ok()?;
+    let mut writer = &stream;
+    writer.write_all(format!("{}\n", payload).as_bytes()).ok()?;
+    writer.flush().ok()?;
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let trimmed = line.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+pub fn oneshot_send_only(ip: &str, port: u16, payload: &str, connect_timeout_ms: u32) -> bool {
+    let addr = format!("{}:{}", ip, port);
+    let stream = match TcpStream::connect_timeout(&addr.parse().ok().unwrap(), Duration::from_millis(connect_timeout_ms as u64)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut writer = &stream;
+    writer.write_all(format!("{}\n", payload).as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
