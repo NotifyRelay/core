@@ -227,7 +227,7 @@ pub fn start_offline_detector(
                 };
 
                 for uuid in &timeouts {
-                    log::info!("离线检测: 设备超时 uuid={}", uuid);
+                    log::info!("设备状态变化: 已超时 uuid={}", uuid);
                     if let Some(cb) = on_timeout_cb {
                         if let Ok(uuid_c) = std::ffi::CString::new(uuid.as_str()) {
                             cb(uuid_c.as_ptr(), user_data);

@@ -250,6 +250,8 @@ fn handle_connection(
                 return;
             }
 
+            log::info!("设备状态变化: 已连接 uuid={}, ip={}", uuid, ip);
+
             {
                 let mut state = state.lock().unwrap();
                 state.sessions.insert(uuid.clone(), TcpSession {
@@ -303,6 +305,8 @@ fn handle_connection(
         let mut state = state.lock().unwrap();
         state.sessions.remove(&uuid);
     }
+
+    log::info!("设备状态变化: 已断开 uuid={}", uuid);
 
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
