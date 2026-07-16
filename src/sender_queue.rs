@@ -156,14 +156,15 @@ impl SenderQueue {
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        let (key_b64, has_tcp_session) = match ctx.lock() {
+        let (key_b64, has_tcp_session, local_uuid) = match ctx.lock() {
             Ok(guard) => {
                 let key = guard.crypto.device_keys.get(&item.device_uuid)
                     .map(|k| k.aes_key_b64.clone());
                 let has = guard.network.tcp.lock()
                     .map(|tcp| tcp.is_connected(&item.device_uuid))
                     .unwrap_or(false);
-                (key, has)
+                let uuid = guard.broadcast_info.as_ref().map(|i| i.uuid.clone()).unwrap_or_default();
+                (key, has, uuid)
             }
             Err(_) => return Err(()),
         };
@@ -187,7 +188,7 @@ impl SenderQueue {
             Ok(e) => e,
             Err(_) => return Ok(false),
         };
-        let msg = codec::encode_data_message(&item.header, &item.device_uuid, "", &encrypted);
+        let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
 
         if has_tcp_session && !item.device_uuid.is_empty() {
             match ctx.lock() {
