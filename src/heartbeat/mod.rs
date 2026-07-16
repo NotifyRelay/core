@@ -64,6 +64,7 @@ pub struct HeartbeatSenderParams {
     pub name_b64: Mutex<String>,
     pub battery: AtomicI32,
     pub device_type: Mutex<String>,
+    pub ip: Mutex<String>,
 }
 
 pub struct HeartbeatHandle {
@@ -80,11 +81,12 @@ pub const HEARTBEAT_MODE_AUTO: i32 = 2;
 impl HeartbeatHandle {
     /// 启动心跳发送线程
     pub fn start(
-        ctx_ptr: usize,
+        _ctx_ptr: usize,
         uuid: &str,
         name: &str,
         battery: i32,
         device_type: &str,
+        ip: &str,
         interval_ms: u64,
         mode: i32,
     ) -> Result<Self, String> {
@@ -96,6 +98,7 @@ impl HeartbeatHandle {
             name_b64: Mutex::new(name_b64),
             battery: AtomicI32::new(battery),
             device_type: Mutex::new(device_type.to_string()),
+            ip: Mutex::new(ip.to_string()),
         });
 
         let r = running.clone();
@@ -130,16 +133,11 @@ impl HeartbeatHandle {
 
                     let sent = if current_mode == HEARTBEAT_MODE_TCP {
                         let msg = codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
-                        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                        match ctx.lock() {
-                            Ok(guard) => {
-                                let mut tcp = match guard.network.tcp.lock() {
-                                    Ok(t) => t,
-                                    Err(_) => { thread::sleep(Duration::from_millis(interval_ms)); continue; }
-                                };
-                                tcp.send_to_device(&uuid, &msg)
-                            }
-                            Err(_) => false,
+                        let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                        if !ip_str.is_empty() {
+                            network::oneshot_send_only(&msg, &ip_str, port, 3000)
+                        } else {
+                            false
                         }
                     } else {
                         let msg = codec::encode_udp_broadcast(&uuid, &name_b64, port, battery, &device_type);

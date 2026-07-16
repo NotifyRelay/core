@@ -14,6 +14,7 @@ pub extern "C" fn nrc_start_heartbeat_sender(
     name: *const c_char,
     battery: i32,
     device_type: *const c_char,
+    ip: *const c_char,
     interval_ms: u64,
     mode: i32,
 ) -> i64 {
@@ -21,8 +22,9 @@ pub extern "C" fn nrc_start_heartbeat_sender(
     let u = unsafe { from_cstr(uuid) };
     let n = unsafe { from_cstr(name) };
     let d = unsafe { from_cstr(device_type) };
+    let ip_str = unsafe { from_cstr(ip) };
 
-    match HeartbeatHandle::start(ctx_ptr as usize, u, n, battery, d, interval_ms, mode) {
+    match HeartbeatHandle::start(ctx_ptr as usize, u, n, battery, d, &ip_str, interval_ms, mode) {
         Ok(handle) => {
             // 存储 handle 到 context
             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
