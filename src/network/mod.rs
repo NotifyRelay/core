@@ -203,6 +203,10 @@ fn handle_connection(
     on_error: Option<ErrorCallback>,
 ) {
     let ip = addr.ip().to_string();
+
+    // 将 accepted socket 设回阻塞模式
+    stream.set_nonblocking(false).expect("设置阻塞模式失败");
+
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
     let mut buffer = String::new();
