@@ -25,11 +25,6 @@ pub fn secret_to_pem(key: &SecretKey) -> Result<String, String> {
         .map(|z| z.to_string())
 }
 
-pub fn public_key_to_b64(public: &PublicKey) -> String {
-    let encoded = EncodedPoint::from(public);
-    base64::engine::general_purpose::STANDARD.encode(encoded.as_bytes())
-}
-
 pub fn compute_shared_secret(
     private: &SecretKey,
     peer_pub_b64: &str,

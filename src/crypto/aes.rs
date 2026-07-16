@@ -32,8 +32,3 @@ pub fn decrypt(key: &[u8; 32], encrypted_b64: &str) -> Result<Vec<u8>, String> {
         .decrypt(nonce, ciphertext)
         .map_err(|e| format!("decrypt failed: {:?}", e))
 }
-
-pub fn generate_random_code() -> String {
-    let code: u32 = rand::thread_rng().gen_range(100_000..1_000_000);
-    format!("{:06}", code)
-}

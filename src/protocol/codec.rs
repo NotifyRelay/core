@@ -1,7 +1,6 @@
 use crate::protocol::header::ProtocolHeader;
 
 pub const DEFAULT_TCP_PORT: u16 = 23333;
-pub const DEFAULT_UDP_PORT: u16 = 23334;
 
 fn battery_pairing(battery: i32) -> String {
     if battery >= 0 {
@@ -167,9 +166,7 @@ pub struct HandshakeFields<'a> {
 
 #[derive(Debug)]
 pub struct DataMessageFields<'a> {
-    pub header: &'a str,
     pub local_uuid: &'a str,
-    pub local_pub_key: &'a str,
     pub encrypted_payload: &'a str,
 }
 
@@ -274,9 +271,7 @@ pub fn decode_data_message(line: &str) -> Option<DataMessageFields<'_>> {
         return None;
     }
     Some(DataMessageFields {
-        header: parts[0],
         local_uuid: parts[1],
-        local_pub_key: parts[2],
         encrypted_payload: parts[3],
     })
 }
