@@ -436,6 +436,7 @@ pub fn oneshot_send_receive(ip: &str, port: u16, payload: &str, connect_timeout_
     let addr = format!("{}:{}", ip, port);
     let stream = TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(connect_timeout_ms as u64)).ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms as u64))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_millis(connect_timeout_ms as u64))).ok()?;
     let mut writer = &stream;
     writer.write_all(format!("{}\n", payload).as_bytes()).ok()?;
     writer.flush().ok()?;
@@ -450,14 +451,26 @@ pub fn oneshot_send_only(ip: &str, port: u16, payload: &str, connect_timeout_ms:
     let addr = format!("{}:{}", ip, port);
     let sock_addr = match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a,
-        Err(_) => return false,
+        Err(_) => {
+            log::warn!("oneshot_send_only: 地址解析失败 addr={}", addr);
+            return false;
+        }
     };
     let stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_millis(connect_timeout_ms as u64)) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) => {
+            log::debug!("oneshot_send_only: 连接失败 addr={}, err={}", addr, e);
+            return false;
+        }
     };
+    stream.set_write_timeout(Some(Duration::from_millis(connect_timeout_ms as u64))).ok();
+    let data = format!("{}\n", payload);
     let mut writer = &stream;
-    writer.write_all(format!("{}\n", payload).as_bytes()).is_ok() && writer.flush().is_ok()
+    if writer.write_all(data.as_bytes()).is_err() || writer.flush().is_err() {
+        log::debug!("oneshot_send_only: 写入失败 addr={}", addr);
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
