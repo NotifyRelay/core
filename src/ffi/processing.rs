@@ -14,7 +14,6 @@ use super::common::{from_cstr};
 
 fn dispatch_data(cb: crate::router::OnDataCb, local_uuid: &str, plaintext: &str, ud: *mut c_void) {
     if let Some(cb) = cb {
-        log::debug!("分发数据回调: uuid={}, 长度={}", local_uuid, plaintext.len());
         let uuid_c = CString::new(local_uuid).unwrap_or_default();
         let text_c = CString::new(plaintext).unwrap_or_default();
         cb(uuid_c.as_ptr(), text_c.as_ptr(), ud);
@@ -30,7 +29,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         return -1;
     }
     let header = ProtocolHeader::parse(line_str);
-    log::debug!("处理消息: 类型={:?}", header);
     match header {
         ProtocolHeader::Handshake => {
             if let Some(f) = codec::decode_handshake(line_str) {
@@ -50,7 +48,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                 crate::crypto::DeviceKeyEntry { remote_pub_key: peer_pub_str.clone(), aes_key_b64: b64 },
                             );
                         }
-                        log::info!("处理消息: HANDSHAKE 自动派生密钥 uuid={}", uuid_str);
                     }
                 }
                 if let Some(cb_fn) = cb {
@@ -58,7 +55,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     let pk = CString::new(f.pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    log::debug!("处理消息: 分发 HANDSHAKE uuid={}", f.uuid);
                     cb_fn(uuid_c.as_ptr(), pk.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: HANDSHAKE 回调未注册");
@@ -84,7 +80,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     let tmp = CString::new(f.tmp_pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    log::debug!("处理消息: 分发 PAIRING_INIT uuid={}", f.uuid);
                     cb(uuid.as_ptr(), tmp.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: PAIRING_INIT 回调未注册");
@@ -126,7 +121,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     let enc = CString::new(f.encrypted_code).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    log::debug!("处理消息: 分发 PAIRING_RESP uuid={}", f.uuid);
                     cb_fn(uuid_c.as_ptr(), tmp.as_ptr(), lt.as_ptr(), enc.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: PAIRING_RESP 回调未注册");
@@ -147,7 +141,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     let lt = CString::new(f.lt_pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    log::debug!("处理消息: 分发 ACCEPT uuid={}", f.uuid);
                     cb(uuid.as_ptr(), lt.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: ACCEPT 回调未注册");
@@ -164,7 +157,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let cb = guard.router.on_reject; let ud = guard.router.user_data;
                 drop(guard);
                 if let Some(cb) = cb {
-                    log::debug!("处理消息: 分发 REJECT uuid={}", payload);
                     let uuid_c = CString::new(payload).unwrap_or_default();
                     cb(uuid_c.as_ptr(), ud);
                 } else {
@@ -187,7 +179,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     let name = CString::new(f.name).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
                     let ip = CString::new("").unwrap_or_default();
-                    log::debug!("处理消息: 分发 HEARTBEAT_TCP uuid={}", f.uuid);
                     cb(uuid.as_ptr(), name.as_ptr(), f.port, f.battery, dt.as_ptr(), ip.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: HEARTBEAT_TCP 回调未注册");
@@ -199,7 +190,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             }
         }
         ProtocolHeader::Data(hdr) => {
-            log::debug!("处理消息: DATA 消息 header={}", hdr);
             let fields = match codec::decode_data_message(line_str) {
                 Some(f) => f, None => {
                     log::error!("处理消息: DATA 消息解析失败");
@@ -237,8 +227,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 }
             };
             let mut key_arr = [0u8; 32]; key_arr.copy_from_slice(&key_bytes);
-            log::debug!("处理消息: 解密 DATA header={}, uuid={}, 密文长度={}",
-                hdr, fields.local_uuid, fields.encrypted_payload.len());
             let plain = match aes::decrypt(&key_arr, fields.encrypted_payload) {
                 Ok(p) => p, Err(_) => {
                     log::error!("处理消息: DATA 解密失败 header={}, uuid={}", hdr, fields.local_uuid);
@@ -247,7 +235,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             };
             let plaintext = String::from_utf8_lossy(&plain).to_string();
             let uuid_s = fields.local_uuid;
-            log::info!("处理消息: DATA 解密成功 header={}, uuid={}, 明文长度={}", hdr, uuid_s, plaintext.len());
+            log::debug!("处理消息: 解密 DATA header={}, uuid={}, 密文长度={}", hdr, uuid_s, fields.encrypted_payload.len());
             match hdr {
                 "DATA_NOTIFICATION" => {
                     let n = serde_json::from_str::<crate::models::Notification>(&plaintext)

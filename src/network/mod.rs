@@ -166,7 +166,6 @@ fn accept_loop(
 
         match incoming {
             Some((stream, addr)) => {
-                log::info!("接受新连接: {}", addr);
                 let state_clone = state.clone();
                 let on_connected = on_connected.clone();
                 let on_disconnected = on_disconnected.clone();
@@ -215,7 +214,6 @@ fn handle_connection(
     // 读取第一行获取设备 UUID
     match reader.read_line(&mut buffer) {
         Ok(0) => {
-            log::info!("连接立即关闭: {}", addr);
             return;
         }
         Ok(_) => {
@@ -239,8 +237,6 @@ fn handle_connection(
                 log::warn!("无法从消息中提取 UUID: {}", &line[..line.len().min(80)]);
                 return;
             }
-
-            log::info!("设备已连接: uuid={}, ip={}, 第一行={}", uuid, ip, &line[..line.len().min(40)]);
 
             // 添加到会话
             {
@@ -277,7 +273,6 @@ fn handle_connection(
         buffer.clear();
         match reader.read_line(&mut buffer) {
             Ok(0) => {
-                log::info!("连接关闭: uuid={}, ip={}", uuid, ip);
                 break;
             }
             Ok(_) => {
@@ -453,7 +448,11 @@ pub fn oneshot_send_receive(ip: &str, port: u16, payload: &str, connect_timeout_
 
 pub fn oneshot_send_only(ip: &str, port: u16, payload: &str, connect_timeout_ms: u32) -> bool {
     let addr = format!("{}:{}", ip, port);
-    let stream = match TcpStream::connect_timeout(&addr.parse().ok().unwrap(), Duration::from_millis(connect_timeout_ms as u64)) {
+    let sock_addr = match addr.parse::<std::net::SocketAddr>() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_millis(connect_timeout_ms as u64)) {
         Ok(s) => s,
         Err(_) => return false,
     };
