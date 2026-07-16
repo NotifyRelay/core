@@ -389,3 +389,92 @@ pub extern "C" fn nrc_oneshot_send_only(
     let payload_str = unsafe { from_cstr(payload) };
     if crate::network::oneshot_send_only(payload_str, ip_str, port, timeout_ms) { 1 } else { 0 }
 }
+
+/// 网络变化通知
+/// 平台端在网络状态变化（WiFi 切换、网络恢复等）时调用此函数
+/// local_ip: 新的本机 IP 地址（可为空，core 会自动获取）
+#[no_mangle]
+pub extern "C" fn nrc_on_network_changed(
+    ctx_ptr: *mut c_void,
+    local_ip: *const c_char,
+) {
+    if ctx_ptr.is_null() { return; }
+
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+
+    // 获取新 IP
+    let new_ip = if !local_ip.is_null() {
+        let ip = unsafe { from_cstr(local_ip) };
+        if !ip.is_empty() { Some(ip.to_string()) } else { None }
+    } else {
+        None
+    };
+
+    log::info!("网络变化通知: ip={:?}", new_ip);
+
+    // 重启 UDP 监听器
+    if let Ok(guard) = ctx.lock() {
+        // 停止旧的 UDP 监听器
+        if let Ok(mut state) = guard.network.tcp.lock() {
+            if let Some(handle) = state.udp_handle.take() {
+                if let Ok(mut running) = handle.running.lock() {
+                    *running = false;
+                }
+            }
+        }
+        let on_heartbeat_udp = guard.router.on_heartbeat_udp;
+        let on_tcp_error = guard.router.on_tcp_error;
+        let user_data = guard.router.user_data;
+        let network_state = guard.network.tcp.clone();
+        drop(guard);
+
+        // 启动新的
+        let udp_port = 23334u16;
+        let udp_user_data = user_data as usize;
+        let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
+            Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+                let name = String::from_utf8(
+                    base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
+                ).unwrap_or(name_b64);
+                if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
+                    std::ffi::CString::new(uuid.as_str()),
+                    std::ffi::CString::new(name.as_str()),
+                    std::ffi::CString::new(device_type.as_str()),
+                ) {
+                    let ud = udp_user_data as *mut c_void;
+                    cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
+                }
+            }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+        } else {
+            None
+        };
+        let udp_err_user_data = user_data as usize;
+        let on_udp_err = if let Some(cb) = on_tcp_error {
+            Some(Arc::new(move |error: String| {
+                if let Ok(err_c) = std::ffi::CString::new(error.as_str()) {
+                    let ud = udp_err_user_data as *mut c_void;
+                    cb(err_c.as_ptr(), ud);
+                }
+            }) as Arc<dyn Fn(String) + Send + Sync>)
+        } else {
+            None
+        };
+
+        match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
+            Ok(running) => {
+                if let Ok(mut state) = network_state.lock() {
+                    state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+                }
+                log::info!("网络变化: UDP 监听器已重启");
+            }
+            Err(e) => {
+                log::warn!("网络变化: 重启 UDP 监听器失败: {}", e);
+            }
+        }
+    }
+
+    // 自动启动已知设备扫描（用于网络恢复后自动重连）
+    if let Ok(guard) = ctx.lock() {
+        guard.discovery.start_known_device_scanner(ctx_ptr as usize);
+    }
+}

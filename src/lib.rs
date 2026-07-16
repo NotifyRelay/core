@@ -7,6 +7,9 @@ mod network;
 mod dedup;
 mod models;
 mod filter;
+pub mod diff;
+pub mod sender_queue;
+pub mod reconnect;
 pub mod ffi;
 
 use p256::SecretKey;
@@ -31,10 +34,14 @@ pub struct CoreContext {
     pub ephemeral_pub_b64: Option<String>,
     pub pairing_key: Option<[u8; 32]>,
     pub pairing_ctx: Option<PairingContext>,
-    /// 预期配对码（发起方设置，用于自动验证）
     pub expected_pairing_code: Option<String>,
     pub broadcast_info: Option<BroadcastInfo>,
     pub broadcast_handle: Option<BroadcastHandle>,
+    // 新增字段
+    pub heartbeat_handle: i64,
+    pub offline_detector_handle: i64,
+    pub sender_queue: i64,
+    pub reconnect_state: i64,
 }
 
 pub struct PairingContext {
@@ -71,6 +78,10 @@ impl CoreContext {
             expected_pairing_code: None,
             broadcast_info: None,
             broadcast_handle: None,
+            heartbeat_handle: 0,
+            offline_detector_handle: 0,
+            sender_queue: 0,
+            reconnect_state: 0,
         }
     }
 }

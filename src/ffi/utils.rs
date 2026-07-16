@@ -1,3 +1,4 @@
+use std::net::UdpSocket;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 
@@ -210,6 +211,22 @@ pub extern "C" fn nrc_generate_random_password() -> *mut c_char {
     let mut rng = rand::thread_rng();
     let password: String = (0..12).map(|_| { let idx = rng.gen_range(0..CHARS.len()); CHARS[idx] as char }).collect();
     to_cstr(&password)
+}
+
+/// 获取本机局域网 IP 地址
+/// 通过 UDP 连接到外部地址来确定实际出站接口
+#[no_mangle]
+pub extern "C" fn nrc_get_local_ip() -> *mut c_char {
+    let ip = get_local_ip_impl().unwrap_or_default();
+    to_cstr(&ip)
+}
+
+fn get_local_ip_impl() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // 连接 Google DNS 以确定本地接口，不实际发送数据
+    socket.connect("8.8.8.8:53").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
 }
 
 #[cfg(test)]
