@@ -3,6 +3,8 @@ use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
+use base64::Engine;
+
 use crate::SafeContext;
 
 use super::common::from_cstr;
@@ -25,6 +27,7 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     let on_connected = guard.router.on_device_connected;
     let on_disconnected = guard.router.on_device_disconnected;
     let on_tcp_error = guard.router.on_tcp_error;
+    let on_heartbeat_udp = guard.router.on_heartbeat_udp;
     let user_data = guard.router.user_data;
 
     // 获取网络状态
@@ -33,7 +36,6 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     drop(guard);
 
     // 创建回调包装器
-    // 将 *mut c_void 转换为 usize 以实现 Send + Sync
     let user_data_usize = user_data as usize;
 
     let on_connected_cb = if let Some(cb) = on_connected {
@@ -79,7 +81,7 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     };
 
     match crate::network::start_tcp_server(
-        network_state,
+        network_state.clone(),
         port,
         on_connected_cb,
         on_disconnected_cb,
@@ -88,13 +90,57 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     ) {
         Ok(_) => {
             log::info!("TCP 服务器已启动，端口: {}", port);
-            0
         }
         Err(e) => {
             log::error!("启动 TCP 服务器失败: {}", e);
-            -1
+            return -1;
         }
     }
+
+    // 同时启动 UDP 监听器
+    let udp_port = 23334u16;
+    let udp_user_data = user_data_usize;
+    let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
+        Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+            let name = String::from_utf8(
+                base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
+            ).unwrap_or(name_b64);
+            if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
+                CString::new(uuid.as_str()),
+                CString::new(name.as_str()),
+                CString::new(device_type.as_str()),
+            ) {
+                let ud = udp_user_data as *mut c_void;
+                cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
+            }
+        }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+    } else {
+        None
+    };
+    let on_udp_err = if let Some(cb) = on_tcp_error {
+        Some(Arc::new(move |error: String| {
+            if let Ok(err_c) = CString::new(error.as_str()) {
+                let ud = user_data_usize as *mut c_void;
+                cb(err_c.as_ptr(), ud);
+            }
+        }) as Arc<dyn Fn(String) + Send + Sync>)
+    } else {
+        None
+    };
+
+    match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
+        Ok(running) => {
+            if let Ok(mut state) = network_state.lock() {
+                state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+            }
+            log::info!("UDP 监听器已启动，端口: {}", udp_port);
+        }
+        Err(e) => {
+            log::warn!("启动 UDP 监听器失败: {}", e);
+        }
+    }
+
+    0
 }
 
 /// 停止 TCP 服务器
@@ -116,6 +162,76 @@ pub extern "C" fn nrc_stop_tcp_server(ctx_ptr: *mut c_void) -> i32 {
     match crate::network::stop_tcp_server(network_state) {
         Ok(_) => 0,
         Err(_) => -1,
+    }
+}
+
+/// 重启 UDP 监听器（网络变化后调用）
+#[no_mangle]
+pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
+    if ctx_ptr.is_null() { return -1; }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    let guard = match ctx.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let network_state = guard.network.tcp.clone();
+    let on_heartbeat_udp = guard.router.on_heartbeat_udp;
+    let on_tcp_error = guard.router.on_tcp_error;
+    let user_data = guard.router.user_data;
+    drop(guard);
+
+    // 停止旧的 UDP 监听器
+    if let Ok(mut state) = network_state.lock() {
+        if let Some(handle) = state.udp_handle.take() {
+            if let Ok(mut running) = handle.running.lock() {
+                *running = false;
+            }
+        }
+    }
+
+    // 启动新的
+    let udp_port = 23334u16;
+    let udp_user_data = user_data as usize;
+    let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
+        Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+            let name = String::from_utf8(
+                base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
+            ).unwrap_or(name_b64);
+            if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
+                CString::new(uuid.as_str()),
+                CString::new(name.as_str()),
+                CString::new(device_type.as_str()),
+            ) {
+                let ud = udp_user_data as *mut c_void;
+                cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
+            }
+        }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+    } else {
+        None
+    };
+    let on_udp_err = if let Some(cb) = on_tcp_error {
+        Some(Arc::new(move |error: String| {
+            if let Ok(err_c) = CString::new(error.as_str()) {
+                let ud = udp_user_data as *mut c_void;
+                cb(err_c.as_ptr(), ud);
+            }
+        }) as Arc<dyn Fn(String) + Send + Sync>)
+    } else {
+        None
+    };
+
+    match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
+        Ok(running) => {
+            if let Ok(mut state) = network_state.lock() {
+                state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+            }
+            log::info!("UDP 监听器已重启，端口: {}", udp_port);
+            0
+        }
+        Err(e) => {
+            log::error!("重启 UDP 监听器失败: {}", e);
+            -1
+        }
     }
 }
 
@@ -233,23 +349,43 @@ pub extern "C" fn nrc_remove_device_session(ctx_ptr: *mut c_void, uuid: *const c
     0
 }
 
-use super::common::to_cstr;
-
+/// Oneshot TCP 发送+接收（新版：统一超时，返回状态码）
+/// 返回 0=成功(响应已通过 process_line 处理), -1=失败
 #[no_mangle]
-pub extern "C" fn nrc_oneshot_send_receive(ip: *const c_char, port: u16, payload: *const c_char, connect_timeout_ms: u32, read_timeout_ms: u32) -> *mut c_char {
-    if ip.is_null() || payload.is_null() { return to_cstr(""); }
+pub extern "C" fn nrc_oneshot_send_receive(
+    ctx_ptr: *mut c_void,
+    ip: *const c_char,
+    port: u16,
+    payload: *const c_char,
+    timeout_ms: u32,
+) -> i32 {
+    if ctx_ptr.is_null() || ip.is_null() || payload.is_null() { return -1; }
     let ip_str = unsafe { from_cstr(ip) };
     let payload_str = unsafe { from_cstr(payload) };
-    match crate::network::oneshot_send_receive(ip_str, port, payload_str, connect_timeout_ms, read_timeout_ms) {
-        Some(response) => to_cstr(&response),
-        None => to_cstr(""),
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+
+    match crate::network::oneshot_send_receive(payload_str, ip_str, port, timeout_ms) {
+        Some(response) => {
+            // 内部处理响应（触发回调）
+            super::processing::process_line(ctx, &response);
+            0
+        }
+        None => -1,
     }
 }
 
+/// Oneshot TCP 发送（不等待响应）
+/// 返回 1=成功, 0=失败
 #[no_mangle]
-pub extern "C" fn nrc_oneshot_send_only(ip: *const c_char, port: u16, payload: *const c_char, connect_timeout_ms: u32) -> i32 {
-    if ip.is_null() || payload.is_null() { return 0; }
+pub extern "C" fn nrc_oneshot_send_only(
+    ctx_ptr: *mut c_void,
+    ip: *const c_char,
+    port: u16,
+    payload: *const c_char,
+    timeout_ms: u32,
+) -> i32 {
+    if ctx_ptr.is_null() || ip.is_null() || payload.is_null() { return 0; }
     let ip_str = unsafe { from_cstr(ip) };
     let payload_str = unsafe { from_cstr(payload) };
-    if crate::network::oneshot_send_only(ip_str, port, payload_str, connect_timeout_ms) { 1 } else { 0 }
+    if crate::network::oneshot_send_only(payload_str, ip_str, port, timeout_ms) { 1 } else { 0 }
 }

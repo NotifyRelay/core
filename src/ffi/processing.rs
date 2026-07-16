@@ -133,15 +133,50 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::Accept => {
             if let Some(f) = codec::decode_accept(line_str) {
-                let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
-                let cb = guard.router.on_accept; let ud = guard.router.user_data;
-                drop(guard);
+                let uuid = f.uuid.to_string();
+                let lt_pub = f.lt_pub_key.to_string();
+                let (cb, ud, priv_key, result_cb) = {
+                    let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                    (guard.router.on_accept, guard.router.user_data,
+                     guard.crypto.local_key.clone(), guard.router.on_pairing_result)
+                };
+                // 自动派生共享密钥
+                if let Some(ref key) = priv_key {
+                    if let Ok(shared) = ecdh::compute_shared_secret(key, &lt_pub) {
+                        let aes_key = hkdf::derive_session_key(&shared);
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
+                        if let Ok(mut guard) = ctx.lock() {
+                            guard.crypto.device_keys.insert(
+                                uuid.clone(),
+                                crate::crypto::DeviceKeyEntry { remote_pub_key: lt_pub.clone(), aes_key_b64: b64 },
+                            );
+                        }
+                        // 配对成功回调
+                        if let Some(cb_r) = result_cb {
+                            let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
+                            let ok_c = CString::new("ok").unwrap_or_default();
+                            cb_r(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
+                        }
+                    } else {
+                        if let Some(cb_r) = result_cb {
+                            let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
+                            let err_c = CString::new("shared_secret_derivation_failed").unwrap_or_default();
+                            cb_r(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
+                        }
+                    }
+                } else {
+                    if let Some(cb_r) = result_cb {
+                        let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
+                        let err_c = CString::new("no_local_keypair").unwrap_or_default();
+                        cb_r(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
+                    }
+                }
                 if let Some(cb) = cb {
-                    let uuid = CString::new(f.uuid).unwrap_or_default();
+                    let uuid_c = CString::new(f.uuid).unwrap_or_default();
                     let lt = CString::new(f.lt_pub_key).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    cb(uuid.as_ptr(), lt.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                    cb(uuid_c.as_ptr(), lt.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: ACCEPT 回调未注册");
                 }
@@ -153,9 +188,16 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::Reject => {
             if let Some(payload) = line_str.strip_prefix("REJECT:") {
-                let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
-                let cb = guard.router.on_reject; let ud = guard.router.user_data;
-                drop(guard);
+                let (cb, ud, result_cb) = {
+                    let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                    (guard.router.on_reject, guard.router.user_data, guard.router.on_pairing_result)
+                };
+                // 配对失败回调
+                if let Some(cb_r) = result_cb {
+                    let uuid_c = CString::new(payload).unwrap_or_default();
+                    let err_c = CString::new("rejected").unwrap_or_default();
+                    cb_r(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
+                }
                 if let Some(cb) = cb {
                     let uuid_c = CString::new(payload).unwrap_or_default();
                     cb(uuid_c.as_ptr(), ud);
@@ -295,7 +337,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 }
                 _ => dispatch_data(cb_unk, uuid_s, &plaintext, ud),
             }
-            0
+             0
         }
         _ => {
             log::warn!("处理消息: 未知消息类型");
@@ -316,27 +358,4 @@ pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) ->
     process_line(ctx, line_str)
 }
 
-#[no_mangle]
-pub extern "C" fn nrc_process_udp_broadcast(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || line.is_null() { return -1; }
-    let line_str = unsafe { from_cstr(line) };
-    if line_str.is_empty() { return -1; }
-    match crate::heartbeat::parse_udp_heartbeat(line_str) {
-        Some((uuid, name_b64, port, battery, device_type)) => {
-            let (cb, ud) = {
-                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
-                guard.heartbeat.record(&uuid);
-                (guard.router.on_heartbeat_udp, guard.router.user_data)
-            };
-            if let Some(cb_fn) = cb {
-                let uuid_c = CString::new(uuid).unwrap_or_default();
-                let name_c = CString::new(name_b64).unwrap_or_default();
-                let dt_c = CString::new(device_type).unwrap_or_default();
-                cb_fn(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
-            }
-            0
-        }
-        None => -1,
-    }
-}
+

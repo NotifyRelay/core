@@ -51,6 +51,9 @@ pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char
 pub type OnDeviceDisconnectedCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 pub type OnTcpErrorCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
+/// 配对结果回调：success=1 成功, 0 失败
+pub type OnPairingResultCb = Option<extern "C" fn(*const c_char, i32, *const c_char, *mut c_void)>;
+
 pub struct Router {
     pub user_data: *mut c_void,
     pub on_handshake: OnHandshakeCb,
@@ -79,6 +82,8 @@ pub struct Router {
     pub on_device_connected: OnDeviceConnectedCb,
     pub on_device_disconnected: OnDeviceDisconnectedCb,
     pub on_tcp_error: OnTcpErrorCb,
+    /// 配对完成回调
+    pub on_pairing_result: OnPairingResultCb,
 }
 
 impl Router {
@@ -110,6 +115,7 @@ impl Router {
             on_device_connected: None,
             on_device_disconnected: None,
             on_tcp_error: None,
+            on_pairing_result: None,
         }
     }
 }

@@ -10,7 +10,8 @@ mod filter;
 pub mod ffi;
 
 use p256::SecretKey;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 pub struct DeviceState {
     pub peer_tmp_pub: Option<String>,
@@ -30,12 +31,27 @@ pub struct CoreContext {
     pub ephemeral_pub_b64: Option<String>,
     pub pairing_key: Option<[u8; 32]>,
     pub pairing_ctx: Option<PairingContext>,
+    /// 预期配对码（发起方设置，用于自动验证）
+    pub expected_pairing_code: Option<String>,
+    pub broadcast_info: Option<BroadcastInfo>,
+    pub broadcast_handle: Option<BroadcastHandle>,
 }
 
 pub struct PairingContext {
     pub peer_tmp_pub: String,
     pub peer_lt_pub: Option<String>,
     pub decrypted_code: Option<String>,
+}
+
+pub struct BroadcastInfo {
+    pub uuid: String,
+    pub name_b64: String,
+    pub battery: i32,
+    pub device_type: String,
+}
+
+pub struct BroadcastHandle {
+    pub running: Arc<AtomicBool>,
 }
 
 impl CoreContext {
@@ -52,6 +68,9 @@ impl CoreContext {
             ephemeral_pub_b64: None,
             pairing_key: None,
             pairing_ctx: None,
+            expected_pairing_code: None,
+            broadcast_info: None,
+            broadcast_handle: None,
         }
     }
 }
