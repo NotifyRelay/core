@@ -38,6 +38,11 @@ make_cb_setter!(nrc_set_on_heartbeat_udp_cb, crate::router::OnHeartbeatUdpCb, on
 
 make_cb_setter!(nrc_set_on_device_timeout_cb, crate::router::OnDeviceTimeoutCb, on_device_timeout);
 
+// 网络层回调
+make_cb_setter!(nrc_set_on_device_connected_cb, crate::router::OnDeviceConnectedCb, on_device_connected);
+make_cb_setter!(nrc_set_on_device_disconnected_cb, crate::router::OnDeviceDisconnectedCb, on_device_disconnected);
+make_cb_setter!(nrc_set_on_tcp_error_cb, crate::router::OnTcpErrorCb, on_tcp_error);
+
 #[no_mangle]
 pub extern "C" fn nrc_set_user_data(ctx_ptr: *mut c_void, user_data: *mut c_void) {
     with_ctx(ctx_ptr, |ctx| { ctx.router.user_data = user_data; });

@@ -3,6 +3,7 @@ mod crypto;
 mod router;
 mod heartbeat;
 mod discovery;
+mod network;
 mod dedup;
 mod models;
 pub mod ffi;
@@ -21,6 +22,7 @@ pub struct CoreContext {
     pub router: router::Router,
     pub heartbeat: heartbeat::HeartbeatState,
     pub discovery: discovery::DiscoveryState,
+    pub network: network::NetworkState,
     pub dedup: dedup::DedupState,
     pub ephemeral_key: Option<SecretKey>,
     pub ephemeral_pub_b64: Option<String>,
@@ -41,6 +43,7 @@ impl CoreContext {
             router: router::Router::new(),
             heartbeat: heartbeat::HeartbeatState::new(),
             discovery: discovery::DiscoveryState::new(),
+            network: network::NetworkState::new(),
             dedup: dedup::DedupState::new(),
             ephemeral_key: None,
             ephemeral_pub_b64: None,

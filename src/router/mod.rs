@@ -46,6 +46,11 @@ pub type OnHeartbeatUdpCb = Option<
 
 pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
+// 网络层回调类型
+pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
+pub type OnDeviceDisconnectedCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+pub type OnTcpErrorCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+
 pub struct Router {
     pub user_data: *mut c_void,
     pub on_handshake: OnHandshakeCb,
@@ -71,6 +76,10 @@ pub struct Router {
     pub on_send_udp: OnSendCb,
     pub on_heartbeat_udp: OnHeartbeatUdpCb,
     pub on_device_timeout: OnDeviceTimeoutCb,
+    // 网络层回调
+    pub on_device_connected: OnDeviceConnectedCb,
+    pub on_device_disconnected: OnDeviceDisconnectedCb,
+    pub on_tcp_error: OnTcpErrorCb,
 }
 
 impl Router {
@@ -100,6 +109,9 @@ impl Router {
             on_send_udp: None,
             on_heartbeat_udp: None,
             on_device_timeout: None,
+            on_device_connected: None,
+            on_device_disconnected: None,
+            on_tcp_error: None,
         }
     }
 }
