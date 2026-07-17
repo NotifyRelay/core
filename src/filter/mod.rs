@@ -7,6 +7,13 @@ pub struct PackageGroup {
     pub packages: Vec<String>,
 }
 
+/// 过滤列表条目（支持关键词过滤）
+#[derive(Clone, Debug)]
+pub struct FilterListEntry {
+    pub package: String,
+    pub keyword: Option<String>,
+}
+
 /// 远程过滤配置
 #[derive(Clone, Debug, Default)]
 pub struct RemoteFilterConfig {
@@ -14,7 +21,7 @@ pub struct RemoteFilterConfig {
     pub package_groups: Vec<PackageGroup>,
     pub group_enabled: HashMap<String, bool>,
     pub filter_mode: u32,
-    pub filter_list: Vec<String>,
+    pub filter_list: Vec<FilterListEntry>,
     pub enable_peer_mode: bool,
     pub installed_packages: Vec<String>,
 }
@@ -41,19 +48,32 @@ impl RemoteFilterConfig {
         remote_pkg.to_string()
     }
 
+    /// 检查包名是否匹配某条过滤条目（含关键词匹配）
+    pub fn matches_filter_entry(&self, pkg: &str, title: &str, text: &str) -> bool {
+        self.filter_list.iter().any(|entry| {
+            if entry.package != pkg {
+                return false;
+            }
+            match &entry.keyword {
+                None => true,
+                Some(kw) => title.contains(kw.as_str()) || text.contains(kw.as_str()),
+            }
+        })
+    }
+
     /// 检查过滤模式: 0=不过滤, 1=白名单, 2=黑名单
-    pub fn check_filter_mode(&self, package_name: &str) -> bool {
+    pub fn check_filter_mode(&self, package_name: &str, title: &str, text: &str) -> bool {
         match self.filter_mode {
             0 => true,
-            1 => self.filter_list.contains(&package_name.to_string()),
-            2 => !self.filter_list.contains(&package_name.to_string()),
+            1 => self.matches_filter_entry(package_name, title, text),
+            2 => !self.matches_filter_entry(package_name, title, text),
             _ => true,
         }
     }
 
-    /// 检查包名是否在过滤列表中
+    /// 检查包名是否在过滤列表中（简化版，无关键词匹配）
     pub fn is_in_filter_list(&self, package_name: &str) -> bool {
-        self.filter_list.contains(&package_name.to_string())
+        self.filter_list.iter().any(|entry| entry.package == package_name)
     }
 }
 
@@ -92,24 +112,47 @@ mod tests {
     #[test]
     fn test_check_filter_mode() {
         let mut config = RemoteFilterConfig::new();
-        config.filter_list.push("com.allowed".to_string());
+        config.filter_list.push(FilterListEntry {
+            package: "com.allowed".to_string(),
+            keyword: None,
+        });
 
         config.filter_mode = 0;
-        assert!(config.check_filter_mode("com.any"));
+        assert!(config.check_filter_mode("com.any", "", ""));
 
         config.filter_mode = 1;
-        assert!(config.check_filter_mode("com.allowed"));
-        assert!(!config.check_filter_mode("com.blocked"));
+        assert!(config.check_filter_mode("com.allowed", "", ""));
+        assert!(!config.check_filter_mode("com.blocked", "", ""));
 
         config.filter_mode = 2;
-        assert!(!config.check_filter_mode("com.allowed"));
-        assert!(config.check_filter_mode("com.blocked"));
+        assert!(!config.check_filter_mode("com.allowed", "", ""));
+        assert!(config.check_filter_mode("com.blocked", "", ""));
+    }
+
+    #[test]
+    fn test_filter_list_keyword() {
+        let mut config = RemoteFilterConfig::new();
+        config.filter_list.push(FilterListEntry {
+            package: "com.app".to_string(),
+            keyword: Some("blocked".to_string()),
+        });
+
+        config.filter_mode = 2; // blacklist
+        // keyword matches → blocked
+        assert!(!config.check_filter_mode("com.app", "blocked content", ""));
+        // keyword doesn't match → not blocked
+        assert!(config.check_filter_mode("com.app", "normal content", ""));
+        // different package → not blocked
+        assert!(config.check_filter_mode("com.other", "blocked content", ""));
     }
 
     #[test]
     fn test_is_in_filter_list() {
         let mut config = RemoteFilterConfig::new();
-        config.filter_list.push("com.whitelist".to_string());
+        config.filter_list.push(FilterListEntry {
+            package: "com.whitelist".to_string(),
+            keyword: None,
+        });
         assert!(config.is_in_filter_list("com.whitelist"));
         assert!(!config.is_in_filter_list("com.other"));
     }

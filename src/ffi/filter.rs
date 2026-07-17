@@ -73,7 +73,11 @@ pub extern "C" fn nrc_set_filter_config(
             cfg.filter_list.clear();
             for item in list {
                 if let Some(s) = item.as_str() {
-                    cfg.filter_list.push(s.to_string());
+                    let parts: Vec<&str> = s.splitn(2, '|').collect();
+                    cfg.filter_list.push(crate::filter::FilterListEntry {
+                        package: parts[0].to_string(),
+                        keyword: parts.get(1).filter(|k| !k.is_empty()).map(|k| k.to_string()),
+                    });
                 }
             }
         }
@@ -118,15 +122,22 @@ pub extern "C" fn nrc_map_local_package(
 }
 
 /// 检查过滤模式（返回 1=通过, 0=被过滤）
+/// 参数: ctx, mappedPkg, originalPkg, title, text
+/// title/text 用于关键词匹配
 #[no_mangle]
 pub extern "C" fn nrc_check_filter_mode(
     ctx_ptr: *mut crate::SafeContext,
-    package_name: *const c_char,
+    mapped_package: *const c_char,
+    _original_package: *const c_char,
+    title: *const c_char,
+    text: *const c_char,
 ) -> i32 {
-    if ctx_ptr.is_null() || package_name.is_null() {
+    if ctx_ptr.is_null() || mapped_package.is_null() {
         return 1;
     }
-    let pkg = unsafe { from_cstr(package_name) };
+    let pkg = unsafe { from_cstr(mapped_package) };
+    let title_str = if title.is_null() { "" } else { unsafe { from_cstr(title) } };
+    let text_str = if text.is_null() { "" } else { unsafe { from_cstr(text) } };
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let guard = match ctx.lock() {
         Ok(g) => g,
@@ -136,10 +147,11 @@ pub extern "C" fn nrc_check_filter_mode(
         Ok(c) => c,
         Err(_) => return 1,
     };
-    if config.check_filter_mode(&pkg) { 1 } else { 0 }
+    if config.check_filter_mode(&pkg, title_str, text_str) { 1 } else { 0 }
 }
 
 /// 过滤通知（返回 1=通过, 0=被过滤）
+/// 支持通过 title/text 关键词匹配过滤条目
 #[no_mangle]
 pub extern "C" fn nrc_filter_notification(
     ctx_ptr: *mut crate::SafeContext,
@@ -151,8 +163,8 @@ pub extern "C" fn nrc_filter_notification(
         return 1;
     }
     let pkg = unsafe { from_cstr(package_name) };
-    let _t = unsafe { from_cstr(title) };
-    let _tx = unsafe { from_cstr(text) };
+    let title_str = if title.is_null() { "" } else { unsafe { from_cstr(title) } };
+    let text_str = if text.is_null() { "" } else { unsafe { from_cstr(text) } };
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let guard = match ctx.lock() {
@@ -164,7 +176,7 @@ pub extern "C" fn nrc_filter_notification(
         Err(_) => return 1,
     };
 
-    if config.check_filter_mode(&pkg) { 1 } else { 0 }
+    if config.check_filter_mode(&pkg, title_str, text_str) { 1 } else { 0 }
 }
 
 #[cfg(test)]
@@ -196,13 +208,15 @@ mod tests {
         unsafe { let _ = CString::from_raw(json_ptr as *mut c_char); }
 
         let pkg_ptr = to_cstr_test("com.allowed");
-        let check = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr) };
+        let empty = to_cstr_test("");
+        let check = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr, empty, empty, empty) };
         assert_eq!(check, 1);
         unsafe { let _ = CString::from_raw(pkg_ptr as *mut c_char); }
 
         let pkg_ptr2 = to_cstr_test("com.blocked");
-        let check2 = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr2) };
+        let check2 = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr2, empty, empty, empty) };
         assert_eq!(check2, 0);
         unsafe { let _ = CString::from_raw(pkg_ptr2 as *mut c_char); }
+        unsafe { let _ = CString::from_raw(empty as *mut c_char); }
     }
 }
