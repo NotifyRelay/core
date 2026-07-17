@@ -154,15 +154,12 @@ impl SenderQueue {
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        let (key_b64, has_tcp_session, local_uuid) = match ctx.lock() {
+        let (key_b64, local_uuid) = match ctx.lock() {
             Ok(guard) => {
                 let key = guard.crypto.device_keys.get(&item.device_uuid)
                     .map(|k| k.aes_key_b64.clone());
-                let has = guard.network.tcp.lock()
-                    .map(|tcp| tcp.is_connected(&item.device_uuid))
-                    .unwrap_or(false);
                 let uuid = guard.broadcast_info.as_ref().map(|i| i.uuid.clone()).unwrap_or_default();
-                (key, has, uuid)
+                (key, uuid)
             }
             Err(_) => return Err(()),
         };
@@ -193,31 +190,19 @@ impl SenderQueue {
         };
         let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
 
-        if has_tcp_session && !item.device_uuid.is_empty() {
-            match ctx.lock() {
-                Ok(guard) => {
-                    match guard.network.tcp.lock() {
-                        Ok(mut tcp) => Ok(tcp.send_to_device(&item.device_uuid, &msg)),
-                        Err(_) => Ok(false),
-                    }
-                }
-                Err(_) => Ok(false),
-            }
+        // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
+        let ip = match ctx.lock() {
+            Ok(guard) => guard.device_ips.lock()
+                .ok()
+                .and_then(|ips| ips.get(&item.device_uuid).cloned())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        if !ip.is_empty() && ip != "0.0.0.0" {
+            Ok(crate::network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000))
         } else {
-            // IP 由 Rust 内部 device_ips 映射查找，不依赖平台端传入
-            let ip = match ctx.lock() {
-                Ok(guard) => guard.device_ips.lock()
-                    .ok()
-                    .and_then(|ips| ips.get(&item.device_uuid).cloned())
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-            if !ip.is_empty() && ip != "0.0.0.0" {
-                Ok(crate::network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000))
-            } else {
-                log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
-                Ok(false)
-            }
+            log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
+            Ok(false)
         }
     }
 
