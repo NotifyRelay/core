@@ -286,6 +286,10 @@ fn handle_connection(
             Ok(_) => {
                 let line = buffer.trim().to_string();
                 if !line.is_empty() {
+                    if let Some(data) = codec::decode_data_message(&line) {
+                        log::info!("收到 TCP DATA: local_uuid={}, payload_len={}, from={}", 
+                            data.local_uuid, data.encrypted_payload.len(), addr);
+                    }
                     if let Some(ref cb) = on_message {
                         cb(uuid.clone(), line);
                     }
