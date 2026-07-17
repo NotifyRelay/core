@@ -205,10 +205,24 @@ impl SenderQueue {
                 }
                 Err(_) => Ok(false),
             }
-        } else if !item.device_ip.is_empty() {
-            Ok(crate::network::oneshot_send_only(&msg, &item.device_ip, codec::DEFAULT_TCP_PORT, 3000))
         } else {
-            Ok(false)
+            let ip = if !item.device_ip.is_empty() && item.device_ip != "0.0.0.0" {
+                item.device_ip.clone()
+            } else {
+                match ctx.lock() {
+                    Ok(guard) => guard.device_ips.lock()
+                        .ok()
+                        .and_then(|ips| ips.get(&item.device_uuid).cloned())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                }
+            };
+            if !ip.is_empty() && ip != "0.0.0.0" {
+                Ok(crate::network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000))
+            } else {
+                log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
+                Ok(false)
+            }
         }
     }
 

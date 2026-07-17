@@ -14,8 +14,8 @@ type DisconnectedCallback = Arc<dyn Fn(String) + Send + Sync>;
 type MessageCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
 
-/// UDP 心跳回调
-type UdpHeartbeatCallback = Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>;
+/// UDP 心跳回调（新增 String 参数为源 IP）
+type UdpHeartbeatCallback = Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>;
 
 /// TCP 会话状态
 pub struct TcpSession {
@@ -461,7 +461,8 @@ pub fn start_udp_listener(
             }
 
             match socket.recv_from(&mut buf) {
-                Ok((n, _src)) => {
+                Ok((n, src)) => {
+                    let src_ip = src.ip().to_string();
                     let line = match String::from_utf8_lossy(&buf[..n]).trim().to_string() {
                         s if s.is_empty() => continue,
                         s => s,
@@ -470,7 +471,7 @@ pub fn start_udp_listener(
                         if let Some((uuid, name_b64, hb_port, battery, device_type)) =
                             heartbeat::parse_udp_heartbeat(&line)
                         {
-                            cb(uuid, name_b64, hb_port, battery, device_type);
+                            cb(uuid, name_b64, hb_port, battery, device_type, src_ip);
                         }
                     }
                 }

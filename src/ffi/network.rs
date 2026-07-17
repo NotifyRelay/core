@@ -106,11 +106,18 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     if !udp_already_running {
         let udp_port = 23334u16;
         let udp_user_data = user_data_usize;
+        let udp_ctx = ctx_ptr as usize;
         let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
-            Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+            Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String, src_ip: String| {
                 let name = String::from_utf8(
                     base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
                 ).unwrap_or(name_b64);
+                // 记录源 IP 到内部映射
+                if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+                    if let Ok(mut ips) = guard.device_ips.lock() {
+                        ips.insert(uuid.clone(), src_ip);
+                    }
+                }
                 if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
                     CString::new(uuid.as_str()),
                     CString::new(name.as_str()),
@@ -119,7 +126,7 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
                     let ud = udp_user_data as *mut c_void;
                     cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
                 }
-            }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+            }) as Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>)
         } else {
             None
         };
@@ -201,11 +208,17 @@ pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
     // 启动新的
     let udp_port = 23334u16;
     let udp_user_data = user_data as usize;
+    let udp_ctx = ctx_ptr as usize;
     let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
-        Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+        Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String, src_ip: String| {
             let name = String::from_utf8(
                 base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
             ).unwrap_or(name_b64);
+            if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+                if let Ok(mut ips) = guard.device_ips.lock() {
+                    ips.insert(uuid.clone(), src_ip);
+                }
+            }
             if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
                 CString::new(uuid.as_str()),
                 CString::new(name.as_str()),
@@ -214,7 +227,7 @@ pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
                 let ud = udp_user_data as *mut c_void;
                 cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
             }
-        }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+        }) as Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>)
     } else {
         None
     };
@@ -437,12 +450,18 @@ pub extern "C" fn nrc_on_network_changed(
             drop(guard);
 
             let udp_port = 23334u16;
+            let udp_ctx2 = ctx_ptr as usize;
             let udp_user_data = user_data as usize;
             let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
-                Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+                Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String, src_ip: String| {
                     let name = String::from_utf8(
                         base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
                     ).unwrap_or(name_b64);
+                    if let Ok(guard) = unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock() {
+                        if let Ok(mut ips) = guard.device_ips.lock() {
+                            ips.insert(uuid.clone(), src_ip);
+                        }
+                    }
                     if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
                         std::ffi::CString::new(uuid.as_str()),
                         std::ffi::CString::new(name.as_str()),
@@ -451,7 +470,7 @@ pub extern "C" fn nrc_on_network_changed(
                         let ud = udp_user_data as *mut c_void;
                         cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
                     }
-                }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+                }) as Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>)
             } else {
                 None
             };

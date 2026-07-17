@@ -12,6 +12,7 @@ pub mod sender_queue;
 pub mod reconnect;
 pub mod ffi;
 
+use std::collections::HashMap;
 use p256::SecretKey;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,8 @@ pub struct CoreContext {
     pub expected_pairing_code: Option<String>,
     pub broadcast_info: Option<BroadcastInfo>,
     pub broadcast_handle: Option<BroadcastHandle>,
+    /// UUID → IP 映射（从 UDP 心跳源地址、TCP 连接等收集）
+    pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
     pub heartbeat_handle: i64,
     pub offline_detector_handle: i64,
@@ -71,6 +74,7 @@ impl CoreContext {
             network: network::NetworkState::new(),
             dedup: dedup::DedupState::new(),
             filter: ffi::filter::FilterState::new(),
+            device_ips: Mutex::new(HashMap::new()),
             ephemeral_key: None,
             ephemeral_pub_b64: None,
             pairing_key: None,
