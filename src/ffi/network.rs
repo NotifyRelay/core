@@ -421,64 +421,65 @@ pub extern "C" fn nrc_on_network_changed(
 
     log::info!("网络变化通知: ip={:?}", new_ip);
 
-    // 重启 UDP 监听器
+    // UDP 监听器使用 0.0.0.0:23334 监听所有接口，网络变化不影响其工作
+    // 只有在监听器未运行时才启动，避免频繁重启导致端口占用竞争
     if let Ok(guard) = ctx.lock() {
-        // 停止旧的 UDP 监听器
-        if let Ok(mut state) = guard.network.tcp.lock() {
-            if let Some(handle) = state.udp_handle.take() {
-                if let Ok(mut running) = handle.running.lock() {
-                    *running = false;
-                }
-            }
-        }
-        let on_heartbeat_udp = guard.router.on_heartbeat_udp;
-        let on_tcp_error = guard.router.on_tcp_error;
-        let user_data = guard.router.user_data;
-        let network_state = guard.network.tcp.clone();
-        drop(guard);
-
-        // 启动新的
-        let udp_port = 23334u16;
-        let udp_user_data = user_data as usize;
-        let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
-            Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
-                let name = String::from_utf8(
-                    base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
-                ).unwrap_or(name_b64);
-                if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
-                    std::ffi::CString::new(uuid.as_str()),
-                    std::ffi::CString::new(name.as_str()),
-                    std::ffi::CString::new(device_type.as_str()),
-                ) {
-                    let ud = udp_user_data as *mut c_void;
-                    cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
-                }
-            }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
-        } else {
-            None
-        };
-        let udp_err_user_data = user_data as usize;
-        let on_udp_err = if let Some(cb) = on_tcp_error {
-            Some(Arc::new(move |error: String| {
-                if let Ok(err_c) = std::ffi::CString::new(error.as_str()) {
-                    let ud = udp_err_user_data as *mut c_void;
-                    cb(err_c.as_ptr(), ud);
-                }
-            }) as Arc<dyn Fn(String) + Send + Sync>)
-        } else {
-            None
+        let udp_running = match guard.network.tcp.lock() {
+            Ok(state) => state.udp_handle.is_some(),
+            Err(_) => false,
         };
 
-        match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
-            Ok(running) => {
-                if let Ok(mut state) = network_state.lock() {
-                    state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+        if !udp_running {
+            let on_heartbeat_udp = guard.router.on_heartbeat_udp;
+            let on_tcp_error = guard.router.on_tcp_error;
+            let user_data = guard.router.user_data;
+            let network_state = guard.network.tcp.clone();
+            drop(guard);
+
+            let udp_port = 23334u16;
+            let udp_user_data = user_data as usize;
+            let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
+                Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+                    let name = String::from_utf8(
+                        base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
+                    ).unwrap_or(name_b64);
+                    if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
+                        std::ffi::CString::new(uuid.as_str()),
+                        std::ffi::CString::new(name.as_str()),
+                        std::ffi::CString::new(device_type.as_str()),
+                    ) {
+                        let ud = udp_user_data as *mut c_void;
+                        cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
+                    }
+                }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+            } else {
+                None
+            };
+            let udp_err_user_data = user_data as usize;
+            let on_udp_err = if let Some(cb) = on_tcp_error {
+                Some(Arc::new(move |error: String| {
+                    if let Ok(err_c) = std::ffi::CString::new(error.as_str()) {
+                        let ud = udp_err_user_data as *mut c_void;
+                        cb(err_c.as_ptr(), ud);
+                    }
+                }) as Arc<dyn Fn(String) + Send + Sync>)
+            } else {
+                None
+            };
+
+            match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
+                Ok(running) => {
+                    if let Ok(mut state) = network_state.lock() {
+                        state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+                    }
+                    log::info!("网络变化: UDP 监听器已启动");
                 }
-                log::info!("网络变化: UDP 监听器已重启");
+                Err(e) => {
+                    log::warn!("网络变化: 启动 UDP 监听器失败: {}", e);
+                }
             }
-            Err(e) => {
-                log::warn!("网络变化: 重启 UDP 监听器失败: {}", e);
-            }
+        } else {
+            log::info!("网络变化: UDP 监听器已在运行，跳过");
         }
     }
 
