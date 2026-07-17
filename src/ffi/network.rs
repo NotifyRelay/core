@@ -97,47 +97,56 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
         }
     }
 
-    // 同时启动 UDP 监听器
-    let udp_port = 23334u16;
-    let udp_user_data = user_data_usize;
-    let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
-        Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
-            let name = String::from_utf8(
-                base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
-            ).unwrap_or(name_b64);
-            if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
-                CString::new(uuid.as_str()),
-                CString::new(name.as_str()),
-                CString::new(device_type.as_str()),
-            ) {
-                let ud = udp_user_data as *mut c_void;
-                cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
-            }
-        }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
-    } else {
-        None
-    };
-    let on_udp_err = if let Some(cb) = on_tcp_error {
-        Some(Arc::new(move |error: String| {
-            if let Ok(err_c) = CString::new(error.as_str()) {
-                let ud = user_data_usize as *mut c_void;
-                cb(err_c.as_ptr(), ud);
-            }
-        }) as Arc<dyn Fn(String) + Send + Sync>)
-    } else {
-        None
+    // 同时启动 UDP 监听器（仅在未启动时）
+    let udp_already_running = match network_state.lock() {
+        Ok(state) => state.udp_handle.is_some(),
+        Err(_) => false,
     };
 
-    match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
-        Ok(running) => {
-            if let Ok(mut state) = network_state.lock() {
-                state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+    if !udp_already_running {
+        let udp_port = 23334u16;
+        let udp_user_data = user_data_usize;
+        let on_udp_cb = if let Some(cb) = on_heartbeat_udp {
+            Some(Arc::new(move |uuid: String, name_b64: String, port: u16, battery: i32, device_type: String| {
+                let name = String::from_utf8(
+                    base64::engine::general_purpose::STANDARD.decode(&name_b64).unwrap_or_default()
+                ).unwrap_or(name_b64);
+                if let (Ok(uuid_c), Ok(name_c), Ok(dt_c)) = (
+                    CString::new(uuid.as_str()),
+                    CString::new(name.as_str()),
+                    CString::new(device_type.as_str()),
+                ) {
+                    let ud = udp_user_data as *mut c_void;
+                    cb(uuid_c.as_ptr(), name_c.as_ptr(), port, battery, dt_c.as_ptr(), ud);
+                }
+            }) as Arc<dyn Fn(String, String, u16, i32, String) + Send + Sync>)
+        } else {
+            None
+        };
+        let on_udp_err = if let Some(cb) = on_tcp_error {
+            Some(Arc::new(move |error: String| {
+                if let Ok(err_c) = CString::new(error.as_str()) {
+                    let ud = user_data_usize as *mut c_void;
+                    cb(err_c.as_ptr(), ud);
+                }
+            }) as Arc<dyn Fn(String) + Send + Sync>)
+        } else {
+            None
+        };
+
+        match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
+            Ok(running) => {
+                if let Ok(mut state) = network_state.lock() {
+                    state.udp_handle = Some(crate::network::UdpListenerHandle { running });
+                }
+                log::info!("UDP 监听器已启动，端口: {}", udp_port);
             }
-            log::info!("UDP 监听器已启动，端口: {}", udp_port);
+            Err(e) => {
+                log::warn!("启动 UDP 监听器失败: {}", e);
+            }
         }
-        Err(e) => {
-            log::warn!("启动 UDP 监听器失败: {}", e);
-        }
+    } else {
+        log::info!("UDP 监听器已在运行，跳过");
     }
 
     0

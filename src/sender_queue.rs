@@ -184,6 +184,11 @@ impl SenderQueue {
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&key_bytes);
 
+        if !local_uuid.is_empty() && item.device_uuid == local_uuid {
+            log::warn!("发送队列: 跳过向自身发送 uuid={}", item.device_uuid);
+            return Ok(false);
+        }
+
         let encrypted = match aes::encrypt(&key_arr, item.plaintext.as_bytes()) {
             Ok(e) => e,
             Err(_) => return Ok(false),
