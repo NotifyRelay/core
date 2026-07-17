@@ -1,5 +1,7 @@
 use std::os::raw::{c_char, c_void};
 
+use base64::Engine;
+
 use crate::heartbeat::{self, HeartbeatHandle};
 use crate::SafeContext;
 
@@ -24,11 +26,17 @@ pub extern "C" fn nrc_start_heartbeat_sender(
     let d = unsafe { from_cstr(device_type) };
     let ip_str = unsafe { from_cstr(ip) };
 
-    match HeartbeatHandle::start(ctx_ptr as usize, u, n, battery, d, &ip_str, interval_ms, mode) {
+    match HeartbeatHandle::start(ctx_ptr as usize, &u, &n, battery, &d, &ip_str, interval_ms, mode) {
         Ok(handle) => {
-            // 存储 handle 到 context
             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
             if let Ok(mut guard) = ctx.lock() {
+                let name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
+                guard.broadcast_info = Some(crate::BroadcastInfo {
+                    uuid: u.to_string(),
+                    name_b64,
+                    battery,
+                    device_type: d.to_string(),
+                });
                 let handle_box = Box::new(handle);
                 let ptr = Box::into_raw(handle_box) as i64;
                 guard.heartbeat_handle = ptr;
