@@ -28,13 +28,12 @@ pub extern "C" fn nrc_start_sender_queue(ctx_ptr: *mut c_void, queue_ptr: i64) {
     queue.start_worker(ctx_ptr as usize);
 }
 
-/// 入队消息
+/// 入队消息（IP 由 Rust 内部管理，无需平台端传入）
 #[no_mangle]
 pub extern "C" fn nrc_enqueue_message(
     ctx_ptr: *mut c_void,
     queue_ptr: i64,
     device_uuid: *const c_char,
-    device_ip: *const c_char,
     header: *const c_char,
     plaintext: *const c_char,
     dedup_key: *const c_char,
@@ -42,14 +41,12 @@ pub extern "C" fn nrc_enqueue_message(
     if ctx_ptr.is_null() || queue_ptr == 0 { return; }
     let queue = unsafe { &*(queue_ptr as *const SenderQueue) };
     let uuid = unsafe { from_cstr(device_uuid) };
-    let ip = unsafe { from_cstr(device_ip) };
     let hdr = unsafe { from_cstr(header) };
     let text = unsafe { from_cstr(plaintext) };
     let dk = unsafe { from_cstr(dedup_key) };
 
     queue.enqueue(SendItem {
         device_uuid: uuid.to_string(),
-        device_ip: ip.to_string(),
         header: hdr.to_string(),
         plaintext: text.to_string(),
         dedup_key: if dk.is_empty() { None } else { Some(dk.to_string()) },

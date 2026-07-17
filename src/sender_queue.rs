@@ -10,10 +10,9 @@ use crate::crypto::aes;
 use crate::protocol::codec;
 use crate::SafeContext;
 
-/// 消息发送项
+/// 消息发送项（IP 由 Rust 内部分配，不依赖平台端传入）
 pub struct SendItem {
     pub device_uuid: String,
-    pub device_ip: String,
     pub header: String,
     pub plaintext: String,
     pub dedup_key: Option<String>,
@@ -125,7 +124,6 @@ impl SenderQueue {
                     retries_left: item.retries_left - 1,
                     ..SendItem {
                         device_uuid: item.device_uuid.clone(),
-                        device_ip: item.device_ip.clone(),
                         header: item.header.clone(),
                         plaintext: item.plaintext.clone(),
                         dedup_key: item.dedup_key.clone(),
@@ -206,16 +204,13 @@ impl SenderQueue {
                 Err(_) => Ok(false),
             }
         } else {
-            let ip = if !item.device_ip.is_empty() && item.device_ip != "0.0.0.0" {
-                item.device_ip.clone()
-            } else {
-                match ctx.lock() {
-                    Ok(guard) => guard.device_ips.lock()
-                        .ok()
-                        .and_then(|ips| ips.get(&item.device_uuid).cloned())
-                        .unwrap_or_default(),
-                    Err(_) => String::new(),
-                }
+            // IP 由 Rust 内部 device_ips 映射查找，不依赖平台端传入
+            let ip = match ctx.lock() {
+                Ok(guard) => guard.device_ips.lock()
+                    .ok()
+                    .and_then(|ips| ips.get(&item.device_uuid).cloned())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
             };
             if !ip.is_empty() && ip != "0.0.0.0" {
                 Ok(crate::network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000))

@@ -38,8 +38,15 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     // 创建回调包装器
     let user_data_usize = user_data as usize;
 
+    let connected_ctx = ctx_ptr as usize;
     let on_connected_cb = if let Some(cb) = on_connected {
         Some(Arc::new(move |uuid: String, ip: String| {
+            // 记录 TCP 连接来源 IP 到内部映射（供 oneshot 发送回退）
+            if let Ok(guard) = unsafe { &*(connected_ctx as *mut crate::SafeContext) }.lock() {
+                if let Ok(mut ips) = guard.device_ips.lock() {
+                    ips.insert(uuid.clone(), ip.clone());
+                }
+            }
             if let (Ok(uuid_c), Ok(ip_c)) = (CString::new(uuid.as_str()), CString::new(ip.as_str())) {
                 let ud = user_data_usize as *mut c_void;
                 cb(uuid_c.as_ptr(), ip_c.as_ptr(), ud);
