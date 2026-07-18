@@ -192,7 +192,7 @@ pub extern "C" fn nrc_send_pairing_init(
                         let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                         if let Ok(mut guard) = ctx.lock() {
                             guard.crypto.device_keys.insert(
-                                lu.clone(),
+                                tu.clone(),
                                 crate::crypto::DeviceKeyEntry {
                                     remote_pub_key: lt_pub.clone(),
                                     aes_key_b64: b64,
@@ -216,7 +216,7 @@ pub extern "C" fn nrc_send_pairing_init(
                 Err(_) => (None, std::ptr::null_mut()),
             };
             if let Some(cb_fn) = cb {
-                let uuid_c = CString::new(lu.clone()).unwrap_or_default();
+                let uuid_c = CString::new(tu.clone()).unwrap_or_default();
                 let ok_c = CString::new("ok").unwrap_or_default();
                 cb_fn(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
             }
@@ -239,7 +239,7 @@ pub extern "C" fn nrc_send_pairing_init(
     let reject_msg = codec::encode_reject(&lu);
     let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
     if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(lu).unwrap_or_default();
+        let uuid_c = CString::new(tu).unwrap_or_default();
         let err_c = CString::new("code_mismatch").unwrap_or_default();
         cb_fn(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
     }
