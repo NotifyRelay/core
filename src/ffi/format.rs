@@ -13,21 +13,20 @@ pub extern "C" fn nrc_format_handshake(uuid: *const c_char, pub_key: *const c_ch
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_format_pairing_init(uuid: *const c_char, tmp_pub_key: *const c_char,
+pub extern "C" fn nrc_format_pairing_init(uuid: *const c_char, spake2_pub: *const c_char,
     ip: *const c_char, battery: i32, device_type: *const c_char) -> *mut c_char {
-    let u = unsafe { from_cstr(uuid) }; let t = unsafe { from_cstr(tmp_pub_key) };
+    let u = unsafe { from_cstr(uuid) }; let s = unsafe { from_cstr(spake2_pub) };
     let i = unsafe { from_cstr(ip) }; let d = unsafe { from_cstr(device_type) };
-    to_cstr(&codec::encode_pairing_init(u, t, i, battery, d))
+    to_cstr(&codec::encode_pairing_init(u, s, i, battery, d))
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_format_pairing_resp(uuid: *const c_char, tmp_pub: *const c_char,
-    lt_pub: *const c_char, encrypted_code: *const c_char, ip: *const c_char,
-    battery: i32, device_type: *const c_char) -> *mut c_char {
-    let u = unsafe { from_cstr(uuid) }; let t = unsafe { from_cstr(tmp_pub) };
-    let l = unsafe { from_cstr(lt_pub) }; let e = unsafe { from_cstr(encrypted_code) };
+pub extern "C" fn nrc_format_pairing_resp(uuid: *const c_char, spake2_pub: *const c_char,
+    lt_pub: *const c_char, ip: *const c_char, battery: i32, device_type: *const c_char) -> *mut c_char {
+    let u = unsafe { from_cstr(uuid) }; let s = unsafe { from_cstr(spake2_pub) };
+    let l = unsafe { from_cstr(lt_pub) };
     let i = unsafe { from_cstr(ip) }; let d = unsafe { from_cstr(device_type) };
-    to_cstr(&codec::encode_pairing_resp(u, t, l, e, i, battery, d))
+    to_cstr(&codec::encode_pairing_resp(u, s, l, i, battery, d))
 }
 
 #[no_mangle]

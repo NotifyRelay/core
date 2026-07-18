@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use base64::Engine;
 
-use crate::{crypto::aes, protocol::codec, crypto::ecdh, crypto::hkdf, BroadcastHandle, BroadcastInfo, CoreContext, SafeContext};
+use crate::{crypto::aes, protocol::codec, crypto::hkdf, crypto::spake2, BroadcastHandle, BroadcastInfo, CoreContext, SafeContext};
 
 use super::common::{encode_name_b64, from_cstr, with_ctx};
 
@@ -92,8 +92,8 @@ pub extern "C" fn nrc_send_handshake(
 fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
     let (cb, ud) = match ctx.lock() {
         Ok(mut g) => {
-            g.ephemeral_key = None;
-            g.ephemeral_pub_b64 = None;
+            g.spake2_prover = None;
+            g.spake2_verifier = None;
             g.pairing_ctx = None;
             g.expected_pairing_code = None;
             (g.router.on_pairing_result, g.router.user_data)
@@ -108,7 +108,7 @@ fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, e
 }
 
 /// 发送 PAIRING_INIT（发起方），自动完成完整配对流程
-/// 内部：生成临时密钥 → 发送 → 接收 PAIRING_RESP → 验证配对码 → 发送 ACCEPT/REJECT → 等待 ACK → 回调
+/// 内部：SPAKE2 Prover → 发送 → 接收 PAIRING_RESP → 完成密钥协商 → 发送 ACCEPT → 等待 ACK → 回调
 /// Rust 内部自动从 device_ips 映射表解析目标 IP，调用方只需传入 UUID
 #[no_mangle]
 pub extern "C" fn nrc_send_pairing_init(
@@ -125,19 +125,16 @@ pub extern "C" fn nrc_send_pairing_init(
     let dt = unsafe { from_cstr(device_type).to_string() };
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
 
-    // 获取本机 IP（用于编码到配对消息中）
     let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let (ctx_ref, target_ip) = match ctx.lock() {
         Ok(mut guard) => {
             guard.expected_pairing_code = Some(code.clone());
-            let (secret, b64) = ecdh::generate_keypair();
-            guard.ephemeral_key = Some(secret);
-            guard.ephemeral_pub_b64 = Some(b64.clone());
-            let msg = codec::encode_pairing_init(&lu, &b64, &local_ip, battery, &dt);
+            let (session, spake2_pub) = spake2::generate_prover_session(&code);
+            guard.spake2_prover = Some(session);
+            let msg = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
 
-            // 从 device_ips 映射表解析目标 IP
             let target = guard.device_ips.lock()
                 .ok()
                 .and_then(|ips| ips.get(&tu).cloned())
@@ -156,8 +153,6 @@ pub extern "C" fn nrc_send_pairing_init(
         return -1;
     }
 
-    // 手动 TCP 连接 + 发送 PAIRING_INIT + 读取 PAIRING_RESP
-    // 使用同一 TCP 流完成 ACCEPT/REJECT + ACK 确认
     let addr = format!("{}:{}", target_ip, port);
     let sock_addr = match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a,
@@ -176,7 +171,6 @@ pub extern "C" fn nrc_send_pairing_init(
         }
     };
 
-    // 发送 PAIRING_INIT
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
     {
         let mut writer = &stream;
@@ -188,7 +182,6 @@ pub extern "C" fn nrc_send_pairing_init(
         let _ = writer.flush();
     }
 
-    // 读取 PAIRING_RESP（60s 超时）
     stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
     let resp = {
         let mut reader = BufReader::new(&stream);
@@ -203,83 +196,76 @@ pub extern "C" fn nrc_send_pairing_init(
         line.trim().to_string()
     };
 
-    // 处理 PAIRING_RESP（process_line 内部会解密配对码）
     super::processing::process_line(ctx, &resp);
 
-    // 检查配对结果
-    let (decrypted, _eph_key, local_key) = match ctx.lock() {
-        Ok(g) => (
-            g.pairing_ctx.as_ref().and_then(|c| c.decrypted_code.clone()),
-            g.ephemeral_key.clone(),
-            g.crypto.local_key.clone(),
+    let (prover_session, peer_lt_pub, peer_spake2_pub) = match ctx.lock() {
+        Ok(mut g) => (
+            g.spake2_prover.take(),
+            g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
+            g.pairing_ctx.as_ref().map(|c| c.peer_spake2_pub.clone()),
         ),
         Err(_) => (None, None, None),
     };
 
-    if let Some(ref decrypted_code) = decrypted {
-        if decrypted_code == &code {
-            log::info!("配对发起: 配对码验证成功，发送 ACCEPT");
-            let (peer_lt_pub, local_pub_b64) = match ctx.lock() {
-                Ok(g) => (
-                    g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
-                    g.crypto.local_pub_key_b64.clone().unwrap_or_default(),
-                ),
-                Err(_) => (None, String::new()),
-            };
-            if let (Some(ref lt_pub), ref lk) = (&peer_lt_pub, &local_key) {
-                if let Some(ref lk) = lk {
-                    if let Ok(shared) = ecdh::compute_shared_secret(lk, lt_pub) {
-                        let aes_key = hkdf::derive_session_key(&shared);
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                        if let Ok(mut guard) = ctx.lock() {
-                            guard.crypto.device_keys.insert(
-                                tu.clone(),
-                                crate::crypto::DeviceKeyEntry {
-                                    remote_pub_key: lt_pub.clone(),
-                                    aes_key_b64: b64,
-                                },
-                            );
+    if let (Some(session), Some(lt_pub), Some(spake2_pub)) = (prover_session, peer_lt_pub, peer_spake2_pub) {
+        match spake2::prover_complete(session, &spake2_pub) {
+            Ok(shared_secret) => {
+                log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
+                let aes_key = hkdf::derive_session_key(&shared_secret);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
+                if let Ok(mut guard) = ctx.lock() {
+                    guard.crypto.device_keys.insert(
+                        tu.clone(),
+                        crate::crypto::DeviceKeyEntry {
+                            remote_pub_key: lt_pub.clone(),
+                            aes_key_b64: b64,
+                        },
+                    );
+                    guard.spake2_prover = None;
+                    guard.spake2_verifier = None;
+                    guard.pairing_ctx = None;
+                    guard.expected_pairing_code = None;
+                }
+                let local_pub_b64 = match ctx.lock() {
+                    Ok(g) => g.crypto.local_pub_key_b64.clone().unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let accept_line = codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
+                let data = format!("{}\n", accept_line);
+                stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                if stream.write_all(data.as_bytes()).is_err() || stream.flush().is_err() {
+                    log::warn!("配对发起: 发送 ACCEPT 失败");
+                } else {
+                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                    let mut ack_reader = BufReader::new(&stream);
+                    let mut ack_line = String::new();
+                    match ack_reader.read_line(&mut ack_line) {
+                        Ok(n) if n > 0 => {
+                            if ack_line.trim().starts_with("ACK:") {
+                                log::info!("配对发起: 收到 ACK 确认: {}", ack_line.trim());
+                            } else {
+                                log::warn!("配对发起: 收到非 ACK 响应: {}", ack_line.trim());
+                            }
+                        }
+                        _ => {
+                            log::warn!("配对发起: 未收到 ACK 确认");
                         }
                     }
                 }
+                fire_pairing_result(ctx, &tu, 1, "ok");
+                return 0;
             }
-            if let Ok(mut guard) = ctx.lock() {
-                guard.ephemeral_key = None;
-                guard.ephemeral_pub_b64 = None;
-                guard.pairing_ctx = None;
-                guard.expected_pairing_code = None;
+            Err(e) => {
+                log::error!("配对发起: SPAKE2 密钥协商失败: {}", e);
+                fire_pairing_result(ctx, &tu, 0, "spake2_failed");
+                let reject_msg = codec::encode_reject(&lu);
+                let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
+                return -1;
             }
-            // 通过同一 TCP 流发送 ACCEPT
-            let accept_line = codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
-            let data = format!("{}\n", accept_line);
-            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-            if stream.write_all(data.as_bytes()).is_err() || stream.flush().is_err() {
-                log::warn!("配对发起: 发送 ACCEPT 失败");
-            } else {
-                // 等待接收方 ACK 确认（10s 超时）
-                stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-                let mut ack_reader = BufReader::new(&stream);
-                let mut ack_line = String::new();
-                match ack_reader.read_line(&mut ack_line) {
-                    Ok(n) if n > 0 => {
-                        if ack_line.trim().starts_with("ACK:") {
-                            log::info!("配对发起: 收到 ACK 确认: {}", ack_line.trim());
-                        } else {
-                            log::warn!("配对发起: 收到非 ACK 响应: {}", ack_line.trim());
-                        }
-                    }
-                    _ => {
-                        log::warn!("配对发起: 未收到 ACK 确认（接收方可能未收到 ACCEPT）");
-                    }
-                }
-            }
-            fire_pairing_result(ctx, &tu, 1, "ok");
-            return 0;
         }
     }
 
-    // 配对失败：发送 REJECT + 等待 ACK + 回调
-    log::warn!("配对发起: 配对码验证失败");
+    log::warn!("配对发起: SPAKE2 会话或参数缺失");
     let reject_msg = codec::encode_reject(&lu);
     let data = format!("{}\n", reject_msg);
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
@@ -291,7 +277,7 @@ pub extern "C" fn nrc_send_pairing_init(
     } else {
         let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
     }
-    fire_pairing_result(ctx, &tu, 0, "code_mismatch");
+    fire_pairing_result(ctx, &tu, 0, "session_missing");
     0
 }
 
@@ -335,33 +321,14 @@ pub extern "C" fn nrc_send_pairing_resp(
 
     let msg = match ctx.lock() {
         Ok(mut guard) => {
-            // 确保有临时密钥
-            if guard.ephemeral_key.is_none() {
-                let (secret, b64) = ecdh::generate_keypair();
-                guard.ephemeral_key = Some(secret);
-                guard.ephemeral_pub_b64 = Some(b64);
-            }
-            let tmp_pub = guard.ephemeral_pub_b64.clone().unwrap_or_default();
-            // 派生配对密钥
-            if let Some(ref eph_key) = guard.ephemeral_key.clone() {
-                if let Some(ref peer_tmp) = guard.pairing_ctx.as_ref().map(|c| c.peer_tmp_pub.clone()) {
-                    if let Ok(shared) = ecdh::compute_shared_secret(eph_key, peer_tmp) {
-                        let aes_key = hkdf::derive_pairing_key(&shared);
-                        guard.pairing_key = Some(aes_key);
-                    }
-                }
-            }
-            // 加密配对码
-            let encrypted = guard.pairing_key
-                .and_then(|key| aes::encrypt(&key, code.as_bytes()).ok())
-                .unwrap_or_default();
-            let msg = codec::encode_pairing_resp(&u, &tmp_pub, &l, &encrypted, &i, battery, &d);
+            let (session, spake2_pub) = spake2::generate_verifier_session(&code);
+            guard.spake2_verifier = Some(session);
+            let msg = codec::encode_pairing_resp(&u, &spake2_pub, &l, &i, battery, &d);
             msg
         }
         Err(_) => return -1,
     };
 
-    // 通过 peer_uuid 查找 TCP 会话发送
     with_ctx(ctx_ptr, |ctx| {
         do_send(ctx, &target_uuid, &msg);
     });

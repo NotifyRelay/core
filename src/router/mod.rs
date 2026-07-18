@@ -11,7 +11,6 @@ pub type OnPairingRespCb = Option<
         *const c_char,
         *const c_char,
         *const c_char,
-        *const c_char,
         i32,
         *const c_char,
         *mut c_void,

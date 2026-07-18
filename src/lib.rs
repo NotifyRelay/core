@@ -13,15 +13,12 @@ pub mod reconnect;
 pub mod ffi;
 
 use std::collections::HashMap;
-use p256::SecretKey;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct DeviceState {
-    pub peer_tmp_pub: Option<String>,
     pub peer_lt_pub: Option<String>,
-    pub decrypted_code: Option<String>,
 }
 
 pub struct CoreContext {
@@ -32,9 +29,8 @@ pub struct CoreContext {
     pub network: network::NetworkState,
     pub dedup: dedup::DedupState,
     pub filter: ffi::filter::FilterState,
-    pub ephemeral_key: Option<SecretKey>,
-    pub ephemeral_pub_b64: Option<String>,
-    pub pairing_key: Option<[u8; 32]>,
+    pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
+    pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
     pub pairing_ctx: Option<PairingContext>,
     pub expected_pairing_code: Option<String>,
     /// 配对码生成（接收端/初始生成端）
@@ -54,9 +50,8 @@ pub struct CoreContext {
 
 pub struct PairingContext {
     pub peer_uuid: String,
-    pub peer_tmp_pub: String,
+    pub peer_spake2_pub: String,
     pub peer_lt_pub: Option<String>,
-    pub decrypted_code: Option<String>,
 }
 
 pub struct BroadcastInfo {
@@ -81,9 +76,8 @@ impl CoreContext {
             dedup: dedup::DedupState::new(),
             filter: ffi::filter::FilterState::new(),
             device_ips: Mutex::new(HashMap::new()),
-            ephemeral_key: None,
-            ephemeral_pub_b64: None,
-            pairing_key: None,
+            spake2_prover: None,
+            spake2_verifier: None,
             pairing_ctx: None,
             expected_pairing_code: None,
             pairing_code: None,

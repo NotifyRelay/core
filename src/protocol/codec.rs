@@ -32,29 +32,28 @@ fn parse_battery_hb(raw: &str) -> i32 {
 
 pub fn encode_pairing_init(
     uuid: &str,
-    tmp_pub_key: &str,
+    spake2_pub: &str,
     ip: &str,
     battery: i32,
     device_type: &str,
 ) -> String {
     format!(
         "PAIRING_INIT:{}:{}:{}:{}:{}",
-        uuid, tmp_pub_key, ip, battery_pairing(battery), device_type
+        uuid, spake2_pub, ip, battery_pairing(battery), device_type
     )
 }
 
 pub fn encode_pairing_resp(
     uuid: &str,
-    tmp_pub: &str,
+    spake2_pub: &str,
     lt_pub: &str,
-    encrypted_code: &str,
     ip: &str,
     battery: i32,
     device_type: &str,
 ) -> String {
     format!(
-        "PAIRING_RESP:{}:{}:{}:{}:{}:{}:{}",
-        uuid, tmp_pub, lt_pub, encrypted_code, ip, battery_pairing(battery), device_type
+        "PAIRING_RESP:{}:{}:{}:{}:{}:{}",
+        uuid, spake2_pub, lt_pub, ip, battery_pairing(battery), device_type
     )
 }
 
@@ -133,7 +132,7 @@ pub fn encode_udp_broadcast(
 #[derive(Debug)]
 pub struct PairingInitFields<'a> {
     pub uuid: &'a str,
-    pub tmp_pub_key: &'a str,
+    pub spake2_pub: &'a str,
     pub ip: &'a str,
     pub battery: i32,
     pub device_type: &'a str,
@@ -142,9 +141,8 @@ pub struct PairingInitFields<'a> {
 #[derive(Debug)]
 pub struct PairingRespFields<'a> {
     pub uuid: &'a str,
-    pub tmp_pub: &'a str,
+    pub spake2_pub: &'a str,
     pub lt_pub: &'a str,
-    pub encrypted_code: &'a str,
     pub ip: &'a str,
     pub battery: i32,
     pub device_type: &'a str,
@@ -202,7 +200,7 @@ pub fn decode_pairing_init(line: &str) -> Option<PairingInitFields<'_>> {
     }
     Some(PairingInitFields {
         uuid: parts[0],
-        tmp_pub_key: parts[1],
+        spake2_pub: parts[1],
         ip: parts[2],
         battery: parse_battery_pairing(parts[3]),
         device_type: parts[4],
@@ -215,17 +213,16 @@ pub fn decode_pairing_resp(line: &str) -> Option<PairingRespFields<'_>> {
         return None;
     }
     let parts = split_parts(line, "PAIRING_RESP:");
-    if parts.len() < 7 {
+    if parts.len() < 6 {
         return None;
     }
     Some(PairingRespFields {
         uuid: parts[0],
-        tmp_pub: parts[1],
+        spake2_pub: parts[1],
         lt_pub: parts[2],
-        encrypted_code: parts[3],
-        ip: parts[4],
-        battery: parse_battery_pairing(parts[5]),
-        device_type: parts[6],
+        ip: parts[3],
+        battery: parse_battery_pairing(parts[4]),
+        device_type: parts[5],
     })
 }
 

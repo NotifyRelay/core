@@ -5,7 +5,7 @@ use std::os::raw::c_void;
 use base64::Engine;
 
 use crate::{
-    crypto::{aes, ecdh, hkdf},
+    crypto::{aes, ecdh, hkdf, spake2},
     protocol::{codec, header::ProtocolHeader},
     SafeContext,
 };
@@ -71,18 +71,17 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
                 guard.pairing_ctx = Some(crate::PairingContext {
                     peer_uuid: f.uuid.to_string(),
-                    peer_tmp_pub: f.tmp_pub_key.to_string(),
+                    peer_spake2_pub: f.spake2_pub.to_string(),
                     peer_lt_pub: None,
-                    decrypted_code: None,
                 });
                 let cb = guard.router.on_pairing_init; let ud = guard.router.user_data;
                 drop(guard);
                 if let Some(cb) = cb {
                     let uuid = CString::new(f.uuid).unwrap_or_default();
-                    let tmp = CString::new(f.tmp_pub_key).unwrap_or_default();
+                    let spake2_pub = CString::new(f.spake2_pub).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    cb(uuid.as_ptr(), tmp.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                    cb(uuid.as_ptr(), spake2_pub.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: PAIRING_INIT 回调未注册");
                 }
@@ -94,37 +93,26 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::PairingResp => {
             if let Some(f) = codec::decode_pairing_resp(line_str) {
-                let (eph_key, cb, ud) = {
+                let (cb, ud) = {
                     let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
-                    (guard.ephemeral_key.clone(), guard.router.on_pairing_resp, guard.router.user_data)
+                    (guard.router.on_pairing_resp, guard.router.user_data)
                 };
-                let peer_tmp = f.tmp_pub.to_string();
+                let peer_spake2 = f.spake2_pub.to_string();
                 let peer_lt = f.lt_pub.to_string();
-                let enc_code = f.encrypted_code.to_string();
-                if let Some(ref ek) = eph_key {
-                    if let Ok(shared) = ecdh::compute_shared_secret(ek, &peer_tmp) {
-                        let aes_key = hkdf::derive_pairing_key(&shared);
-                        let decoded = aes::decrypt(&aes_key, &enc_code).ok()
-                            .map(|p| String::from_utf8_lossy(&p).to_string());
-                        if let Ok(mut guard) = ctx.lock() {
-                            guard.pairing_key = Some(aes_key);
-                            guard.pairing_ctx = Some(crate::PairingContext {
-                                peer_uuid: f.uuid.to_string(),
-                                peer_tmp_pub: peer_tmp.clone(),
-                                peer_lt_pub: Some(peer_lt.clone()),
-                                decrypted_code: decoded.clone(),
-                            });
-                        }
-                    }
+                if let Ok(mut guard) = ctx.lock() {
+                    guard.pairing_ctx = Some(crate::PairingContext {
+                        peer_uuid: f.uuid.to_string(),
+                        peer_spake2_pub: peer_spake2.clone(),
+                        peer_lt_pub: Some(peer_lt.clone()),
+                    });
                 }
                 if let Some(cb_fn) = cb {
                     let uuid_c = CString::new(f.uuid).unwrap_or_default();
-                    let tmp = CString::new(f.tmp_pub).unwrap_or_default();
+                    let spake2_pub = CString::new(f.spake2_pub).unwrap_or_default();
                     let lt = CString::new(f.lt_pub).unwrap_or_default();
-                    let enc = CString::new(f.encrypted_code).unwrap_or_default();
                     let ip = CString::new(f.ip).unwrap_or_default();
                     let dt = CString::new(f.device_type).unwrap_or_default();
-                    cb_fn(uuid_c.as_ptr(), tmp.as_ptr(), lt.as_ptr(), enc.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
+                    cb_fn(uuid_c.as_ptr(), spake2_pub.as_ptr(), lt.as_ptr(), ip.as_ptr(), f.battery, dt.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: PAIRING_RESP 回调未注册");
                 }
@@ -138,39 +126,45 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             if let Some(f) = codec::decode_accept(line_str) {
                 let uuid = f.uuid.to_string();
                 let lt_pub = f.lt_pub_key.to_string();
-                let (cb, ud, priv_key, result_cb) = {
-                    let guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+                let (cb, ud, verifier_session, peer_spake2_pub, result_cb) = {
+                    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
                     (guard.router.on_accept, guard.router.user_data,
-                     guard.crypto.local_key.clone(), guard.router.on_pairing_result)
+                     guard.spake2_verifier.take(),
+                     guard.pairing_ctx.as_ref().map(|c| c.peer_spake2_pub.clone()),
+                     guard.router.on_pairing_result)
                 };
-                // 自动派生共享密钥
-                if let Some(ref key) = priv_key {
-                    if let Ok(shared) = ecdh::compute_shared_secret(key, &lt_pub) {
-                        let aes_key = hkdf::derive_session_key(&shared);
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                        if let Ok(mut guard) = ctx.lock() {
-                            guard.crypto.device_keys.insert(
-                                uuid.clone(),
-                                crate::crypto::DeviceKeyEntry { remote_pub_key: lt_pub.clone(), aes_key_b64: b64 },
-                            );
+                let mut success = false;
+                if let (Some(session), Some(spake2_pub)) = (verifier_session, peer_spake2_pub) {
+                    match spake2::verifier_complete(session, &spake2_pub) {
+                        Ok(shared_secret) => {
+                            let aes_key = hkdf::derive_session_key(&shared_secret);
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
+                            if let Ok(mut guard) = ctx.lock() {
+                                guard.crypto.device_keys.insert(
+                                    uuid.clone(),
+                                    crate::crypto::DeviceKeyEntry { remote_pub_key: lt_pub.clone(), aes_key_b64: b64 },
+                                );
+                                guard.spake2_prover = None;
+                                guard.spake2_verifier = None;
+                                guard.pairing_ctx = None;
+                                guard.expected_pairing_code = None;
+                            }
+                            success = true;
                         }
-                        // 配对成功回调
-                        if let Some(cb_r) = result_cb {
-                            let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
-                            let ok_c = CString::new("ok").unwrap_or_default();
-                            cb_r(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
-                        }
-                    } else {
-                        if let Some(cb_r) = result_cb {
-                            let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
-                            let err_c = CString::new("shared_secret_derivation_failed").unwrap_or_default();
-                            cb_r(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
+                        Err(e) => {
+                            log::error!("处理消息: SPAKE2 verifier 完成失败: {}", e);
                         }
                     }
                 } else {
-                    if let Some(cb_r) = result_cb {
-                        let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
-                        let err_c = CString::new("no_local_keypair").unwrap_or_default();
+                    log::warn!("处理消息: ACCEPT 时 SPAKE2 会话或参数缺失");
+                }
+                if let Some(cb_r) = result_cb {
+                    let uuid_c = CString::new(uuid.as_str()).unwrap_or_default();
+                    if success {
+                        let ok_c = CString::new("ok").unwrap_or_default();
+                        cb_r(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
+                    } else {
+                        let err_c = CString::new("spake2_failed").unwrap_or_default();
                         cb_r(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
                     }
                 }
@@ -183,7 +177,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 } else {
                     log::warn!("处理消息: ACCEPT 回调未注册");
                 }
-                // 回复 ACK 确认给发起方
                 {
                     let ack = codec::encode_ack(&uuid);
                     match ctx.lock() {

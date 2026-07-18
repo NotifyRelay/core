@@ -1,4 +1,5 @@
 pub mod ecdh;
+pub mod spake2;
 pub mod aes;
 pub mod hkdf;
 
