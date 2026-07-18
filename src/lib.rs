@@ -48,6 +48,7 @@ pub struct CoreContext {
 }
 
 pub struct PairingContext {
+    pub peer_uuid: String,
     pub peer_tmp_pub: String,
     pub peer_lt_pub: Option<String>,
     pub decrypted_code: Option<String>,

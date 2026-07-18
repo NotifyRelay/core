@@ -247,27 +247,43 @@ pub extern "C" fn nrc_send_pairing_init(
 }
 
 /// 发送 PAIRING_RESP（接收方回复发起方的配对请求）
-/// sender_uuid 是接收方（本机）身份标识，用于编码到消息中
-/// target_uuid 是发起方 UUID，用于查找 TCP 会话
+/// uuid 为接收方（本机）身份标识，用于编码到消息中
+/// 会话通过 pairing_ctx.peer_uuid 查找
 #[no_mangle]
 pub extern "C" fn nrc_send_pairing_resp(
     ctx_ptr: *mut c_void,
-    sender_uuid: *const c_char,
-    target_uuid: *const c_char,
+    uuid: *const c_char,
     lt_pub: *const c_char,
     pairing_code: *const c_char,
     ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) -> i32 {
-    let su = unsafe { from_cstr(sender_uuid).to_string() };
-    let tu = unsafe { from_cstr(target_uuid).to_string() };
+    let u = unsafe { from_cstr(uuid).to_string() };
     let l = unsafe { from_cstr(lt_pub).to_string() };
     let code = unsafe { from_cstr(pairing_code).to_string() };
     let i = unsafe { from_cstr(ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let target_uuid = match ctx.lock() {
+        Ok(guard) => match guard.pairing_ctx.as_ref() {
+            Some(c) => Some(c.peer_uuid.clone()),
+            None => {
+                log::error!("发送 PAIRING_RESP: 无配对上下文");
+                None
+            }
+        },
+        Err(_) => {
+            log::error!("发送 PAIRING_RESP: 加锁失败");
+            None
+        }
+    };
+    let target_uuid = match target_uuid {
+        Some(u) => u,
+        None => return -1,
+    };
+
     let msg = match ctx.lock() {
         Ok(mut guard) => {
             // 确保有临时密钥
@@ -290,15 +306,15 @@ pub extern "C" fn nrc_send_pairing_resp(
             let encrypted = guard.pairing_key
                 .and_then(|key| aes::encrypt(&key, code.as_bytes()).ok())
                 .unwrap_or_default();
-            let msg = codec::encode_pairing_resp(&su, &tmp_pub, &l, &encrypted, &i, battery, &d);
+            let msg = codec::encode_pairing_resp(&u, &tmp_pub, &l, &encrypted, &i, battery, &d);
             msg
         }
         Err(_) => return -1,
     };
 
-    // 通过 TCP 会话查找对端（target_uuid）发送
+    // 通过 peer_uuid 查找 TCP 会话发送
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &tu, &msg);
+        do_send(ctx, &target_uuid, &msg);
     });
     0
 }
