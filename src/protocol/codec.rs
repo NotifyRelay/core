@@ -75,6 +75,10 @@ pub fn encode_reject(uuid: &str) -> String {
     format!("REJECT:{}", uuid)
 }
 
+pub fn encode_ack(uuid: &str) -> String {
+    format!("ACK:{}", uuid)
+}
+
 pub fn encode_handshake(
     uuid: &str,
     pub_key: &str,

@@ -11,6 +11,7 @@ use crate::{
 };
 
 use super::common::{from_cstr};
+use super::send::do_send;
 
 fn dispatch_data(cb: crate::router::OnDataCb, local_uuid: &str, plaintext: &str, ud: *mut c_void) {
     if let Some(cb) = cb {
@@ -182,6 +183,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 } else {
                     log::warn!("处理消息: ACCEPT 回调未注册");
                 }
+                // 回复 ACK 确认给发起方
+                {
+                    let ack = codec::encode_ack(&uuid);
+                    match ctx.lock() {
+                        Ok(ref guard) => { do_send(guard, &uuid, &ack); }
+                        _ => {}
+                    }
+                }
                  0
             } else {
                 log::error!("处理消息: ACCEPT 解析失败");
@@ -205,6 +214,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     cb(uuid_c.as_ptr(), ud);
                 } else {
                     log::warn!("处理消息: REJECT 回调未注册");
+                }
+                // 回复 ACK 确认给发起方
+                {
+                    let ack = codec::encode_ack(payload);
+                    match ctx.lock() {
+                        Ok(ref guard) => { do_send(guard, payload, &ack); }
+                        _ => {}
+                    }
                 }
                  0
             } else {
@@ -343,6 +360,10 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 _ => dispatch_data(cb_unk, uuid_s, &plaintext, ud),
             }
              0
+        }
+        ProtocolHeader::Ack => {
+            log::debug!("处理消息: 收到 ACK");
+            0
         }
         _ => {
             log::warn!("处理消息: 未知消息类型");

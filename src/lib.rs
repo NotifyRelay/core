@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use p256::SecretKey;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct DeviceState {
     pub peer_tmp_pub: Option<String>,
@@ -36,6 +37,10 @@ pub struct CoreContext {
     pub pairing_key: Option<[u8; 32]>,
     pub pairing_ctx: Option<PairingContext>,
     pub expected_pairing_code: Option<String>,
+    /// 配对码生成（接收端/初始生成端）
+    pub pairing_code: Option<String>,
+    /// 配对码过期时间
+    pub pairing_code_expiry: Option<Instant>,
     pub broadcast_info: Option<BroadcastInfo>,
     pub broadcast_handle: Option<BroadcastHandle>,
     /// UUID → IP 映射（从 UDP 心跳源地址、TCP 连接等收集）
@@ -81,6 +86,8 @@ impl CoreContext {
             pairing_key: None,
             pairing_ctx: None,
             expected_pairing_code: None,
+            pairing_code: None,
+            pairing_code_expiry: None,
             broadcast_info: None,
             broadcast_handle: None,
             heartbeat_handle: 0,

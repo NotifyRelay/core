@@ -15,7 +15,7 @@ use crate::{crypto::aes, protocol::codec, crypto::ecdh, crypto::hkdf, BroadcastH
 use super::common::{encode_name_b64, from_cstr, with_ctx};
 
 /// 通过已建立的 TCP 会话发送消息
-fn do_send(ctx: &CoreContext, uuid: &str, line: &str) -> bool {
+pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, line: &str) -> bool {
     let data = format!("{}\n", line);
     match ctx.network.tcp.lock() {
         Ok(mut tcp) => {
@@ -88,8 +88,27 @@ pub extern "C" fn nrc_send_handshake(
     oneshot_send_and_process(ctx, &ti, port, &msg)
 }
 
+/// 发送配对结果回调并清理临时状态
+fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
+    let (cb, ud) = match ctx.lock() {
+        Ok(mut g) => {
+            g.ephemeral_key = None;
+            g.ephemeral_pub_b64 = None;
+            g.pairing_ctx = None;
+            g.expected_pairing_code = None;
+            (g.router.on_pairing_result, g.router.user_data)
+        }
+        Err(_) => return,
+    };
+    if let Some(cb_fn) = cb {
+        let uuid_c = CString::new(target_uuid).unwrap_or_default();
+        let err_c = CString::new(error_msg).unwrap_or_default();
+        cb_fn(uuid_c.as_ptr(), success, err_c.as_ptr(), ud);
+    }
+}
+
 /// 发送 PAIRING_INIT（发起方），自动完成完整配对流程
-/// 内部：生成临时密钥 → 发送 → 接收 PAIRING_RESP → 验证配对码 → 发送 ACCEPT/REJECT
+/// 内部：生成临时密钥 → 发送 → 接收 PAIRING_RESP → 验证配对码 → 发送 ACCEPT/REJECT → 等待 ACK → 回调
 /// Rust 内部自动从 device_ips 映射表解析目标 IP，调用方只需传入 UUID
 #[no_mangle]
 pub extern "C" fn nrc_send_pairing_init(
@@ -133,33 +152,56 @@ pub extern "C" fn nrc_send_pairing_init(
 
     if target_ip.is_empty() {
         log::error!("配对发起: 无法获取目标设备IP, target_uuid={}", tu);
+        fire_pairing_result(ctx, &tu, 0, "no_target_ip");
         return -1;
     }
 
-    // 手动 TCP 连接 + 发送 PAIRING_INIT + 长超时读取 PAIRING_RESP
+    // 手动 TCP 连接 + 发送 PAIRING_INIT + 读取 PAIRING_RESP
+    // 使用同一 TCP 流完成 ACCEPT/REJECT + ACK 确认
     let addr = format!("{}:{}", target_ip, port);
     let sock_addr = match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a,
-        Err(_) => { log::error!("配对发起: 地址解析失败 addr={}", addr); return -1; }
+        Err(_) => {
+            log::error!("配对发起: 地址解析失败 addr={}", addr);
+            fire_pairing_result(ctx, &tu, 0, "address_parse_failed");
+            return -1;
+        }
     };
-    let stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
+    let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
         Ok(s) => s,
-        Err(e) => { log::error!("配对发起: 连接目标超时, err={}", e); return -1; }
+        Err(e) => {
+            log::error!("配对发起: 连接目标超时, err={}", e);
+            fire_pairing_result(ctx, &tu, 0, "connection_timeout");
+            return -1;
+        }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
-    let mut writer = &stream;
-    if writer.write_all(format!("{}\n", ctx_ref).as_bytes()).is_err() {
-        log::error!("配对发起: 发送失败");
-        return -1;
+
+    // 发送 PAIRING_INIT
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    {
+        let mut writer = &stream;
+        if writer.write_all(format!("{}\n", ctx_ref).as_bytes()).is_err() {
+            log::error!("配对发起: 发送 PAIRING_INIT 失败");
+            fire_pairing_result(ctx, &tu, 0, "send_pairing_init_failed");
+            return -1;
+        }
+        let _ = writer.flush();
     }
-    let _ = writer.flush();
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-        log::error!("配对发起: 读取响应失败或连接关闭");
-        return -1;
-    }
-    let resp = line.trim().to_string();
+
+    // 读取 PAIRING_RESP（60s 超时）
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let resp = {
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            log::error!("配对发起: 读取 PAIRING_RESP 失败或连接关闭");
+            fire_pairing_result(ctx, &tu, 0, "pairing_resp_timeout");
+            let reject_msg = codec::encode_reject(&lu);
+            let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
+            return -1;
+        }
+        line.trim().to_string()
+    };
 
     // 处理 PAIRING_RESP（process_line 内部会解密配对码）
     super::processing::process_line(ctx, &resp);
@@ -184,7 +226,6 @@ pub extern "C" fn nrc_send_pairing_init(
                 ),
                 Err(_) => (None, String::new()),
             };
-            // 派生长期共享密钥
             if let (Some(ref lt_pub), ref lk) = (&peer_lt_pub, &local_key) {
                 if let Some(ref lk) = lk {
                     if let Ok(shared) = ecdh::compute_shared_secret(lk, lt_pub) {
@@ -208,41 +249,49 @@ pub extern "C" fn nrc_send_pairing_init(
                 guard.pairing_ctx = None;
                 guard.expected_pairing_code = None;
             }
-            // 通过 oneshot 发送 ACCEPT（不等待响应）
+            // 通过同一 TCP 流发送 ACCEPT
             let accept_line = codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
-            crate::network::oneshot_send_only(&accept_line, &target_ip, port, 5000);
-            let (cb, ud) = match ctx.lock() {
-                Ok(g) => (g.router.on_pairing_result, g.router.user_data),
-                Err(_) => (None, std::ptr::null_mut()),
-            };
-            if let Some(cb_fn) = cb {
-                let uuid_c = CString::new(tu.clone()).unwrap_or_default();
-                let ok_c = CString::new("ok").unwrap_or_default();
-                cb_fn(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
+            let data = format!("{}\n", accept_line);
+            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+            if stream.write_all(data.as_bytes()).is_err() || stream.flush().is_err() {
+                log::warn!("配对发起: 发送 ACCEPT 失败");
+            } else {
+                // 等待接收方 ACK 确认（10s 超时）
+                stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                let mut ack_reader = BufReader::new(&stream);
+                let mut ack_line = String::new();
+                match ack_reader.read_line(&mut ack_line) {
+                    Ok(n) if n > 0 => {
+                        if ack_line.trim().starts_with("ACK:") {
+                            log::info!("配对发起: 收到 ACK 确认: {}", ack_line.trim());
+                        } else {
+                            log::warn!("配对发起: 收到非 ACK 响应: {}", ack_line.trim());
+                        }
+                    }
+                    _ => {
+                        log::warn!("配对发起: 未收到 ACK 确认（接收方可能未收到 ACCEPT）");
+                    }
+                }
             }
+            fire_pairing_result(ctx, &tu, 1, "ok");
             return 0;
         }
     }
 
-    // 配对失败
+    // 配对失败：发送 REJECT + 等待 ACK + 回调
     log::warn!("配对发起: 配对码验证失败");
-    let (cb, ud) = match ctx.lock() {
-        Ok(mut g) => {
-            g.ephemeral_key = None;
-            g.ephemeral_pub_b64 = None;
-            g.pairing_ctx = None;
-            g.expected_pairing_code = None;
-            (g.router.on_pairing_result, g.router.user_data)
-        }
-        Err(_) => (None, std::ptr::null_mut()),
-    };
     let reject_msg = codec::encode_reject(&lu);
-    let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(tu).unwrap_or_default();
-        let err_c = CString::new("code_mismatch").unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
+    let data = format!("{}\n", reject_msg);
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    if stream.write_all(data.as_bytes()).is_ok() && stream.flush().is_ok() {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut ack_reader = BufReader::new(&stream);
+        let mut ack_line = String::new();
+        ack_reader.read_line(&mut ack_line).ok();
+    } else {
+        let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
     }
+    fire_pairing_result(ctx, &tu, 0, "code_mismatch");
     0
 }
 
@@ -514,5 +563,65 @@ pub extern "C" fn nrc_periodic_broadcast(
             0
         }
         _ => -1,
+    }
+}
+
+/// 生成 6 位配对码，存储到 Rust 上下文中，返回码字符串。
+/// ttl_secs: 配对码有效期（秒），0 表示使用默认 300 秒（5 分钟）
+#[no_mangle]
+pub extern "C" fn nrc_generate_pairing_code(ctx_ptr: *mut c_void, ttl_secs: u32) -> *mut c_char {
+    use rand::Rng;
+    let ttl = if ttl_secs == 0 { 300 } else { ttl_secs as u64 };
+    let code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Uniform::new(0u32, 10u32))
+        .take(6)
+        .map(|d| d.to_string())
+        .collect();
+    let result = super::common::to_cstr(&code);
+    if !ctx_ptr.is_null() {
+        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        if let Ok(mut guard) = ctx.lock() {
+            guard.pairing_code = Some(code);
+            guard.pairing_code_expiry = Some(std::time::Instant::now() + Duration::from_secs(ttl));
+        }
+    }
+    result
+}
+
+/// 清除已存储的配对码
+#[no_mangle]
+pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
+    if ctx_ptr.is_null() { return; }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    if let Ok(mut guard) = ctx.lock() {
+        guard.pairing_code = None;
+        guard.pairing_code_expiry = None;
+    }
+}
+
+/// 验证配对码：比对存储的配对码且检查是否过期
+/// 返回 0 表示验证通过，-1 表示不匹配，-2 表示已过期
+#[no_mangle]
+pub extern "C" fn nrc_validate_pairing_code(ctx_ptr: *mut c_void, code: *const c_char) -> i32 {
+    if ctx_ptr.is_null() || code.is_null() { return -1; }
+    let input = unsafe { from_cstr(code) };
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    match ctx.lock() {
+        Ok(guard) => {
+            let stored = match &guard.pairing_code {
+                Some(c) => c.clone(),
+                None => return -1,
+            };
+            if stored != input {
+                return -1;
+            }
+            if let Some(expiry) = guard.pairing_code_expiry {
+                if std::time::Instant::now() > expiry {
+                    return -2;
+                }
+            }
+            0
+        }
+        Err(_) => -1,
     }
 }
