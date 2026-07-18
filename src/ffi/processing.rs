@@ -69,7 +69,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             if let Some(f) = codec::decode_pairing_init(line_str) {
                 let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
                 guard.pairing_ctx = Some(crate::PairingContext {
-                    peer_uuid: f.uuid.clone(),
+                    peer_uuid: f.uuid.to_string(),
                     peer_tmp_pub: f.tmp_pub_key.to_string(),
                     peer_lt_pub: None,
                     decrypted_code: None,
@@ -108,7 +108,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         if let Ok(mut guard) = ctx.lock() {
                             guard.pairing_key = Some(aes_key);
                             guard.pairing_ctx = Some(crate::PairingContext {
-                                peer_uuid: f.uuid.clone(),
+                                peer_uuid: f.uuid.to_string(),
                                 peer_tmp_pub: peer_tmp.clone(),
                                 peer_lt_pub: Some(peer_lt.clone()),
                                 decrypted_code: decoded.clone(),
