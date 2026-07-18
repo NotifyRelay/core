@@ -1,5 +1,6 @@
 use std::ffi::CString;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,15 +136,30 @@ pub extern "C" fn nrc_send_pairing_init(
         return -1;
     }
 
-    // oneshot 发送 PAIRING_INIT 并接收 PAIRING_RESP
-    let resp = crate::network::oneshot_send_receive(&ctx_ref, &target_ip, port, 5000);
-    let resp = match resp {
-        Some(r) => r,
-        None => {
-            log::error!("配对发起: 未收到响应");
-            return -1;
-        }
+    // 手动 TCP 连接 + 发送 PAIRING_INIT + 长超时读取 PAIRING_RESP
+    let addr = format!("{}:{}", target_ip, port);
+    let sock_addr = match addr.parse::<std::net::SocketAddr>() {
+        Ok(a) => a,
+        Err(_) => { log::error!("配对发起: 地址解析失败 addr={}", addr); return -1; }
     };
+    let stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(e) => { log::error!("配对发起: 连接目标超时, err={}", e); return -1; }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    let mut writer = &stream;
+    if writer.write_all(format!("{}\n", ctx_ref).as_bytes()).is_err() {
+        log::error!("配对发起: 发送失败");
+        return -1;
+    }
+    let _ = writer.flush();
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        log::error!("配对发起: 读取响应失败或连接关闭");
+        return -1;
+    }
+    let resp = line.trim().to_string();
 
     // 处理 PAIRING_RESP（process_line 内部会解密配对码）
     super::processing::process_line(ctx, &resp);

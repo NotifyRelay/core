@@ -41,7 +41,13 @@ pub extern "C" fn nrc_export_device_key(
     let uuid = unsafe { from_cstr(device_uuid) };
     with_ctx(ctx_ptr, |ctx| {
         ctx.crypto.device_keys.get(uuid)
-            .map(|k| to_cstr(&k.aes_key_b64))
+            .map(|k| {
+                let json = serde_json::json!({
+                    "aes_key_b64": k.aes_key_b64,
+                    "remote_pub_key": k.remote_pub_key,
+                });
+                to_cstr(&json.to_string())
+            })
             .unwrap_or(std::ptr::null_mut())
     })
 }
