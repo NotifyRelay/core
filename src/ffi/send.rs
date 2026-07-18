@@ -89,38 +89,54 @@ pub extern "C" fn nrc_send_handshake(
 
 /// 发送 PAIRING_INIT（发起方），自动完成完整配对流程
 /// 内部：生成临时密钥 → 发送 → 接收 PAIRING_RESP → 验证配对码 → 发送 ACCEPT/REJECT
+/// Rust 内部自动从 device_ips 映射表解析目标 IP，调用方只需传入 UUID
 #[no_mangle]
 pub extern "C" fn nrc_send_pairing_init(
     ctx_ptr: *mut c_void,
-    uuid: *const c_char,
+    local_uuid: *const c_char,
+    target_uuid: *const c_char,
     expected_code: *const c_char,
-    ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) -> i32 {
-    let u = unsafe { from_cstr(uuid).to_string() };
+    let lu = unsafe { from_cstr(local_uuid).to_string() };
+    let tu = unsafe { from_cstr(target_uuid).to_string() };
     let code = unsafe { from_cstr(expected_code).to_string() };
-    let i = unsafe { from_cstr(ip).to_string() };
-    let d = unsafe { from_cstr(device_type).to_string() };
+    let dt = unsafe { from_cstr(device_type).to_string() };
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
 
+    // 获取本机 IP（用于编码到配对消息中）
+    let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
+
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let ctx_ref = match ctx.lock() {
+    let (ctx_ref, target_ip) = match ctx.lock() {
         Ok(mut guard) => {
             guard.expected_pairing_code = Some(code.clone());
-            // 生成临时密钥
             let (secret, b64) = ecdh::generate_keypair();
             guard.ephemeral_key = Some(secret);
             guard.ephemeral_pub_b64 = Some(b64.clone());
-            let msg = codec::encode_pairing_init(&u, &b64, &i, battery, &d);
+            let msg = codec::encode_pairing_init(&lu, &b64, &local_ip, battery, &dt);
+
+            // 从 device_ips 映射表解析目标 IP
+            let target = guard.device_ips.lock()
+                .ok()
+                .and_then(|ips| ips.get(&tu).cloned())
+                .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+                .unwrap_or_default();
+
             drop(guard);
-            msg
+            (msg, target)
         }
         Err(_) => return -1,
     };
 
+    if target_ip.is_empty() {
+        log::error!("配对发起: 无法获取目标设备IP, target_uuid={}", tu);
+        return -1;
+    }
+
     // oneshot 发送 PAIRING_INIT 并接收 PAIRING_RESP
-    let resp = crate::network::oneshot_send_receive(&ctx_ref, &i, port, 5000);
+    let resp = crate::network::oneshot_send_receive(&ctx_ref, &target_ip, port, 5000);
     let resp = match resp {
         Some(r) => r,
         None => {
@@ -145,7 +161,6 @@ pub extern "C" fn nrc_send_pairing_init(
     if let Some(ref decrypted_code) = decrypted {
         if decrypted_code == &code {
             log::info!("配对发起: 配对码验证成功，发送 ACCEPT");
-            // 获取 peer_lt_pub 用于派生长期密钥
             let (peer_lt_pub, local_pub_b64) = match ctx.lock() {
                 Ok(g) => (
                     g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
@@ -161,7 +176,7 @@ pub extern "C" fn nrc_send_pairing_init(
                         let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                         if let Ok(mut guard) = ctx.lock() {
                             guard.crypto.device_keys.insert(
-                                u.clone(),
+                                lu.clone(),
                                 crate::crypto::DeviceKeyEntry {
                                     remote_pub_key: lt_pub.clone(),
                                     aes_key_b64: b64,
@@ -171,7 +186,6 @@ pub extern "C" fn nrc_send_pairing_init(
                     }
                 }
             }
-            // 清理配对状态
             if let Ok(mut guard) = ctx.lock() {
                 guard.ephemeral_key = None;
                 guard.ephemeral_pub_b64 = None;
@@ -179,15 +193,14 @@ pub extern "C" fn nrc_send_pairing_init(
                 guard.expected_pairing_code = None;
             }
             // 通过 oneshot 发送 ACCEPT（不等待响应）
-            let accept_line = codec::encode_accept(&u, &local_pub_b64, &i, battery, &d);
-            crate::network::oneshot_send_only(&accept_line, &i, port, 5000);
-            // 配对成功回调
+            let accept_line = codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
+            crate::network::oneshot_send_only(&accept_line, &target_ip, port, 5000);
             let (cb, ud) = match ctx.lock() {
                 Ok(g) => (g.router.on_pairing_result, g.router.user_data),
                 Err(_) => (None, std::ptr::null_mut()),
             };
             if let Some(cb_fn) = cb {
-                let uuid_c = CString::new(u.clone()).unwrap_or_default();
+                let uuid_c = CString::new(lu.clone()).unwrap_or_default();
                 let ok_c = CString::new("ok").unwrap_or_default();
                 cb_fn(uuid_c.as_ptr(), 1, ok_c.as_ptr(), ud);
             }
@@ -207,11 +220,10 @@ pub extern "C" fn nrc_send_pairing_init(
         }
         Err(_) => (None, std::ptr::null_mut()),
     };
-    // 发送 REJECT
-    let reject_msg = codec::encode_reject(&u);
-    let _ = crate::network::oneshot_send_only(&reject_msg, &i, port, 5000);
+    let reject_msg = codec::encode_reject(&lu);
+    let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
     if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(u).unwrap_or_default();
+        let uuid_c = CString::new(lu).unwrap_or_default();
         let err_c = CString::new("code_mismatch").unwrap_or_default();
         cb_fn(uuid_c.as_ptr(), 0, err_c.as_ptr(), ud);
     }

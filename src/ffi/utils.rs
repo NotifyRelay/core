@@ -221,7 +221,7 @@ pub extern "C" fn nrc_get_local_ip() -> *mut c_char {
     to_cstr(&ip)
 }
 
-fn get_local_ip_impl() -> Option<String> {
+pub(crate) fn get_local_ip_impl() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     // 连接 Google DNS 以确定本地接口，不实际发送数据
     socket.connect("8.8.8.8:53").ok()?;
