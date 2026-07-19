@@ -260,32 +260,6 @@ pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
     }
 }
 
-/// 发送消息到指定设备
-#[no_mangle]
-pub extern "C" fn nrc_send_to_device(ctx_ptr: *mut c_void, uuid: *const c_char, message: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || uuid.is_null() || message.is_null() {
-        return -1;
-    }
-
-    let uuid_str = unsafe { from_cstr(uuid) };
-    let message_str = unsafe { from_cstr(message) };
-
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    let guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
-
-    let network_state = guard.network.tcp.clone();
-    drop(guard);
-
-    if crate::network::send_to_device(network_state, &uuid_str, &message_str) {
-        0
-    } else {
-        -1
-    }
-}
-
 /// 广播消息到所有连接的设备
 #[no_mangle]
 pub extern "C" fn nrc_broadcast_message(ctx_ptr: *mut c_void, message: *const c_char) -> i32 {

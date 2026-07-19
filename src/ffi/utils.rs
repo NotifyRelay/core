@@ -80,46 +80,42 @@ pub extern "C" fn nrc_compute_feature_id_simple(
     to_cstr(&feature)
 }
 
-/// 检查去重并标记 pending。返回 1 = 应发送，0 = 重复
+/// 统一去重接口
+/// action: 0=check_and_pend, 1=mark_sent, 2=clear_pending, 3=cleanup
+/// action=0 时返回 1=应发送, 0=重复
+/// action=1/2/3 时返回 0=成功, -1=失败
 #[no_mangle]
-pub extern "C" fn nrc_dedup_check_and_pend(
+pub extern "C" fn nrc_dedup(
     ctx_ptr: *mut c_void,
+    action: i32,
     dedup_key: *const c_char,
-    ttl_ms: i64,
+    arg1_ms: i64,
+    arg2_ms: i64,
 ) -> i32 {
-    let key = unsafe { from_cstr(dedup_key) };
-    if key.is_empty() { return 0; }
+    if ctx_ptr.is_null() { return -1; }
+    let key = if !dedup_key.is_null() { unsafe { from_cstr(dedup_key) } } else { "" };
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return 0 };
-    if guard.dedup.check_and_pend(key, ttl_ms) { 1 } else { 0 }
-}
+    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
 
-/// 标记发送成功（从 pending 移至 sent）
-#[no_mangle]
-pub extern "C" fn nrc_dedup_mark_sent(ctx_ptr: *mut c_void, dedup_key: *const c_char) {
-    let key = unsafe { from_cstr(dedup_key) };
-    if key.is_empty() { return; }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
-    guard.dedup.mark_sent(key);
-}
-
-/// 清除 pending（发送失败时）
-#[no_mangle]
-pub extern "C" fn nrc_dedup_clear_pending(ctx_ptr: *mut c_void, dedup_key: *const c_char) {
-    let key = unsafe { from_cstr(dedup_key) };
-    if key.is_empty() { return; }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
-    guard.dedup.clear_pending(key);
-}
-
-/// 清理过期的已发送记录
-#[no_mangle]
-pub extern "C" fn nrc_dedup_cleanup(ctx_ptr: *mut c_void, now_ms: i64, ttl_ms: i64) {
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return };
-    guard.dedup.cleanup(now_ms, ttl_ms);
+    match action {
+        0 => {
+            if key.is_empty() { return 0; }
+            if guard.dedup.check_and_pend(key, arg1_ms) { 1 } else { 0 }
+        }
+        1 => {
+            if !key.is_empty() { guard.dedup.mark_sent(key); }
+            0
+        }
+        2 => {
+            if !key.is_empty() { guard.dedup.clear_pending(key); }
+            0
+        }
+        3 => {
+            guard.dedup.cleanup(arg1_ms, arg2_ms);
+            0
+        }
+        _ => -1,
+    }
 }
 
 use base64::Engine;

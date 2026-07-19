@@ -96,14 +96,17 @@ fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, e
             g.spake2_verifier = None;
             g.pairing_ctx = None;
             g.expected_pairing_code = None;
-            (g.router.on_pairing_result, g.router.user_data)
+            (g.router.on_pairing, g.router.user_data)
         }
         Err(_) => return,
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(target_uuid).unwrap_or_default();
-        let err_c = CString::new(error_msg).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), success, err_c.as_ptr(), ud);
+        let type_c = CString::new("RESULT").unwrap_or_default();
+        let json_str = serde_json::json!({"uuid": target_uuid, "success": success != 0, "error": error_msg}).to_string();
+        let data_c = CString::new(json_str).unwrap_or_default();
+        let extra_c = CString::new(error_msg).unwrap_or_default();
+        cb_fn(uuid_c.as_ptr(), type_c.as_ptr(), data_c.as_ptr(), success, extra_c.as_ptr(), ud);
     }
 }
 
@@ -358,23 +361,6 @@ pub extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_char) {
     let u = unsafe { from_cstr(uuid).to_string() };
     with_ctx(ctx_ptr, |ctx| {
         do_send(ctx, &u, &codec::encode_reject(&u));
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_send_heartbeat_tcp(
-    ctx_ptr: *mut c_void,
-    uuid: *const c_char,
-    name: *const c_char,
-    port: u16,
-    battery: i32,
-    device_type: *const c_char,
-) {
-    let u = unsafe { from_cstr(uuid).to_string() };
-    let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
-    let d = unsafe { from_cstr(device_type).to_string() };
-    with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &u, &codec::encode_heartbeat_tcp(&u, &n_b64, port, battery, &d));
     });
 }
 
