@@ -18,15 +18,12 @@ impl log::Log for PlatformLogBridge {
         true
     }
     fn log(&self, record: &log::Record) {
-        if record.metadata().target().starts_with("mdns_sd") {
-            return;
-        }
         let val = LOG_CB.load(Ordering::Relaxed);
         if val == 0 {
             return;
         }
         let cb: LogCb = unsafe { std::mem::transmute(val) };
-        if let Ok(c_msg) = CString::new(format!("{}", record.args())) {
+        if let Ok(c_msg) = CString::new(format!("[{}] {}", record.metadata().target(), record.args())) {
             cb(record.level() as i32, c_msg.as_ptr());
         }
     }
