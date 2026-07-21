@@ -137,7 +137,6 @@ pub unsafe extern "C" fn nrc_audio_write_frame(
     pcm_len: i32,
 ) -> i32 {
     if pcm_len <= 0 || pcm_data.is_null() {
-        log::warn!("音频流: nrc_audio_write_frame 参数无效 pcm_len={}", pcm_len);
         return -1;
     }
     let pcm = std::slice::from_raw_parts(pcm_data, pcm_len as usize);
@@ -145,7 +144,6 @@ pub unsafe extern "C" fn nrc_audio_write_frame(
         if audio_stream::write_frame(&ctx.audio, pcm) {
             0
         } else {
-            log::warn!("音频流: 写入 PCM 帧失败，长度={}", pcm_len);
             -1
         }
     })
