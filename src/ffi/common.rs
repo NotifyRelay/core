@@ -14,10 +14,16 @@ static LOG_INIT: Once = Once::new();
 struct PlatformLogBridge;
 
 impl log::Log for PlatformLogBridge {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if metadata.target().starts_with("mdns_sd") {
+            return false;
+        }
         true
     }
     fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let val = LOG_CB.load(Ordering::Relaxed);
         if val == 0 {
             return;

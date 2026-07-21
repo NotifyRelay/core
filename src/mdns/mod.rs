@@ -36,7 +36,6 @@ impl MdnsState {
         device_type: &str,
     ) -> Result<(), String> {
         if self.daemon.is_some() {
-            log::warn!("mDNS 广告已在运行，跳过");
             return Ok(());
         }
 
@@ -64,12 +63,6 @@ impl MdnsState {
             .register(service_info)
             .map_err(|e| format!("注册 mDNS 服务失败: {}", e))?;
 
-        log::info!(
-            "mDNS 广告已启动: uuid={}, name={}, type={}",
-            uuid,
-            name,
-            device_type
-        );
         self.daemon = Some(daemon);
         Ok(())
     }
@@ -77,7 +70,6 @@ impl MdnsState {
     pub fn stop_advertiser(&mut self) {
         if let Some(daemon) = self.daemon.take() {
             drop(daemon);
-            log::info!("mDNS 广告已停止");
         }
     }
 
@@ -88,7 +80,6 @@ impl MdnsState {
         user_data: *mut std::os::raw::c_void,
     ) -> Result<(), String> {
         if self.browse_handle.is_some() {
-            log::warn!("mDNS 浏览已在运行，跳过");
             return Ok(());
         }
 
@@ -160,9 +151,7 @@ impl MdnsState {
                                     );
                                 }
                             }
-                            ServiceEvent::ServiceRemoved(_, full_name) => {
-                                log::debug!("mDNS 服务已移除: {}", full_name);
-                            }
+                            ServiceEvent::ServiceRemoved(_, _) => {}
                             _ => {}
                         },
                         Err(_) => {
@@ -174,13 +163,11 @@ impl MdnsState {
                 // 浏览器退出时，丢弃 receiver 以通知守护进程停止浏览
                 drop(receiver);
                 drop(daemon);
-                log::debug!("mDNS 浏览线程已退出");
             })
             .map_err(|e| format!("启动 mDNS 浏览线程失败: {}", e))?;
 
         self.browse_handle = Some(handle);
         self.browse_running = Some(running);
-        log::info!("mDNS 浏览已启动");
         Ok(())
     }
 
@@ -191,6 +178,5 @@ impl MdnsState {
         if let Some(handle) = self.browse_handle.take() {
             let _ = handle.join();
         }
-        log::info!("mDNS 浏览已停止");
     }
 }
