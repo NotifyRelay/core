@@ -1,7 +1,7 @@
-pub mod ecdh;
-pub mod spake2;
 pub mod aes;
+pub mod ecdh;
 pub mod hkdf;
+pub mod spake2;
 
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};

@@ -30,19 +30,26 @@ pub extern "C" fn nrc_ecdh_get_public_key(ctx_ptr: *mut c_void) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn nrc_ecdh_has_keypair(ctx_ptr: *mut c_void) -> i32 {
-    with_ctx(ctx_ptr, |ctx| {
-        if ctx.crypto.local_key.is_some() { 1 } else { 0 }
-    })
+    with_ctx(
+        ctx_ptr,
+        |ctx| {
+            if ctx.crypto.local_key.is_some() {
+                1
+            } else {
+                0
+            }
+        },
+    )
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_ecdh_derive_shared_secret(
+pub unsafe extern "C" fn nrc_ecdh_derive_shared_secret(
     ctx_ptr: *mut c_void,
     peer_uuid: *const c_char,
     peer_pub_key_b64: *const c_char,
 ) -> i32 {
-    let uuid = unsafe { from_cstr(peer_uuid).to_string() };
-    let peer = unsafe { from_cstr(peer_pub_key_b64).to_string() };
+    let uuid = from_cstr(peer_uuid).to_string();
+    let peer = from_cstr(peer_pub_key_b64).to_string();
     with_ctx(ctx_ptr, |ctx| {
         if let Some(ref priv_key) = ctx.crypto.local_key {
             match ecdh::compute_shared_secret(priv_key, &peer) {

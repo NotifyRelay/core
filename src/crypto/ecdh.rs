@@ -1,11 +1,6 @@
-use p256::{
-    SecretKey,
-    PublicKey,
-    ecdh::diffie_hellman,
-    EncodedPoint,
-};
-use rand::rngs::OsRng;
 use base64::Engine;
+use p256::{ecdh::diffie_hellman, EncodedPoint, PublicKey, SecretKey};
+use rand::rngs::OsRng;
 
 pub fn generate_keypair() -> (SecretKey, String) {
     let secret = SecretKey::random(&mut OsRng);
@@ -25,10 +20,7 @@ pub fn secret_to_pem(key: &SecretKey) -> Result<String, String> {
         .map(|z| z.to_string())
 }
 
-pub fn compute_shared_secret(
-    private: &SecretKey,
-    peer_pub_b64: &str,
-) -> Result<Vec<u8>, String> {
+pub fn compute_shared_secret(private: &SecretKey, peer_pub_b64: &str) -> Result<Vec<u8>, String> {
     let peer_bytes = base64::engine::general_purpose::STANDARD
         .decode(peer_pub_b64)
         .map_err(|e| format!("base64 decode: {}", e))?;

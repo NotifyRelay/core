@@ -1,21 +1,25 @@
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 
-pub type OnPairingCb = Option<extern "C" fn(
-    *const c_char,      // device_uuid
-    *const c_char,      // message_type: "HANDSHAKE", "PAIRING_INIT", "PAIRING_RESP", "ACCEPT", "REJECT", "HEARTBEAT_TCP", "RESULT"
-    *const c_char,      // data (JSON格式，包含所有字段)
-    i32,                // int_value (battery, success等)
-    *const c_char,      // extra (pub_key, ip等)
-    *mut c_void,        // user_data
-)>;
+pub type OnPairingCb = Option<
+    extern "C" fn(
+        *const c_char, // device_uuid
+        *const c_char, // message_type: "HANDSHAKE", "PAIRING_INIT", "PAIRING_RESP", "ACCEPT", "REJECT", "HEARTBEAT_TCP", "RESULT"
+        *const c_char, // data (JSON格式，包含所有字段)
+        i32,           // int_value (battery, success等)
+        *const c_char, // extra (pub_key, ip等)
+        *mut c_void,   // user_data
+    ),
+>;
 
-pub type OnDataCb = Option<extern "C" fn(
-    *const c_char,      // device_uuid
-    *const c_char,      // message_type: "NOTIFICATION", "MEDIAPLAY", "ICON_REQUEST", ...
-    *const c_char,      // plaintext
-    *mut c_void,        // user_data
-)>;
+pub type OnDataCb = Option<
+    extern "C" fn(
+        *const c_char, // device_uuid
+        *const c_char, // message_type: "NOTIFICATION", "MEDIAPLAY", "ICON_REQUEST", ...
+        *const c_char, // plaintext
+        *mut c_void,   // user_data
+    ),
+>;
 
 pub type OnHeartbeatUdpCb = Option<
     extern "C" fn(
@@ -30,14 +34,7 @@ pub type OnHeartbeatUdpCb = Option<
 >;
 
 pub type OnMdnsDiscoveredCb = Option<
-    extern "C" fn(
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        u16,
-        *const c_char,
-        *mut c_void,
-    ),
+    extern "C" fn(*const c_char, *const c_char, *const c_char, u16, *const c_char, *mut c_void),
 >;
 
 pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;

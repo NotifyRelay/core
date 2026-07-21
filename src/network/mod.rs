@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::protocol::codec;
 use crate::heartbeat;
+use crate::protocol::codec;
 
 /// 回调类型
 type ConnectedCallback = Arc<dyn Fn(String, String) + Send + Sync>;
@@ -120,7 +120,9 @@ pub fn start_tcp_server(
 ) -> Result<(), String> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("绑定端口失败: {}", e))?;
-    listener.set_nonblocking(true).map_err(|e| format!("设置非阻塞失败: {}", e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞失败: {}", e))?;
 
     {
         let mut state = state.lock().map_err(|e| format!("加锁失败: {}", e))?;
@@ -136,7 +138,13 @@ pub fn start_tcp_server(
     let on_err = on_error;
 
     thread::spawn(move || {
-        accept_loop(state_clone, on_connected, on_disconnected, on_message, on_err);
+        accept_loop(
+            state_clone,
+            on_connected,
+            on_disconnected,
+            on_message,
+            on_err,
+        );
     });
 
     log::info!("TCP 服务器已启动，监听端口 {}", port);
@@ -254,12 +262,15 @@ fn handle_connection(
 
             {
                 let mut state = state.lock().unwrap();
-                state.sessions.insert(uuid.clone(), TcpSession {
-                    stream: stream.try_clone().expect("克隆流失败"),
-                    uuid: uuid.clone(),
-                    ip: ip.clone(),
-                    buffer: String::new(),
-                });
+                state.sessions.insert(
+                    uuid.clone(),
+                    TcpSession {
+                        stream: stream.try_clone().expect("克隆流失败"),
+                        uuid: uuid.clone(),
+                        ip: ip.clone(),
+                        buffer: String::new(),
+                    },
+                );
             }
 
             if let Some(ref cb) = on_connected {
@@ -287,8 +298,12 @@ fn handle_connection(
                 let line = buffer.trim().to_string();
                 if !line.is_empty() {
                     if let Some(data) = codec::decode_data_message(&line) {
-                        log::info!("收到 TCP DATA: local_uuid={}, payload_len={}, from={}", 
-                            data.local_uuid, data.encrypted_payload.len(), addr);
+                        log::info!(
+                            "收到 TCP DATA: local_uuid={}, payload_len={}, from={}",
+                            data.local_uuid,
+                            data.encrypted_payload.len(),
+                            addr
+                        );
                     }
                     if let Some(ref cb) = on_message {
                         cb(uuid.clone(), line);
@@ -363,14 +378,15 @@ const UDP_BROADCAST_PORT: u16 = 23334;
 
 /// 发送 UDP 广播消息（支持多子网）
 pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| format!("绑定 UDP 失败: {}", e))?;
-    socket.set_broadcast(true)
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("绑定 UDP 失败: {}", e))?;
+    socket
+        .set_broadcast(true)
         .map_err(|e| format!("设置广播失败: {}", e))?;
 
     let data = message.as_bytes();
 
-    socket.send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
+    socket
+        .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
         .map_err(|e| format!("有限广播失败: {}", e))?;
 
     #[cfg(target_os = "android")]
@@ -405,7 +421,8 @@ fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
                     if !ip.is_loopback() && !ip.is_unspecified() {
                         let ip_bytes = ip.octets();
                         let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
-                        let broadcast_addr = SocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
+                        let broadcast_addr =
+                            SocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
 
                         if let Err(e) = socket.send_to(data, broadcast_addr) {
                             log::warn!("向子网 {} 广播失败: {}", broadcast, e);
@@ -441,9 +458,10 @@ pub fn start_udp_listener(
     on_error: Option<ErrorCallback>,
 ) -> Result<Arc<Mutex<bool>>, String> {
     let addr = format!("0.0.0.0:{}", port);
-    let socket = UdpSocket::bind(&addr)
-        .map_err(|e| format!("绑定 UDP 监听端口 {} 失败: {}", port, e))?;
-    socket.set_read_timeout(Some(Duration::from_secs(1)))
+    let socket =
+        UdpSocket::bind(&addr).map_err(|e| format!("绑定 UDP 监听端口 {} 失败: {}", port, e))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|e| format!("设置 UDP 超时失败: {}", e))?;
 
     let running = Arc::new(Mutex::new(true));
@@ -496,17 +514,17 @@ pub fn start_udp_listener(
 }
 
 /// Oneshot TCP 发送并接收响应，内部通过 process_line 处理响应
-pub fn oneshot_send_receive(
-    payload: &str,
-    ip: &str,
-    port: u16,
-    timeout_ms: u32,
-) -> Option<String> {
+pub fn oneshot_send_receive(payload: &str, ip: &str, port: u16, timeout_ms: u32) -> Option<String> {
     let addr = format!("{}:{}", ip, port);
     let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
-    let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms as u64))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(timeout_ms as u64))).ok()?;
+    let stream =
+        TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
+        .ok()?;
     let mut writer = &stream;
     writer.write_all(format!("{}\n", payload).as_bytes()).ok()?;
     writer.flush().ok()?;
@@ -514,7 +532,11 @@ pub fn oneshot_send_receive(
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     let trimmed = line.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Oneshot TCP 发送（不等待响应）
@@ -527,14 +549,17 @@ pub fn oneshot_send_only(payload: &str, ip: &str, port: u16, timeout_ms: u32) ->
             return false;
         }
     };
-    let stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("oneshot_send_only: 连接失败 addr={}, err={}", addr, e);
-            return false;
-        }
-    };
-    stream.set_write_timeout(Some(Duration::from_millis(timeout_ms as u64))).ok();
+    let stream =
+        match TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("oneshot_send_only: 连接失败 addr={}, err={}", addr, e);
+                return false;
+            }
+        };
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
+        .ok();
     let data = format!("{}\n", payload);
     let mut writer = &stream;
     if writer.write_all(data.as_bytes()).is_err() || writer.flush().is_err() {
@@ -553,14 +578,7 @@ mod tests {
         let state = Arc::new(Mutex::new(TcpServerState::new()));
         let port = 12345;
 
-        let result = start_tcp_server(
-            state.clone(),
-            port,
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = start_tcp_server(state.clone(), port, None, None, None, None);
         assert!(result.is_ok());
 
         {

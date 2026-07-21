@@ -15,7 +15,10 @@ pub extern "C" fn nrc_compute_dedup_key(
     let d = unsafe { from_cstr(data) };
     let input = format!("{}|{}", uuid, d);
     let hash = sha2::Sha256::digest(input.as_bytes());
-    let hex = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let hex = hash
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
     to_cstr(&hex)
 }
 
@@ -38,25 +41,45 @@ pub extern "C" fn nrc_compute_feature_id(
         if let Ok(root) = serde_json::from_str::<serde_json::Value>(param) {
             if let Some(chat_info) = root.get("chatInfo").and_then(|v| v.as_object()) {
                 if let Some(title_val) = chat_info.get("title").and_then(|v| v.as_str()) {
-                    if !title_val.is_empty() { key_parts.push(format!("chat:{}", title_val)); }
+                    if !title_val.is_empty() {
+                        key_parts.push(format!("chat:{}", title_val));
+                    }
                 }
             } else if let Some(base_info) = root.get("baseInfo").and_then(|v| v.as_object()) {
-                let bt = base_info.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let bc = base_info.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if !bt.is_empty() { key_parts.push(format!("baseT:{}", bt)); }
-                if !bc.is_empty() { key_parts.push(format!("baseC:{}", bc)); }
+                let bt = base_info
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let bc = base_info
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !bt.is_empty() {
+                    key_parts.push(format!("baseT:{}", bt));
+                }
+                if !bc.is_empty() {
+                    key_parts.push(format!("baseC:{}", bc));
+                }
             } else if let Some(highlight) = root.get("highlightInfo").and_then(|v| v.as_object()) {
                 if let Some(ht) = highlight.get("title").and_then(|v| v.as_str()) {
-                    if !ht.is_empty() { key_parts.push(format!("hi:{}", ht)); }
+                    if !ht.is_empty() {
+                        key_parts.push(format!("hi:{}", ht));
+                    }
                 }
             }
         }
     }
     if key_parts.len() <= 1 {
-        if !t.is_empty() { key_parts.push(format!("t:{}", t)); }
-        if !tx.is_empty() { key_parts.push(format!("c:{}", tx)); }
+        if !t.is_empty() {
+            key_parts.push(format!("t:{}", t));
+        }
+        if !tx.is_empty() {
+            key_parts.push(format!("c:{}", tx));
+        }
     }
-    if !iid.is_empty() { key_parts.push(format!("id:{}", iid)); }
+    if !iid.is_empty() {
+        key_parts.push(format!("id:{}", iid));
+    }
     let raw = key_parts.join("|");
     let hash = sha1::Sha1::digest(raw.as_bytes());
     let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
@@ -73,9 +96,15 @@ pub extern "C" fn nrc_compute_feature_id_simple(
     let t = unsafe { from_cstr(title) };
     let tx = unsafe { from_cstr(text) };
     let mut parts: Vec<&str> = Vec::new();
-    if !pkg.is_empty() { parts.push(pkg); }
-    if !t.is_empty() { parts.push(t); }
-    if !tx.is_empty() { parts.push(tx); }
+    if !pkg.is_empty() {
+        parts.push(pkg);
+    }
+    if !t.is_empty() {
+        parts.push(t);
+    }
+    if !tx.is_empty() {
+        parts.push(tx);
+    }
     let feature = parts.join("|");
     to_cstr(&feature)
 }
@@ -92,22 +121,41 @@ pub extern "C" fn nrc_dedup(
     arg1_ms: i64,
     arg2_ms: i64,
 ) -> i32 {
-    if ctx_ptr.is_null() { return -1; }
-    let key = if !dedup_key.is_null() { unsafe { from_cstr(dedup_key) } } else { "" };
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+    let key = if !dedup_key.is_null() {
+        unsafe { from_cstr(dedup_key) }
+    } else {
+        ""
+    };
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+    let mut guard = match ctx.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
 
     match action {
         0 => {
-            if key.is_empty() { return 0; }
-            if guard.dedup.check_and_pend(key, arg1_ms) { 1 } else { 0 }
+            if key.is_empty() {
+                return 0;
+            }
+            if guard.dedup.check_and_pend(key, arg1_ms) {
+                1
+            } else {
+                0
+            }
         }
         1 => {
-            if !key.is_empty() { guard.dedup.mark_sent(key); }
+            if !key.is_empty() {
+                guard.dedup.mark_sent(key);
+            }
             0
         }
         2 => {
-            if !key.is_empty() { guard.dedup.clear_pending(key); }
+            if !key.is_empty() {
+                guard.dedup.clear_pending(key);
+            }
             0
         }
         3 => {
@@ -121,28 +169,54 @@ pub extern "C" fn nrc_dedup(
 use base64::Engine;
 
 fn text_similarity_impl(a: &str, b: &str) -> f64 {
-    if a.is_empty() && b.is_empty() { return 1.0; }
-    if a.is_empty() || b.is_empty() { return 0.0; }
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
     let a_lower = a.trim().to_lowercase();
     let b_lower = b.trim().to_lowercase();
-    if a_lower == b_lower { return 1.0; }
-    if a_lower.contains(&b_lower) || b_lower.contains(&a_lower) { return 0.9; }
+    if a_lower == b_lower {
+        return 1.0;
+    }
+    if a_lower.contains(&b_lower) || b_lower.contains(&a_lower) {
+        return 0.9;
+    }
     let set_a: std::collections::HashSet<char> = a_lower.chars().collect();
     let set_b: std::collections::HashSet<char> = b_lower.chars().collect();
-    if set_a.is_empty() && set_b.is_empty() { return 1.0; }
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0;
+    }
     let intersection = set_a.intersection(&set_b).count();
     let union = set_a.union(&set_b).count();
-    let jaccard = if union > 0 { intersection as f64 / union as f64 } else { 0.0 };
-    let len_ratio = a_lower.len().min(b_lower.len()) as f64 / a_lower.len().max(b_lower.len()) as f64;
+    let jaccard = if union > 0 {
+        intersection as f64 / union as f64
+    } else {
+        0.0
+    };
+    let len_ratio =
+        a_lower.len().min(b_lower.len()) as f64 / a_lower.len().max(b_lower.len()) as f64;
     jaccard * 0.7 + len_ratio * 0.3
 }
 
-fn combined_similarity_impl(new_title: &str, new_text: &str, old_title: &str, old_text: &str) -> f64 {
+fn combined_similarity_impl(
+    new_title: &str,
+    new_text: &str,
+    old_title: &str,
+    old_text: &str,
+) -> f64 {
     let title_empty = new_title.is_empty() && old_title.is_empty();
     let text_empty = new_text.is_empty() && old_text.is_empty();
-    if title_empty && text_empty { return 1.0; }
-    if title_empty { return text_similarity_impl(new_text, old_text); }
-    if text_empty { return text_similarity_impl(new_title, old_title); }
+    if title_empty && text_empty {
+        return 1.0;
+    }
+    if title_empty {
+        return text_similarity_impl(new_text, old_text);
+    }
+    if text_empty {
+        return text_similarity_impl(new_title, old_title);
+    }
     let title_sim = text_similarity_impl(new_title, old_title);
     let text_sim = text_similarity_impl(new_text, old_text);
     (title_sim + text_sim) / 2.0
@@ -157,31 +231,51 @@ pub extern "C" fn nrc_text_similarity(a: *const c_char, b: *const c_char) -> f64
 
 #[no_mangle]
 pub extern "C" fn nrc_should_deduplicate(
-    new_title: *const c_char, new_text: *const c_char,
-    old_title: *const c_char, old_text: *const c_char,
+    new_title: *const c_char,
+    new_text: *const c_char,
+    old_title: *const c_char,
+    old_text: *const c_char,
 ) -> i32 {
     let nt = unsafe { from_cstr(new_title) };
     let ntx = unsafe { from_cstr(new_text) };
     let ot = unsafe { from_cstr(old_title) };
     let otx = unsafe { from_cstr(old_text) };
     let sim = combined_similarity_impl(nt, ntx, ot, otx);
-    if sim >= 0.8 { 1 } else { 0 }
+    if sim >= 0.8 {
+        1
+    } else {
+        0
+    }
 }
 
 fn derive_ftp_credentials_impl(shared_secret_b64: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let secret_bytes = match base64::engine::general_purpose::STANDARD.decode(shared_secret_b64) {
         Ok(b) => b,
         Err(_) => return r#"{"username":"","password":""}"#.to_string(),
     };
     let derived = Sha256::digest(&secret_bytes);
     let username_bytes = &derived[..8];
-    let username = base64::engine::general_purpose::STANDARD.encode(username_bytes).replace('+', "-").replace('/', "_").replace('=', "");
-    let username: String = username.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let username = base64::engine::general_purpose::STANDARD
+        .encode(username_bytes)
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "");
+    let username: String = username
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     let username = format!("ftp_{}", &username[..username.len().min(16)]);
     let password_bytes = &derived[..32];
-    let password = base64::engine::general_purpose::STANDARD.encode(password_bytes).replace('+', "-").replace('/', "_").replace('=', "");
-    let password: String = password.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let password = base64::engine::general_purpose::STANDARD
+        .encode(password_bytes)
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "");
+    let password: String = password
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     serde_json::json!({"username": username, "password": password}).to_string()
 }
 
@@ -205,7 +299,12 @@ pub extern "C" fn nrc_generate_random_password() -> *mut c_char {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
     let mut rng = rand::thread_rng();
-    let password: String = (0..12).map(|_| { let idx = rng.gen_range(0..CHARS.len()); CHARS[idx] as char }).collect();
+    let password: String = (0..12)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARS.len());
+            CHARS[idx] as char
+        })
+        .collect();
     to_cstr(&password)
 }
 

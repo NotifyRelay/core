@@ -8,7 +8,10 @@ pub struct DedupState {
 
 impl DedupState {
     pub fn new() -> Self {
-        Self { pending: HashSet::new(), sent: HashMap::new() }
+        Self {
+            pending: HashSet::new(),
+            sent: HashMap::new(),
+        }
     }
 
     /// 检查是否应发送（不在已发送 TTL 内），并标记 pending

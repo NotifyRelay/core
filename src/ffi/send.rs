@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use base64::Engine;
 
-use crate::{crypto::aes, protocol::codec, crypto::hkdf, crypto::spake2, BroadcastHandle, BroadcastInfo, CoreContext, SafeContext};
+use crate::{
+    crypto::aes, crypto::hkdf, crypto::spake2, protocol::codec, BroadcastHandle, BroadcastInfo,
+    CoreContext, SafeContext,
+};
 
 use super::common::{encode_name_b64, from_cstr, with_ctx};
 
@@ -103,10 +106,19 @@ fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, e
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(target_uuid).unwrap_or_default();
         let type_c = CString::new("RESULT").unwrap_or_default();
-        let json_str = serde_json::json!({"uuid": target_uuid, "success": success != 0, "error": error_msg}).to_string();
+        let json_str =
+            serde_json::json!({"uuid": target_uuid, "success": success != 0, "error": error_msg})
+                .to_string();
         let data_c = CString::new(json_str).unwrap_or_default();
         let extra_c = CString::new(error_msg).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), type_c.as_ptr(), data_c.as_ptr(), success, extra_c.as_ptr(), ud);
+        cb_fn(
+            uuid_c.as_ptr(),
+            type_c.as_ptr(),
+            data_c.as_ptr(),
+            success,
+            extra_c.as_ptr(),
+            ud,
+        );
     }
 }
 
@@ -138,7 +150,9 @@ pub extern "C" fn nrc_send_pairing_init(
             guard.spake2_prover = Some(session);
             let msg = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
 
-            let target = guard.device_ips.lock()
+            let target = guard
+                .device_ips
+                .lock()
                 .ok()
                 .and_then(|ips| ips.get(&tu).cloned())
                 .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
@@ -177,7 +191,10 @@ pub extern "C" fn nrc_send_pairing_init(
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
     {
         let mut writer = &stream;
-        if writer.write_all(format!("{}\n", ctx_ref).as_bytes()).is_err() {
+        if writer
+            .write_all(format!("{}\n", ctx_ref).as_bytes())
+            .is_err()
+        {
             log::error!("配对发起: 发送 PAIRING_INIT 失败");
             fire_pairing_result(ctx, &tu, 0, "send_pairing_init_failed");
             return -1;
@@ -210,7 +227,9 @@ pub extern "C" fn nrc_send_pairing_init(
         Err(_) => (None, None, None),
     };
 
-    if let (Some(session), Some(lt_pub), Some(spake2_pub)) = (prover_session, peer_lt_pub, peer_spake2_pub) {
+    if let (Some(session), Some(lt_pub), Some(spake2_pub)) =
+        (prover_session, peer_lt_pub, peer_spake2_pub)
+    {
         match spake2::prover_complete(session, &spake2_pub) {
             Ok(shared_secret) => {
                 log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
@@ -233,7 +252,8 @@ pub extern "C" fn nrc_send_pairing_init(
                     Ok(g) => g.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                     Err(_) => String::new(),
                 };
-                let accept_line = codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
+                let accept_line =
+                    codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
                 let data = format!("{}\n", accept_line);
                 stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
                 if stream.write_all(data.as_bytes()).is_err() || stream.flush().is_err() {
@@ -376,7 +396,8 @@ pub extern "C" fn nrc_send_heartbeat_udp(
     let u = unsafe { from_cstr(uuid).to_string() };
     let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let d = unsafe { from_cstr(device_type).to_string() };
-    crate::network::send_udp_broadcast(&codec::encode_udp_broadcast(&u, &n_b64, port, battery, &d)).ok();
+    crate::network::send_udp_broadcast(&codec::encode_udp_broadcast(&u, &n_b64, port, battery, &d))
+        .ok();
 }
 
 #[no_mangle]
@@ -391,7 +412,8 @@ pub extern "C" fn nrc_send_discovery(
     let u = unsafe { from_cstr(uuid).to_string() };
     let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
     let d = unsafe { from_cstr(device_type).to_string() };
-    crate::network::send_udp_broadcast(&codec::encode_udp_broadcast(&u, &n_b64, port, battery, &d)).ok();
+    crate::network::send_udp_broadcast(&codec::encode_udp_broadcast(&u, &n_b64, port, battery, &d))
+        .ok();
 }
 
 #[no_mangle]
@@ -410,12 +432,15 @@ pub extern "C" fn nrc_send_data_message(
     let text = unsafe { from_cstr(plaintext).to_string() };
     with_ctx(ctx_ptr, |ctx| {
         let key_b64 = match ctx.crypto.device_keys.get(&remote) {
-            Some(k) => k.aes_key_b64.clone(), None => return,
+            Some(k) => k.aes_key_b64.clone(),
+            None => return,
         };
         let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
-            Ok(b) if b.len() == 32 => b, _ => return,
+            Ok(b) if b.len() == 32 => b,
+            _ => return,
         };
-        let mut key_arr = [0u8; 32]; key_arr.copy_from_slice(&key_bytes);
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key_bytes);
         if let Ok(encrypted) = aes::encrypt(&key_arr, text.as_bytes()) {
             let msg = codec::encode_data_message(&hdr, &uuid, &pub_key, &encrypted);
             do_send(ctx, &uuid, &msg);
@@ -434,12 +459,17 @@ pub extern "C" fn nrc_periodic_broadcast(
     battery: i32,
     device_type: *const c_char,
 ) -> i32 {
-    if ctx_ptr.is_null() { return -1; }
+    if ctx_ptr.is_null() {
+        return -1;
+    }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
 
     match action {
         0 => {
-            let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
             if let Some(handle) = guard.broadcast_handle.take() {
                 handle.running.store(false, Ordering::Relaxed);
             }
@@ -454,7 +484,10 @@ pub extern "C" fn nrc_periodic_broadcast(
             let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
             let d = unsafe { from_cstr(device_type).to_string() };
 
-            let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
             guard.broadcast_info = Some(BroadcastInfo {
                 uuid: u,
                 name_b64: n_b64,
@@ -472,28 +505,35 @@ pub extern "C" fn nrc_periodic_broadcast(
 
             match thread::Builder::new()
                 .name("periodic-broadcast".to_string())
-                .spawn(move || {
-                    loop {
-                        if !r.load(Ordering::Relaxed) { break; }
-
-                        let msg = {
-                            let ctx = unsafe { &mut *(ctx_usize as *mut SafeContext) };
-                            let guard = match ctx.lock() { Ok(g) => g, Err(_) => break };
-                            match &guard.broadcast_info {
-                                Some(i) => codec::encode_udp_broadcast(
-                                    &i.uuid, &i.name_b64, codec::DEFAULT_TCP_PORT, i.battery, &i.device_type,
-                                ),
-                                None => {
-                                    drop(guard);
-                                    thread::sleep(Duration::from_millis(500));
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let _ = crate::network::send_udp_broadcast(&msg);
-                        thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
+                .spawn(move || loop {
+                    if !r.load(Ordering::Relaxed) {
+                        break;
                     }
+
+                    let msg = {
+                        let ctx = unsafe { &mut *(ctx_usize as *mut SafeContext) };
+                        let guard = match ctx.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        match &guard.broadcast_info {
+                            Some(i) => codec::encode_udp_broadcast(
+                                &i.uuid,
+                                &i.name_b64,
+                                codec::DEFAULT_TCP_PORT,
+                                i.battery,
+                                &i.device_type,
+                            ),
+                            None => {
+                                drop(guard);
+                                thread::sleep(Duration::from_millis(500));
+                                continue;
+                            }
+                        }
+                    };
+
+                    let _ = crate::network::send_udp_broadcast(&msg);
+                    thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
                 }) {
                 Ok(_) => {
                     guard.broadcast_handle = Some(BroadcastHandle { running });
@@ -506,12 +546,23 @@ pub extern "C" fn nrc_periodic_broadcast(
             }
         }
         2 => {
-            let mut guard = match ctx.lock() { Ok(g) => g, Err(_) => return -1 };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
             if let Some(ref mut info) = guard.broadcast_info {
-                if !uuid.is_null() { info.uuid = unsafe { from_cstr(uuid).to_string() }; }
-                if !name.is_null() { info.name_b64 = encode_name_b64(unsafe { from_cstr(name) }); }
-                if battery >= 0 { info.battery = battery; }
-                if !device_type.is_null() { info.device_type = unsafe { from_cstr(device_type).to_string() }; }
+                if !uuid.is_null() {
+                    info.uuid = unsafe { from_cstr(uuid).to_string() };
+                }
+                if !name.is_null() {
+                    info.name_b64 = encode_name_b64(unsafe { from_cstr(name) });
+                }
+                if battery >= 0 {
+                    info.battery = battery;
+                }
+                if !device_type.is_null() {
+                    info.device_type = unsafe { from_cstr(device_type).to_string() };
+                }
             }
             0
         }
@@ -544,7 +595,9 @@ pub extern "C" fn nrc_generate_pairing_code(ctx_ptr: *mut c_void, ttl_secs: u32)
 /// 清除已存储的配对码
 #[no_mangle]
 pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
-    if ctx_ptr.is_null() { return; }
+    if ctx_ptr.is_null() {
+        return;
+    }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     if let Ok(mut guard) = ctx.lock() {
         guard.pairing_code = None;
@@ -556,7 +609,9 @@ pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
 /// 返回 0 表示验证通过，-1 表示不匹配，-2 表示已过期
 #[no_mangle]
 pub extern "C" fn nrc_validate_pairing_code(ctx_ptr: *mut c_void, code: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || code.is_null() { return -1; }
+    if ctx_ptr.is_null() || code.is_null() {
+        return -1;
+    }
     let input = unsafe { from_cstr(code) };
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     match ctx.lock() {

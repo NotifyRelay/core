@@ -46,11 +46,14 @@ impl ReconnectState {
     /// 添加重连目标
     pub fn add_target(&self, uuid: &str, ip: &str) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard.targets.insert(uuid.to_string(), ReconnectTarget {
-                uuid: uuid.to_string(),
-                ip: ip.to_string(),
-                last_attempt: None,
-            });
+            guard.targets.insert(
+                uuid.to_string(),
+                ReconnectTarget {
+                    uuid: uuid.to_string(),
+                    ip: ip.to_string(),
+                    last_attempt: None,
+                },
+            );
             guard.attempt_counts.entry(uuid.to_string()).or_insert(0);
         }
     }
@@ -73,7 +76,9 @@ impl ReconnectState {
 
     /// 启动重连检测线程
     pub fn start(&self, ctx_ptr: usize) {
-        if self.running.load(Ordering::Relaxed) { return; }
+        if self.running.load(Ordering::Relaxed) {
+            return;
+        }
         self.running.store(true, Ordering::Relaxed);
 
         let inner = self.inner.clone();
@@ -83,7 +88,9 @@ impl ReconnectState {
             .name("reconnect".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) { break; }
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     let mut to_reconnect: Vec<(String, String)> = Vec::new();
 
@@ -93,12 +100,16 @@ impl ReconnectState {
                         let uuids: Vec<String> = guard.targets.keys().cloned().collect();
 
                         for uuid in &uuids {
-                            let connected = match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-                                Ok(ctx) => ctx.network.tcp.lock()
-                                    .map(|tcp| tcp.is_connected(uuid))
-                                    .unwrap_or(false),
-                                Err(_) => false,
-                            };
+                            let connected =
+                                match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
+                                    Ok(ctx) => ctx
+                                        .network
+                                        .tcp
+                                        .lock()
+                                        .map(|tcp| tcp.is_connected(uuid))
+                                        .unwrap_or(false),
+                                    Err(_) => false,
+                                };
 
                             if connected {
                                 guard.attempt_counts.remove(uuid);
@@ -114,9 +125,13 @@ impl ReconnectState {
                                 continue;
                             }
 
-                            let should_retry = guard.targets.get(uuid)
+                            let should_retry = guard
+                                .targets
+                                .get(uuid)
                                 .and_then(|t| t.last_attempt)
-                                .map(|t| now.duration_since(t).as_secs() >= guard.retry_interval_secs)
+                                .map(|t| {
+                                    now.duration_since(t).as_secs() >= guard.retry_interval_secs
+                                })
                                 .unwrap_or(true);
 
                             if should_retry {
@@ -136,17 +151,32 @@ impl ReconnectState {
 
                     for (uuid, ip) in to_reconnect {
                         log::info!("重连: 尝试连接 uuid={}, ip={}", uuid, ip);
-                        let handshake_msg = match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-                            Ok(guard) => {
-                                let local_uuid = guard.broadcast_info.as_ref().map(|i| i.uuid.clone()).unwrap_or_default();
-                                let local_pub = guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
-                                let dt = guard.broadcast_info.as_ref().map(|i| i.device_type.clone()).unwrap_or_default();
-                                codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
-                            }
-                            Err(_) => continue,
-                        };
+                        let handshake_msg =
+                            match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
+                                Ok(guard) => {
+                                    let local_uuid = guard
+                                        .broadcast_info
+                                        .as_ref()
+                                        .map(|i| i.uuid.clone())
+                                        .unwrap_or_default();
+                                    let local_pub =
+                                        guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
+                                    let dt = guard
+                                        .broadcast_info
+                                        .as_ref()
+                                        .map(|i| i.device_type.clone())
+                                        .unwrap_or_default();
+                                    codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
+                                }
+                                Err(_) => continue,
+                            };
 
-                        let _ = crate::network::oneshot_send_receive(&handshake_msg, &ip, codec::DEFAULT_TCP_PORT, 5000);
+                        let _ = crate::network::oneshot_send_receive(
+                            &handshake_msg,
+                            &ip,
+                            codec::DEFAULT_TCP_PORT,
+                            5000,
+                        );
 
                         // 更新最后尝试时间
                         if let Ok(mut guard) = inner.lock() {

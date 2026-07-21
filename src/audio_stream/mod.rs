@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub type AudioDataCb = Option<extern "C" fn(*const c_char, *const u8, i32, i32, i32, *mut c_void)>;
-pub type AudioEventCb = Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>;
+pub type AudioEventCb =
+    Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>;
 
 pub struct AudioStreamState {
     pub listener: Option<TcpListener>,
@@ -147,14 +148,27 @@ fn read_loop(
 ) {
     let mut len_buf = [0u8; 4];
     loop {
-        if !active.load(Ordering::SeqCst) { break; }
-        if stream.read_exact(&mut len_buf).is_err() { break; }
+        if !active.load(Ordering::SeqCst) {
+            break;
+        }
+        if stream.read_exact(&mut len_buf).is_err() {
+            break;
+        }
         let frame_len = u32::from_be_bytes(len_buf) as usize;
         let mut pcm = vec![0u8; frame_len];
-        if stream.read_exact(&mut pcm).is_err() { break; }
+        if stream.read_exact(&mut pcm).is_err() {
+            break;
+        }
         if let Some(cb) = on_data {
             let dev = std::ffi::CString::new("").unwrap();
-            cb(dev.as_ptr(), pcm.as_ptr(), frame_len as i32, sample_rate, channels, user_data);
+            cb(
+                dev.as_ptr(),
+                pcm.as_ptr(),
+                frame_len as i32,
+                sample_rate,
+                channels,
+                user_data,
+            );
         }
     }
     active.store(false, Ordering::SeqCst);
@@ -163,7 +177,9 @@ fn read_loop(
 
 /// 写入一帧 PCM（发送端调用）
 pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
-    if !state.active.load(Ordering::SeqCst) { return false; }
+    if !state.active.load(Ordering::SeqCst) {
+        return false;
+    }
     let mut guard = match state.stream_slot.lock() {
         Ok(g) => g,
         Err(_) => return false,
@@ -173,8 +189,12 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         None => return false,
     };
     let len_be = (pcm_data.len() as u32).to_be_bytes();
-    if stream.write_all(&len_be).is_err() { return false; }
-    if stream.write_all(pcm_data).is_err() { return false; }
+    if stream.write_all(&len_be).is_err() {
+        return false;
+    }
+    if stream.write_all(pcm_data).is_err() {
+        return false;
+    }
     true
 }
 

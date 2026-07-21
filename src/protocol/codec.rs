@@ -39,7 +39,11 @@ pub fn encode_pairing_init(
 ) -> String {
     format!(
         "PAIRING_INIT:{}:{}:{}:{}:{}",
-        uuid, spake2_pub, ip, battery_pairing(battery), device_type
+        uuid,
+        spake2_pub,
+        ip,
+        battery_pairing(battery),
+        device_type
     )
 }
 
@@ -53,7 +57,12 @@ pub fn encode_pairing_resp(
 ) -> String {
     format!(
         "PAIRING_RESP:{}:{}:{}:{}:{}:{}",
-        uuid, spake2_pub, lt_pub, ip, battery_pairing(battery), device_type
+        uuid,
+        spake2_pub,
+        lt_pub,
+        ip,
+        battery_pairing(battery),
+        device_type
     )
 }
 
@@ -66,7 +75,11 @@ pub fn encode_accept(
 ) -> String {
     format!(
         "ACCEPT:{}:{}:{}:{}:{}",
-        uuid, lt_pub_key, ip, battery_pairing(battery), device_type
+        uuid,
+        lt_pub_key,
+        ip,
+        battery_pairing(battery),
+        device_type
     )
 }
 
@@ -87,7 +100,11 @@ pub fn encode_handshake(
 ) -> String {
     format!(
         "HANDSHAKE:{}:{}:{}:{}:{}",
-        uuid, pub_key, ip, battery_pairing(battery), device_type
+        uuid,
+        pub_key,
+        ip,
+        battery_pairing(battery),
+        device_type
     )
 }
 
@@ -100,7 +117,11 @@ pub fn encode_heartbeat_tcp(
 ) -> String {
     format!(
         "HEARTBEAT_TCP:{}:{}:{}:{}:{}",
-        uuid, name, port, battery_hb(battery), device_type
+        uuid,
+        name,
+        port,
+        battery_hb(battery),
+        device_type
     )
 }
 
@@ -125,7 +146,11 @@ pub fn encode_udp_broadcast(
 ) -> String {
     format!(
         "{}:{}:{}:{}:{}",
-        uuid, name_b64, port, battery_hb(battery), device_type
+        uuid,
+        name_b64,
+        port,
+        battery_hb(battery),
+        device_type
     )
 }
 
@@ -294,5 +319,3 @@ pub fn decode_heartbeat_tcp(line: &str) -> Option<HeartbeatTcpFields<'_>> {
         device_type: parts[4],
     })
 }
-
-

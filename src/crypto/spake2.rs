@@ -1,5 +1,5 @@
-use spake2::{Ed25519Group, Identity, Password, Spake2};
 use base64::Engine;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 
 pub type Spake2ProverSession = Spake2<Ed25519Group>;
 pub type Spake2VerifierSession = Spake2<Ed25519Group>;

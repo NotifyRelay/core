@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 
-use crate::protocol::codec;
 use crate::network;
+use crate::protocol::codec;
 use crate::SafeContext;
 
 pub struct HeartbeatState {
@@ -16,7 +16,9 @@ pub struct HeartbeatState {
 
 impl HeartbeatState {
     pub fn new() -> Self {
-        Self { last_seen: HashMap::new() }
+        Self {
+            last_seen: HashMap::new(),
+        }
     }
 
     pub fn record(&mut self, uuid: &str) {
@@ -26,7 +28,8 @@ impl HeartbeatState {
 
     pub fn check_timeouts(&self, timeout_sec: i64) -> Vec<String> {
         let now = now_sec();
-        self.last_seen.iter()
+        self.last_seen
+            .iter()
             .filter(|(_, &ts)| now - ts > timeout_sec)
             .map(|(uuid, _)| uuid.clone())
             .collect()
@@ -118,12 +121,24 @@ impl HeartbeatHandle {
                 let mut since_tcp_check = 0u32;
 
                 loop {
-                    if !r.load(Ordering::Relaxed) { break; }
+                    if !r.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     let uuid = p.uuid.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                    let name_b64 = p.name_b64.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    let name_b64 = p
+                        .name_b64
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let battery = p.battery.load(Ordering::Relaxed);
-                    let device_type = p.device_type.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    let device_type = p
+                        .device_type
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let port = codec::DEFAULT_TCP_PORT;
 
                     if uuid.is_empty() {
@@ -132,7 +147,13 @@ impl HeartbeatHandle {
                     }
 
                     let sent = if current_mode == HEARTBEAT_MODE_TCP {
-                        let msg = codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
+                        let msg = codec::encode_heartbeat_tcp(
+                            &uuid,
+                            &name_b64,
+                            port,
+                            battery,
+                            &device_type,
+                        );
                         let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
                         if !ip_str.is_empty() {
                             network::oneshot_send_only(&msg, &ip_str, port, 3000)
@@ -140,7 +161,13 @@ impl HeartbeatHandle {
                             false
                         }
                     } else {
-                        let msg = codec::encode_udp_broadcast(&uuid, &name_b64, port, battery, &device_type);
+                        let msg = codec::encode_udp_broadcast(
+                            &uuid,
+                            &name_b64,
+                            port,
+                            battery,
+                            &device_type,
+                        );
                         network::send_udp_broadcast(&msg).is_ok()
                     };
 
@@ -154,7 +181,10 @@ impl HeartbeatHandle {
                     let mode_now = m.load(Ordering::Relaxed);
                     if mode_now == HEARTBEAT_MODE_AUTO {
                         if current_mode == HEARTBEAT_MODE_TCP && consecutive_failures >= 3 {
-                            log::info!("心跳 Auto 模式: TCP 连续失败 {} 次, 回退到 UDP", consecutive_failures);
+                            log::info!(
+                                "心跳 Auto 模式: TCP 连续失败 {} 次, 回退到 UDP",
+                                consecutive_failures
+                            );
                             current_mode = HEARTBEAT_MODE_UDP;
                             consecutive_failures = 0;
                             since_tcp_check = 0;
@@ -181,17 +211,23 @@ impl HeartbeatHandle {
     /// 更新心跳参数（电池、名称等）
     pub fn update(&self, uuid: &str, name: &str, battery: i32, device_type: &str) {
         if !uuid.is_empty() {
-            if let Ok(mut u) = self.params.uuid.lock() { *u = uuid.to_string(); }
+            if let Ok(mut u) = self.params.uuid.lock() {
+                *u = uuid.to_string();
+            }
         }
         if !name.is_empty() {
             let b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
-            if let Ok(mut n) = self.params.name_b64.lock() { *n = b64; }
+            if let Ok(mut n) = self.params.name_b64.lock() {
+                *n = b64;
+            }
         }
         if battery >= 0 {
             self.params.battery.store(battery, Ordering::Relaxed);
         }
         if !device_type.is_empty() {
-            if let Ok(mut d) = self.params.device_type.lock() { *d = device_type.to_string(); }
+            if let Ok(mut d) = self.params.device_type.lock() {
+                *d = device_type.to_string();
+            }
         }
     }
 
@@ -211,36 +247,44 @@ pub fn start_offline_detector(
 
     thread::Builder::new()
         .name("offline-detector".to_string())
-        .spawn(move || {
-            loop {
-                if !r.load(Ordering::Relaxed) { break; }
+        .spawn(move || loop {
+            if !r.load(Ordering::Relaxed) {
+                break;
+            }
 
-                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                let (timeouts, on_timeout_cb, user_data) = match ctx.lock() {
-                    Ok(guard) => {
-                        let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
-                        let cb = guard.router.on_device_timeout;
-                        let ud = guard.router.user_data;
-                        (timed_out, cb, ud)
-                    }
-                    Err(_) => { thread::sleep(Duration::from_millis(check_interval_ms)); continue; }
-                };
+            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+            let (timeouts, on_timeout_cb, user_data) = match ctx.lock() {
+                Ok(guard) => {
+                    let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
+                    let cb = guard.router.on_device_timeout;
+                    let ud = guard.router.user_data;
+                    (timed_out, cb, ud)
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(check_interval_ms));
+                    continue;
+                }
+            };
 
-                for uuid in &timeouts {
-                    log::info!("设备状态变化: 已超时 uuid={}", uuid);
-                    if let Some(cb) = on_timeout_cb {
-                        if let Ok(uuid_c) = std::ffi::CString::new(uuid.as_str()) {
-                            cb(uuid_c.as_ptr(), user_data);
-                        }
-                    }
-                    if let Ok(mut guard) = ctx.lock() {
-                        guard.heartbeat.remove(uuid);
-                        guard.network.tcp.lock().ok().map(|mut tcp| tcp.remove_session(uuid));
+            for uuid in &timeouts {
+                log::info!("设备状态变化: 已超时 uuid={}", uuid);
+                if let Some(cb) = on_timeout_cb {
+                    if let Ok(uuid_c) = std::ffi::CString::new(uuid.as_str()) {
+                        cb(uuid_c.as_ptr(), user_data);
                     }
                 }
-
-                thread::sleep(Duration::from_millis(check_interval_ms));
+                if let Ok(mut guard) = ctx.lock() {
+                    guard.heartbeat.remove(uuid);
+                    guard
+                        .network
+                        .tcp
+                        .lock()
+                        .ok()
+                        .map(|mut tcp| tcp.remove_session(uuid));
+                }
             }
+
+            thread::sleep(Duration::from_millis(check_interval_ms));
         })
         .map_err(|e| format!("启动离线检测线程失败: {}", e))?;
 

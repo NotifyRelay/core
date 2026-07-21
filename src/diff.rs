@@ -12,10 +12,7 @@ pub enum DiffDecision {
 }
 
 /// 超级岛差异计算
-pub fn compute_superisland_diff(
-    old_json: &str,
-    new_json: &str,
-) -> DiffDecision {
+pub fn compute_superisland_diff(old_json: &str, new_json: &str) -> DiffDecision {
     if old_json.is_empty() {
         return DiffDecision::Full;
     }
@@ -78,7 +75,8 @@ fn extract_superisland_map(val: &serde_json::Value) -> Option<HashMap<String, se
 
     let mut map = HashMap::new();
     for feature in features {
-        let feature_id = match feature.get("featureId")
+        let feature_id = match feature
+            .get("featureId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
         {

@@ -1,8 +1,8 @@
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
-use crate::filter::RemoteFilterConfig;
 use super::common::{from_cstr, to_cstr};
+use crate::filter::RemoteFilterConfig;
 
 /// 过滤器状态
 pub struct FilterState {
@@ -19,15 +19,15 @@ impl FilterState {
 
 /// 设置过滤配置（JSON 格式）
 #[no_mangle]
-pub extern "C" fn nrc_set_filter_config(
+pub unsafe extern "C" fn nrc_set_filter_config(
     ctx_ptr: *mut crate::SafeContext,
     config_json: *const c_char,
 ) -> i32 {
     if ctx_ptr.is_null() || config_json.is_null() {
         return -1;
     }
-    let json_str = unsafe { from_cstr(config_json) };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let json_str = from_cstr(config_json);
+    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
         Ok(g) => g,
         Err(_) => return -1,
@@ -40,7 +40,10 @@ pub extern "C" fn nrc_set_filter_config(
     };
 
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
-        if let Some(v) = parsed.get("enablePackageGroupMapping").and_then(|v| v.as_bool()) {
+        if let Some(v) = parsed
+            .get("enablePackageGroupMapping")
+            .and_then(|v| v.as_bool())
+        {
             cfg.enable_package_group_mapping = v;
         }
         if let Some(groups) = parsed.get("packageGroups").and_then(|v| v.as_array()) {
@@ -50,7 +53,10 @@ pub extern "C" fn nrc_set_filter_config(
                     g.get("groupName").and_then(|v| v.as_str()),
                     g.get("packages").and_then(|v| v.as_array()),
                 ) {
-                    let packages: Vec<String> = pkgs.iter().filter_map(|p| p.as_str().map(|s| s.to_string())).collect();
+                    let packages: Vec<String> = pkgs
+                        .iter()
+                        .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                        .collect();
                     cfg.package_groups.push(crate::filter::PackageGroup {
                         group_name: name.to_string(),
                         packages,
@@ -76,7 +82,10 @@ pub extern "C" fn nrc_set_filter_config(
                     let parts: Vec<&str> = s.splitn(2, '|').collect();
                     cfg.filter_list.push(crate::filter::FilterListEntry {
                         package: parts[0].to_string(),
-                        keyword: parts.get(1).filter(|k| !k.is_empty()).map(|k| k.to_string()),
+                        keyword: parts
+                            .get(1)
+                            .filter(|k| !k.is_empty())
+                            .map(|k| k.to_string()),
                     });
                 }
             }
@@ -100,15 +109,15 @@ pub extern "C" fn nrc_set_filter_config(
 
 /// 映射远程包名为本地包名
 #[no_mangle]
-pub extern "C" fn nrc_map_local_package(
+pub unsafe extern "C" fn nrc_map_local_package(
     ctx_ptr: *mut crate::SafeContext,
     remote_package: *const c_char,
 ) -> *mut c_char {
     if ctx_ptr.is_null() || remote_package.is_null() {
         return to_cstr("");
     }
-    let pkg = unsafe { from_cstr(remote_package) };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let pkg = from_cstr(remote_package);
+    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
         Ok(g) => g,
         Err(_) => return to_cstr(""),
@@ -125,7 +134,7 @@ pub extern "C" fn nrc_map_local_package(
 /// 参数: ctx, mappedPkg, originalPkg, title, text
 /// title/text 用于关键词匹配
 #[no_mangle]
-pub extern "C" fn nrc_check_filter_mode(
+pub unsafe extern "C" fn nrc_check_filter_mode(
     ctx_ptr: *mut crate::SafeContext,
     mapped_package: *const c_char,
     _original_package: *const c_char,
@@ -135,10 +144,18 @@ pub extern "C" fn nrc_check_filter_mode(
     if ctx_ptr.is_null() || mapped_package.is_null() {
         return 1;
     }
-    let pkg = unsafe { from_cstr(mapped_package) };
-    let title_str = if title.is_null() { "" } else { unsafe { from_cstr(title) } };
-    let text_str = if text.is_null() { "" } else { unsafe { from_cstr(text) } };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let pkg = from_cstr(mapped_package);
+    let title_str = if title.is_null() {
+        ""
+    } else {
+        from_cstr(title)
+    };
+    let text_str = if text.is_null() {
+        ""
+    } else {
+        from_cstr(text)
+    };
+    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
         Ok(g) => g,
         Err(_) => return 1,
@@ -147,13 +164,17 @@ pub extern "C" fn nrc_check_filter_mode(
         Ok(c) => c,
         Err(_) => return 1,
     };
-    if config.check_filter_mode(&pkg, title_str, text_str) { 1 } else { 0 }
+    if config.check_filter_mode(&pkg, title_str, text_str) {
+        1
+    } else {
+        0
+    }
 }
 
 /// 过滤通知（返回 1=通过, 0=被过滤）
 /// 支持通过 title/text 关键词匹配过滤条目
 #[no_mangle]
-pub extern "C" fn nrc_filter_notification(
+pub unsafe extern "C" fn nrc_filter_notification(
     ctx_ptr: *mut crate::SafeContext,
     package_name: *const c_char,
     title: *const c_char,
@@ -162,11 +183,19 @@ pub extern "C" fn nrc_filter_notification(
     if ctx_ptr.is_null() || package_name.is_null() {
         return 1;
     }
-    let pkg = unsafe { from_cstr(package_name) };
-    let title_str = if title.is_null() { "" } else { unsafe { from_cstr(title) } };
-    let text_str = if text.is_null() { "" } else { unsafe { from_cstr(text) } };
+    let pkg = from_cstr(package_name);
+    let title_str = if title.is_null() {
+        ""
+    } else {
+        from_cstr(title)
+    };
+    let text_str = if text.is_null() {
+        ""
+    } else {
+        from_cstr(text)
+    };
 
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
         Ok(g) => g,
         Err(_) => return 1,
@@ -176,7 +205,11 @@ pub extern "C" fn nrc_filter_notification(
         Err(_) => return 1,
     };
 
-    if config.check_filter_mode(&pkg, title_str, text_str) { 1 } else { 0 }
+    if config.check_filter_mode(&pkg, title_str, text_str) {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -205,18 +238,26 @@ mod tests {
         let json_ptr = to_cstr_test(config_json);
         let result = unsafe { nrc_set_filter_config(ctx_ptr, json_ptr) };
         assert_eq!(result, 0);
-        unsafe { let _ = CString::from_raw(json_ptr as *mut c_char); }
+        unsafe {
+            let _ = CString::from_raw(json_ptr as *mut c_char);
+        }
 
         let pkg_ptr = to_cstr_test("com.allowed");
         let empty = to_cstr_test("");
         let check = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr, empty, empty, empty) };
         assert_eq!(check, 1);
-        unsafe { let _ = CString::from_raw(pkg_ptr as *mut c_char); }
+        unsafe {
+            let _ = CString::from_raw(pkg_ptr as *mut c_char);
+        }
 
         let pkg_ptr2 = to_cstr_test("com.blocked");
         let check2 = unsafe { nrc_check_filter_mode(ctx_ptr, pkg_ptr2, empty, empty, empty) };
         assert_eq!(check2, 0);
-        unsafe { let _ = CString::from_raw(pkg_ptr2 as *mut c_char); }
-        unsafe { let _ = CString::from_raw(empty as *mut c_char); }
+        unsafe {
+            let _ = CString::from_raw(pkg_ptr2 as *mut c_char);
+        }
+        unsafe {
+            let _ = CString::from_raw(empty as *mut c_char);
+        }
     }
 }

@@ -7,12 +7,12 @@ use super::common::{from_cstr, to_cstr};
 /// 计算超级岛差异
 /// 返回 JSON: {"decision":"full"} 或 {"decision":"delta","payload":"..."} 或 {"decision":"skip"}
 #[no_mangle]
-pub extern "C" fn nrc_compute_superisland_diff(
+pub unsafe extern "C" fn nrc_compute_superisland_diff(
     old_state: *const c_char,
     new_state: *const c_char,
 ) -> *mut c_char {
-    let old = unsafe { from_cstr(old_state) };
-    let new_s = unsafe { from_cstr(new_state) };
+    let old = from_cstr(old_state);
+    let new_s = from_cstr(new_state);
 
     let result = match diff::compute_superisland_diff(old, new_s) {
         DiffDecision::Full => r#"{"decision":"full"}"#.to_string(),
@@ -32,10 +32,12 @@ mod tests {
 
     #[test]
     fn test_diff_ffi_full() {
-        let result = unsafe { nrc_compute_superisland_diff(
-            std::ffi::CString::new("").unwrap().as_ptr(),
-            std::ffi::CString::new("{}").unwrap().as_ptr(),
-        ) };
+        let result = unsafe {
+            nrc_compute_superisland_diff(
+                std::ffi::CString::new("").unwrap().as_ptr(),
+                std::ffi::CString::new("{}").unwrap().as_ptr(),
+            )
+        };
         let s = unsafe { from_cstr(result) };
         assert!(s.contains(r#""full""#));
     }

@@ -73,7 +73,9 @@ impl RemoteFilterConfig {
 
     /// 检查包名是否在过滤列表中（简化版，无关键词匹配）
     pub fn is_in_filter_list(&self, package_name: &str) -> bool {
-        self.filter_list.iter().any(|entry| entry.package == package_name)
+        self.filter_list
+            .iter()
+            .any(|entry| entry.package == package_name)
     }
 }
 
@@ -138,7 +140,7 @@ mod tests {
         });
 
         config.filter_mode = 2; // blacklist
-        // keyword matches → blocked
+                                // keyword matches → blocked
         assert!(!config.check_filter_mode("com.app", "blocked content", ""));
         // keyword doesn't match → not blocked
         assert!(config.check_filter_mode("com.app", "normal content", ""));
