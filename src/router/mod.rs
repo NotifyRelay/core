@@ -24,6 +24,18 @@ pub type OnHeartbeatUdpCb = Option<
         u16,
         i32,
         *const c_char,
+        *const c_char,
+        *mut c_void,
+    ),
+>;
+
+pub type OnMdnsDiscoveredCb = Option<
+    extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        u16,
+        *const c_char,
         *mut c_void,
     ),
 >;
@@ -40,6 +52,7 @@ pub struct Router {
     pub on_data: OnDataCb,
 
     pub on_heartbeat_udp: OnHeartbeatUdpCb,
+    pub on_mdns_discovered: OnMdnsDiscoveredCb,
     pub on_device_timeout: OnDeviceTimeoutCb,
     pub on_device_connected: OnDeviceConnectedCb,
     pub on_device_disconnected: OnDeviceDisconnectedCb,
@@ -53,6 +66,7 @@ impl Router {
             on_pairing: None,
             on_data: None,
             on_heartbeat_udp: None,
+            on_mdns_discovered: None,
             on_device_timeout: None,
             on_device_connected: None,
             on_device_disconnected: None,

@@ -15,8 +15,10 @@ pub mod diff;
 pub mod discovery;
 pub mod reconnect;
 pub mod audio_stream;
+pub mod mdns;
 
 pub use common::*;
+pub use mdns::*;
 pub use lifecycle::*;
 pub use ecdh::*;
 pub use key_management::*;

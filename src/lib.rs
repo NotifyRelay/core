@@ -5,6 +5,7 @@ mod heartbeat;
 mod discovery;
 pub mod audio_stream;
 mod network;
+mod mdns;
 mod dedup;
 mod models;
 mod filter;
@@ -29,6 +30,7 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub audio: audio_stream::AudioStreamState,
     pub network: network::NetworkState,
+    pub mdns: mdns::MdnsState,
     pub dedup: dedup::DedupState,
     pub filter: ffi::filter::FilterState,
     pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
@@ -76,6 +78,7 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             audio: audio_stream::AudioStreamState::new(),
             network: network::NetworkState::new(),
+            mdns: mdns::MdnsState::new(),
             dedup: dedup::DedupState::new(),
             filter: ffi::filter::FilterState::new(),
             device_ips: Mutex::new(HashMap::new()),
