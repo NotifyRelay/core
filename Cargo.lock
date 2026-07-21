@@ -552,6 +552,7 @@ dependencies = [
  "aes-gcm",
  "base64",
  "hkdf 0.12.4",
+ "libc",
  "log",
  "md5",
  "mdns-sd",
