@@ -60,28 +60,28 @@ pub extern "C" fn nrc_audio_start(
     let ruuid = unsafe { from_cstr(remote_uuid).to_string() };
     let p = port as u16;
 
-    with_ctx(ctx_ptr, |ctx| {
+    let start_ok = with_ctx(ctx_ptr, |ctx| -> bool {
         let state = &mut ctx.audio;
         state.remote_uuid = ruuid.clone();
-
-        let result = match dir.as_str() {
-            "send" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
-            "recv" => {
+        match dir.as_str() {
+            "send" => {
                 let ok = audio_stream::start_receiver(state, p, sample_rate, channels);
                 if ok { audio_stream::start_accept_thread(state); }
                 ok
             }
+            "recv" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
             _ => { log::error!("audio_stream FFI: unknown direction {dir}"); false }
-        };
-
-        if result {
-            // Rust 内部自动发送控制消息
-            send_control(ctx, &ruuid, "audioStart", sample_rate, channels);
-            0
-        } else {
-            -1
         }
-    })
+    });
+
+    // 启动成功后发控制消息
+    if start_ok && dir == "send" {
+        with_ctx(ctx_ptr, |ctx| {
+            send_control(ctx, &ruuid, "audioStart", sample_rate, channels);
+        });
+    }
+
+    if start_ok { 0 } else { -1 }
 }
 
 #[no_mangle]
