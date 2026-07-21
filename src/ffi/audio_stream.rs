@@ -7,6 +7,7 @@ use super::common::{from_cstr, with_ctx};
 
 /// 通过加密通道发送 DATA_MEDIA_CONTROL 消息
 fn send_control(ctx: &crate::CoreContext, remote_uuid: &str, action: &str, sample_rate: i32, channels: i32) {
+    log::info!("音频流: send_control 开始 action={}, 远端UUID={}", action, remote_uuid);
     let payload = if action == "audioStart" {
         format!(r#"{{"type":"MEDIA_CONTROL","action":"{}","sampleRate":{},"channels":{}}}"#, action, sample_rate, channels)
     } else {
@@ -17,13 +18,13 @@ fn send_control(ctx: &crate::CoreContext, remote_uuid: &str, action: &str, sampl
     let key_b64 = match ctx.crypto.device_keys.get(remote_uuid) {
         Some(k) => k.aes_key_b64.clone(),
         None => {
-            log::warn!("audio_stream: 未找到对端密钥 uuid={}", remote_uuid);
+            log::warn!("音频流: 未找到对端密钥 uuid={}", remote_uuid);
             return;
         }
     };
     let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
         Ok(b) if b.len() == 32 => b,
-        _ => { log::warn!("audio_stream: 密钥格式无效"); return; }
+        _ => { log::warn!("音频流: 密钥格式无效"); return; }
     };
     let mut key_arr = [0u8; 32];
     key_arr.copy_from_slice(&key_bytes);
@@ -36,12 +37,12 @@ fn send_control(ctx: &crate::CoreContext, remote_uuid: &str, action: &str, sampl
     if let Ok(encrypted) = aes::encrypt(&key_arr, payload.as_bytes()) {
         let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, &local_pub_key, &encrypted);
         if do_send(ctx, remote_uuid, &msg) {
-            log::info!("audio_stream: 已发送控制消息 action={}", action);
+            log::info!("音频流: 已发送控制消息 action={}", action);
         } else {
-            log::warn!("audio_stream: 发送控制消息失败 action={}", action);
+            log::warn!("音频流: 发送控制消息失败 action={}", action);
         }
     } else {
-        log::error!("audio_stream: 加密控制消息失败");
+        log::error!("音频流: 加密控制消息失败");
     }
 }
 
@@ -60,6 +61,9 @@ pub extern "C" fn nrc_audio_start(
     let ruuid = unsafe { from_cstr(remote_uuid).to_string() };
     let p = port as u16;
 
+    log::info!("音频流: nrc_audio_start 方向={}, 对端IP={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
+        dir, ip, port, sample_rate, channels, ruuid);
+
     let start_ok = with_ctx(ctx_ptr, |ctx| -> bool {
         let state = &mut ctx.audio;
         state.remote_uuid = ruuid.clone();
@@ -70,18 +74,23 @@ pub extern "C" fn nrc_audio_start(
                 ok
             }
             "recv" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
-            _ => { log::error!("audio_stream FFI: unknown direction {dir}"); false }
+            _ => { log::error!("音频流 FFI: 未知方向 {dir}"); false }
         }
     });
 
-    // 启动成功后发控制消息
-    if start_ok && dir == "send" {
-        with_ctx(ctx_ptr, |ctx| {
-            send_control(ctx, &ruuid, "audioStart", sample_rate, channels);
-        });
+    if start_ok {
+        log::info!("音频流: nrc_audio_start 成功");
+        // 启动成功后发控制消息
+        if dir == "send" {
+            with_ctx(ctx_ptr, |ctx| {
+                send_control(ctx, &ruuid, "audioStart", sample_rate, channels);
+            });
+        }
+        0
+    } else {
+        log::error!("音频流: nrc_audio_start 失败");
+        -1
     }
-
-    if start_ok { 0 } else { -1 }
 }
 
 #[no_mangle]
@@ -90,29 +99,40 @@ pub extern "C" fn nrc_audio_write_frame(
     pcm_data: *const u8,
     pcm_len: i32,
 ) -> i32 {
-    if pcm_len <= 0 || pcm_data.is_null() { return -1; }
+    if pcm_len <= 0 || pcm_data.is_null() {
+        log::warn!("音频流: nrc_audio_write_frame 参数无效 pcm_len={}", pcm_len);
+        return -1;
+    }
     let pcm = unsafe { std::slice::from_raw_parts(pcm_data, pcm_len as usize) };
     with_ctx(ctx_ptr, |ctx| {
-        if audio_stream::write_frame(&ctx.audio, pcm) { 0 } else { -1 }
+        if audio_stream::write_frame(&ctx.audio, pcm) { 0 } else {
+            log::warn!("音频流: 写入 PCM 帧失败，长度={}", pcm_len);
+            -1
+        }
     })
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
+    log::info!("音频流: nrc_audio_stop 开始停止");
     with_ctx(ctx_ptr, |ctx| {
         let ruuid = ctx.audio.remote_uuid.clone();
         if !ruuid.is_empty() {
+            log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", ruuid);
             send_control(ctx, &ruuid, "audioStop", 0, 0);
         }
         audio_stream::stop(&mut ctx.audio);
     });
+    log::info!("音频流: nrc_audio_stop 完成");
     0
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_audio_is_active(ctx_ptr: *mut c_void) -> i32 {
     with_ctx(ctx_ptr, |ctx| {
-        if ctx.audio.active.load(std::sync::atomic::Ordering::SeqCst) { 1 } else { 0 }
+        let active = ctx.audio.active.load(std::sync::atomic::Ordering::SeqCst);
+        log::debug!("音频流: 查询活跃状态={}", active);
+        if active { 1 } else { 0 }
     })
 }
 

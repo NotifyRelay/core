@@ -47,14 +47,14 @@ pub(crate) fn start_sender(
     channels: i32,
 ) -> bool {
     if state.active.load(Ordering::SeqCst) {
-        log::warn!("audio_stream: already active");
+        log::warn!("音频流: 已在运行，无法重复启动发送端");
         return false;
     }
     let addr = format!("{}:{}", ip, port);
     let stream = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("audio_stream: connect {addr} fail: {e}");
+            log::error!("音频流: 连接对端 {addr} 失败: {e}");
             return false;
         }
     };
@@ -63,7 +63,7 @@ pub(crate) fn start_sender(
     let cloned = stream.try_clone().unwrap();
     *state.stream_slot.lock().unwrap() = Some(cloned);
     state.active.store(true, Ordering::SeqCst);
-    log::info!("audio_stream: sender connected to {addr}");
+    log::info!("音频流: 发送端已连接到 {addr}");
 
     // 启动读取循环（接收端连接后也要读数据）
     start_read_thread(state, stream);
@@ -80,8 +80,9 @@ fn start_read_thread(state: &mut AudioStreamState, stream: TcpStream) {
 
     let handle = thread::spawn(move || {
         let ud_ptr = ud as *mut c_void;
+        log::info!("音频流: 读取线程已启动");
         read_loop(stream, active, sample_rate, channels, on_data, ud_ptr);
-        log::info!("audio_stream: 读取线程结束");
+        log::info!("音频流: 读取线程已结束");
     });
     state.thread_handle = Some(handle);
 }
@@ -94,13 +95,13 @@ pub(crate) fn start_receiver(
     channels: i32,
 ) -> bool {
     if state.active.load(Ordering::SeqCst) {
-        log::warn!("audio_stream: already active");
+        log::warn!("音频流: 已在运行，无法重复启动接收端");
         return false;
     }
     let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)) {
         Ok(l) => l,
         Err(e) => {
-            log::error!("audio_stream: bind :{port} fail: {e}");
+            log::error!("音频流: 绑定端口 :{port} 失败: {e}");
             return false;
         }
     };
@@ -108,7 +109,7 @@ pub(crate) fn start_receiver(
     state.channels = channels;
     state.listener = Some(listener);
     state.active.store(true, Ordering::SeqCst);
-    log::info!("audio_stream: listening :{port}");
+    log::info!("音频流: 正在监听端口 :{port}");
     true
 }
 
@@ -121,17 +122,16 @@ pub(crate) fn start_accept_thread(state: &mut AudioStreamState) {
     let stream_slot = state.stream_slot.clone();
 
     let handle = thread::spawn(move || {
-        log::info!("audio_stream: waiting for receiver...");
+        log::info!("音频流: 等待对端连接...");
         match listener.accept() {
             Ok((stream, addr)) => {
-                log::info!("audio_stream: receiver connected from {addr}");
+                log::info!("音频流: 对端已连接 {addr}");
                 if let Ok(cloned) = stream.try_clone() {
                     *stream_slot.lock().unwrap() = Some(cloned);
                 }
             }
-            Err(e) => log::error!("audio_stream: accept fail: {e}"),
+            Err(e) => log::error!("音频流: 接受连接失败: {e}"),
         }
-        log::info!("audio_stream: accept thread ended");
     });
     state.thread_handle = Some(handle);
 }
@@ -158,7 +158,7 @@ fn read_loop(
         }
     }
     active.store(false, Ordering::SeqCst);
-    log::info!("audio_stream: read loop ended");
+    log::info!("音频流: 读取循环已退出");
 }
 
 /// 写入一帧 PCM（发送端调用）
@@ -188,5 +188,5 @@ pub(crate) fn stop(state: &mut AudioStreamState) {
     }
     state.listener.take();
     state.thread_handle.take().map(|h| h.join());
-    log::info!("audio_stream: stopped");
+    log::info!("音频流: 已停止");
 }
