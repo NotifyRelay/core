@@ -562,6 +562,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
+ "socket2",
  "spake2",
  "uuid",
 ]

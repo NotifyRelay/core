@@ -1,10 +1,33 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+fn bind_reusable(port: u16) -> Result<TcpListener, String> {
+    let addr: SocketAddr = format!("0.0.0.0:{}", port)
+        .parse()
+        .map_err(|e| format!("地址解析失败: {}", e))?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .map_err(|e| format!("创建 socket 失败: {}", e))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| format!("设置 SO_REUSEADDR 失败: {}", e))?;
+    socket
+        .bind(&socket2::SockAddr::from(addr))
+        .map_err(|e| format!("绑定端口 :{port} 失败: {}", e))?;
+    socket
+        .listen(1)
+        .map_err(|e| format!("监听失败: {}", e))?;
+    let listener = TcpListener::from(socket);
+    Ok(listener)
+}
 
 pub type AudioDataCb = Option<extern "C" fn(*const c_char, *const u8, i32, i32, i32, *mut c_void)>;
 pub type AudioEventCb =
@@ -100,7 +123,7 @@ pub(crate) fn start_receiver(
         log::warn!("音频流: 已在运行，无法重复启动接收端");
         return false;
     }
-    let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)) {
+    let listener = match bind_reusable(port) {
         Ok(l) => l,
         Err(e) => {
             log::error!("音频流: 绑定端口 :{port} 失败: {e}");

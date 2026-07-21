@@ -22,5 +22,6 @@ rand = "0.8"
 log = "0.4"
 libc = "0.2"
 mdns-sd = "0.12"
+socket2 = "0.5"
 
 
