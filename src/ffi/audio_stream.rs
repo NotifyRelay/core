@@ -1,11 +1,10 @@
 use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, with_ctx};
-use crate::ffi::send::do_send;
-use crate::{audio_stream, crypto::aes, protocol::codec};
+use crate::{audio_stream, crypto::aes, network, protocol::codec};
 use base64::Engine;
 
-/// 通过加密通道发送 DATA_MEDIA_CONTROL 消息
+/// 通过 oneshot TCP 连接发送 DATA_MEDIA_CONTROL 消息（与发送队列一致）
 fn send_control(
     ctx: &crate::CoreContext,
     remote_uuid: &str,
@@ -27,7 +26,6 @@ fn send_control(
         format!(r#"{{"type":"MEDIA_CONTROL","action":"{}"}}"#, action)
     };
 
-    // 获取对端 AES 密钥
     let key_b64 = match ctx.crypto.device_keys.get(remote_uuid) {
         Some(k) => k.aes_key_b64.clone(),
         None => {
@@ -45,26 +43,28 @@ fn send_control(
     let mut key_arr = [0u8; 32];
     key_arr.copy_from_slice(&key_bytes);
 
-    // 获取本端 UUID 和公钥
     let local_uuid = ctx
         .broadcast_info
         .as_ref()
         .map(|i| i.uuid.clone())
         .unwrap_or_default();
-    let local_pub_key = ctx.crypto.local_pub_key_b64.as_deref().unwrap_or_default();
 
-    // 加密并发送
     if let Ok(encrypted) = aes::encrypt(&key_arr, payload.as_bytes()) {
-        let msg = codec::encode_data_message(
-            "DATA_MEDIA_CONTROL",
-            &local_uuid,
-            &local_pub_key,
-            &encrypted,
-        );
-        if do_send(ctx, remote_uuid, &msg) {
-            log::info!("音频流: 已发送控制消息 action={}", action);
+        let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, "", &encrypted);
+        let ip = ctx
+            .device_ips
+            .lock()
+            .ok()
+            .and_then(|ips| ips.get(remote_uuid).cloned())
+            .unwrap_or_default();
+        if !ip.is_empty() && ip != "0.0.0.0" {
+            if network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000) {
+                log::info!("音频流: 已发送控制消息 action={}", action);
+            } else {
+                log::warn!("音频流: oneshot 发送控制消息失败 action={}", action);
+            }
         } else {
-            log::warn!("音频流: 发送控制消息失败 action={}", action);
+            log::warn!("音频流: 无有效IP发送控制消息 uuid={}", remote_uuid);
         }
     } else {
         log::error!("音频流: 加密控制消息失败");
