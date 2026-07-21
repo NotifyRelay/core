@@ -38,7 +38,7 @@ impl AudioStreamState {
     }
 }
 
-/// 发送端：连接接收端 :23335 并推流
+/// 连接接收端 :23335（用于推流或读取）
 pub(crate) fn start_sender(
     state: &mut AudioStreamState,
     ip: &str,
@@ -60,10 +60,30 @@ pub(crate) fn start_sender(
     };
     state.sample_rate = sample_rate;
     state.channels = channels;
-    *state.stream_slot.lock().unwrap() = Some(stream);
+    let cloned = stream.try_clone().unwrap();
+    *state.stream_slot.lock().unwrap() = Some(cloned);
     state.active.store(true, Ordering::SeqCst);
     log::info!("audio_stream: sender connected to {addr}");
+
+    // 启动读取循环（接收端连接后也要读数据）
+    start_read_thread(state, stream);
     true
+}
+
+/// 在独立线程中读取 PCM 数据并回调
+fn start_read_thread(state: &mut AudioStreamState, stream: TcpStream) {
+    let active = state.active.clone();
+    let sample_rate = state.sample_rate;
+    let channels = state.channels;
+    let on_data = state.on_data;
+    let ud = state.user_data as usize;
+
+    let handle = thread::spawn(move || {
+        let ud_ptr = ud as *mut c_void;
+        read_loop(stream, active, sample_rate, channels, on_data, ud_ptr);
+        log::info!("audio_stream: 读取线程结束");
+    });
+    state.thread_handle = Some(handle);
 }
 
 /// 接收端：监听 :23335，等待发送端连接
@@ -92,33 +112,26 @@ pub(crate) fn start_receiver(
     true
 }
 
-/// 独立线程等待连接 → 连接后进入读取循环
+/// 独立线程等待连接 → 连接后仅存储 stream（发送方写数据用）
 pub(crate) fn start_accept_thread(state: &mut AudioStreamState) {
     let listener = match state.listener.as_ref() {
         Some(l) => l.try_clone().unwrap(),
         None => return,
     };
-    let active = state.active.clone();
     let stream_slot = state.stream_slot.clone();
-    let sample_rate = state.sample_rate;
-    let channels = state.channels;
-    let on_data = state.on_data;
-    let ud = state.user_data as usize;
 
     let handle = thread::spawn(move || {
-        let ud_ptr = ud as *mut c_void;
-        log::info!("audio_stream: waiting for sender...");
+        log::info!("audio_stream: waiting for receiver...");
         match listener.accept() {
             Ok((stream, addr)) => {
-                log::info!("audio_stream: sender connected from {addr}");
+                log::info!("audio_stream: receiver connected from {addr}");
                 if let Ok(cloned) = stream.try_clone() {
                     *stream_slot.lock().unwrap() = Some(cloned);
                 }
-                read_loop(stream, active, sample_rate, channels, on_data, ud_ptr);
             }
             Err(e) => log::error!("audio_stream: accept fail: {e}"),
         }
-        log::info!("audio_stream: receiver thread ended");
+        log::info!("audio_stream: accept thread ended");
     });
     state.thread_handle = Some(handle);
 }
