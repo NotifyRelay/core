@@ -14,6 +14,7 @@ pub mod sender_queue;
 pub mod diff;
 pub mod discovery;
 pub mod reconnect;
+pub mod audio_stream;
 
 pub use common::*;
 pub use lifecycle::*;
@@ -31,3 +32,4 @@ pub use sender_queue::*;
 pub use diff::*;
 pub use discovery::*;
 pub use reconnect::*;
+pub use audio_stream::*;

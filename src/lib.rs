@@ -3,6 +3,7 @@ mod crypto;
 mod router;
 mod heartbeat;
 mod discovery;
+pub mod audio_stream;
 mod network;
 mod dedup;
 mod models;
@@ -26,6 +27,7 @@ pub struct CoreContext {
     pub router: router::Router,
     pub heartbeat: heartbeat::HeartbeatState,
     pub discovery: discovery::DiscoveryState,
+    pub audio: audio_stream::AudioStreamState,
     pub network: network::NetworkState,
     pub dedup: dedup::DedupState,
     pub filter: ffi::filter::FilterState,
@@ -72,6 +74,7 @@ impl CoreContext {
             router: router::Router::new(),
             heartbeat: heartbeat::HeartbeatState::new(),
             discovery: discovery::DiscoveryState::new(),
+            audio: audio_stream::AudioStreamState::new(),
             network: network::NetworkState::new(),
             dedup: dedup::DedupState::new(),
             filter: ffi::filter::FilterState::new(),
