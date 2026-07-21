@@ -18,6 +18,7 @@ pub struct AudioStreamState {
     pub on_data: AudioDataCb,
     pub on_event: AudioEventCb,
     pub user_data: *mut c_void,
+    pub remote_uuid: String,
 }
 
 impl AudioStreamState {
@@ -32,6 +33,7 @@ impl AudioStreamState {
             on_data: None,
             on_event: None,
             user_data: std::ptr::null_mut(),
+            remote_uuid: String::new(),
         }
     }
 }
