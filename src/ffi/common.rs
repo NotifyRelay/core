@@ -8,23 +8,65 @@ use base64::Engine;
 
 type LogCb = extern "C" fn(i32, *const c_char);
 
+#[cfg(target_os = "android")]
+const ANDROID_LOG_DEBUG: i32 = 3;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_INFO: i32 = 4;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_WARN: i32 = 5;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_ERROR: i32 = 6;
+
+#[cfg(target_os = "android")]
+fn android_log_level(level: log::Level) -> i32 {
+    match level {
+        log::Level::Error => ANDROID_LOG_ERROR,
+        log::Level::Warn => ANDROID_LOG_WARN,
+        log::Level::Info => ANDROID_LOG_INFO,
+        _ => ANDROID_LOG_DEBUG,
+    }
+}
+
+#[cfg(target_os = "android")]
+#[link(name = "log")]
+extern "C" {
+    fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char) -> i32;
+}
+
 static LOG_CB: AtomicUsize = AtomicUsize::new(0);
 static LOG_INIT: Once = Once::new();
 
 struct PlatformLogBridge;
 
 impl log::Log for PlatformLogBridge {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if metadata.target().starts_with("mdns_sd") && metadata.level() <= log::Level::Debug {
+            return false;
+        }
         true
     }
     fn log(&self, record: &log::Record) {
-        let val = LOG_CB.load(Ordering::Relaxed);
-        if val == 0 {
+        if !self.enabled(record.metadata()) {
             return;
         }
-        let cb: LogCb = unsafe { std::mem::transmute(val) };
-        if let Ok(c_msg) = CString::new(format!("{}", record.args())) {
-            cb(record.level() as i32, c_msg.as_ptr());
+        #[cfg(target_os = "android")]
+        {
+            let tag = CString::new("NotifyRelayCore").unwrap();
+            let msg = CString::new(format!("{}", record.args())).unwrap();
+            unsafe {
+                __android_log_write(android_log_level(record.level()), tag.as_ptr(), msg.as_ptr());
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let val = LOG_CB.load(Ordering::Relaxed);
+            if val == 0 {
+                return;
+            }
+            let cb: LogCb = unsafe { std::mem::transmute(val) };
+            if let Ok(c_msg) = CString::new(format!("{}", record.args())) {
+                cb(record.level() as i32, c_msg.as_ptr());
+            }
         }
     }
     fn flush(&self) {}
@@ -34,17 +76,8 @@ static LOG_BRIDGE: PlatformLogBridge = PlatformLogBridge;
 
 pub fn init_log_bridge() {
     LOG_INIT.call_once(|| {
-        #[cfg(target_os = "android")]
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_tag("NotifyRelayCore")
-                .with_max_level(log::LevelFilter::Debug),
-        );
-        #[cfg(not(target_os = "android"))]
-        {
-            log::set_logger(&LOG_BRIDGE).ok();
-            log::set_max_level(log::LevelFilter::Debug);
-        }
+        log::set_logger(&LOG_BRIDGE).ok();
+        log::set_max_level(log::LevelFilter::Debug);
     });
 }
 
