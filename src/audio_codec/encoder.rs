@@ -1,22 +1,25 @@
 use ruopus::EncodeError;
 
 const OPUS_BITRATE: u32 = 64000;
-const OPUS_FRAME_SIZE: i32 = 960;
+const OPUS_FRAME_MS: i32 = 20;
 
 pub struct OpusEncoder {
     inner: ruopus::OpusEncoder,
     channels: i32,
     frame_size: i32,
+    sample_rate: i32,
 }
 
 impl OpusEncoder {
-    pub fn new(_sample_rate: i32, channels: i32) -> Result<Self, EncodeError> {
+    pub fn new(sample_rate: i32, channels: i32) -> Result<Self, EncodeError> {
+        let frame_size = (sample_rate * OPUS_FRAME_MS) / 1000;
         let mut inner = ruopus::OpusEncoder::new(channels as usize);
         inner.set_bitrate(Some(OPUS_BITRATE));
         Ok(Self {
             inner,
             channels,
-            frame_size: OPUS_FRAME_SIZE,
+            frame_size,
+            sample_rate,
         })
     }
 

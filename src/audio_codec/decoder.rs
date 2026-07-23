@@ -1,18 +1,21 @@
-const OPUS_FRAME_SIZE: i32 = 960;
+const OPUS_FRAME_MS: i32 = 20;
 
 pub struct OpusDecoder {
     inner: ruopus::OpusDecoder,
     channels: i32,
     frame_size: i32,
+    sample_rate: i32,
 }
 
 impl OpusDecoder {
-    pub fn new(_sample_rate: i32, channels: i32) -> Result<Self, ruopus::packet::PacketError> {
+    pub fn new(sample_rate: i32, channels: i32) -> Result<Self, ruopus::packet::PacketError> {
+        let frame_size = (sample_rate * OPUS_FRAME_MS) / 1000;
         let inner = ruopus::OpusDecoder::new(channels as usize);
         Ok(Self {
             inner,
             channels,
-            frame_size: OPUS_FRAME_SIZE,
+            frame_size,
+            sample_rate,
         })
     }
 
