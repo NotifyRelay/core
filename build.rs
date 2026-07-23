@@ -107,14 +107,14 @@ fn build_opus_for_android(ndk_home: &str, ninja_path: &str, abi: &str) -> std::i
         let search_path = format!("{home}/.cargo/registry/src");
         if let Ok(entries) = glob::glob(&format!("{search_path}/**/{pattern}")) {
             for entry in entries.flatten() {
-                let build_dir = entry.join("build");
+                let build_dir = entry.join(format!("build-{abi}"));
                 let lib_dir = build_dir.join("lib");
                 let lib_file = lib_dir.join("libopus.a");
 
                 if lib_file.exists() {
                     let lib_opus_dir = build_dir.to_string_lossy().to_string();
                     println!("cargo:rustc-env=LIBOPUS_LIB_DIR={lib_opus_dir}");
-                    println!("build.rs: using prebuilt opus: {lib_opus_dir}");
+                    println!("build.rs: using prebuilt opus for {abi}: {lib_opus_dir}");
                     return Ok(());
                 }
 
@@ -149,7 +149,7 @@ fn build_opus_for_android(ndk_home: &str, ninja_path: &str, abi: &str) -> std::i
                     std::fs::copy(&src_lib, &lib_file)?;
                     let lib_opus_dir = build_dir.to_string_lossy().to_string();
                     println!("cargo:rustc-env=LIBOPUS_LIB_DIR={lib_opus_dir}");
-                    println!("build.rs: built opus for android: {lib_opus_dir}");
+                    println!("build.rs: built opus for {abi}: {lib_opus_dir}");
                     return Ok(());
                 }
             }
