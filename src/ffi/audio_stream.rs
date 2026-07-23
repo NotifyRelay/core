@@ -141,14 +141,24 @@ pub unsafe extern "C" fn nrc_audio_write_frame(
 #[no_mangle]
 pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
     log::info!("音频流: nrc_audio_stop 开始停止");
-    with_ctx(ctx_ptr, |ctx| {
-        let ruuid = ctx.audio.remote_uuid.clone();
-        if !ruuid.is_empty() {
-            log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", ruuid);
-            send_control(ctx, &ruuid, "audioStop", 0, 0);
+
+    let ruuid = with_ctx(ctx_ptr, |ctx| {
+        let uuid = ctx.audio.remote_uuid.clone();
+        if !uuid.is_empty() {
+            log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
+            send_control(ctx, &uuid, "audioStop", 0, 0);
         }
-        audio_stream::stop(&mut ctx.audio);
+        uuid
     });
+
+    let thread_handle = with_ctx(ctx_ptr, |ctx| audio_stream::stop(&mut ctx.audio));
+
+    if let Some(h) = thread_handle {
+        log::info!("音频流: 等待读取线程退出");
+        h.join().ok();
+        log::info!("音频流: 读取线程已退出");
+    }
+
     log::info!("音频流: nrc_audio_stop 完成");
     0
 }

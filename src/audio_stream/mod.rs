@@ -458,12 +458,12 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn stop(state: &mut AudioStreamState) {
+pub(crate) fn stop(state: &mut AudioStreamState) -> Option<std::thread::JoinHandle<()>> {
     state.active.store(false, Ordering::SeqCst);
 
     drop(state.udp_socket.take());
 
-    state.thread_handle.take().map(|h| h.join());
+    let handle = state.thread_handle.take();
 
     let stats = state.stats.lock().unwrap();
     let elapsed = stats.start_time.elapsed().as_secs_f64();
@@ -508,4 +508,6 @@ pub(crate) fn stop(state: &mut AudioStreamState) {
     state.peer_ip.clear();
     state.peer_port = 0;
     log::info!("音频流: 已停止");
+
+    handle
 }
