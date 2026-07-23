@@ -24,6 +24,7 @@ pub struct AudioStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub opus_bytes_sent: u64,
+    pub opus_bytes_received: u64,
     pub start_time: Instant,
 }
 
@@ -36,6 +37,7 @@ impl AudioStats {
             bytes_sent: 0,
             bytes_received: 0,
             opus_bytes_sent: 0,
+            opus_bytes_received: 0,
             start_time: Instant::now(),
         }
     }
@@ -335,6 +337,11 @@ fn read_loop(
                             };
 
                             {
+                                let mut stats_guard = stats.lock().unwrap();
+                                stats_guard.opus_bytes_received += data.len() as u64;
+                            }
+
+                            {
                                 let mut queue_guard = pcm_queue.lock().unwrap();
                                 queue_guard.push_back(pcm);
                                 if queue_guard.len() > 50 {
@@ -519,14 +526,20 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
 
     if let Ok(stats) = state.stats.try_lock() {
         let elapsed = stats.start_time.elapsed().as_secs_f64();
-        let pcm_bytes = stats.packets_sent * 960 * 2 * 2;
-        let compression_ratio = if pcm_bytes > 0 {
-            pcm_bytes as f64 / stats.opus_bytes_sent as f64
+        let pcm_bytes_sent = stats.packets_sent * 960 * 2 * 2;
+        let pcm_bytes_received = stats.packets_received * 960 * 2 * 2;
+        let compression_ratio = if pcm_bytes_sent > 0 {
+            pcm_bytes_sent as f64 / stats.opus_bytes_sent as f64
         } else {
             0.0
         };
-        let actual_bitrate = if elapsed > 0.0 {
+        let send_bitrate = if elapsed > 0.0 {
             (stats.opus_bytes_sent * 8) as f64 / elapsed / 1000.0
+        } else {
+            0.0
+        };
+        let recv_bitrate = if elapsed > 0.0 {
+            (stats.opus_bytes_received * 8) as f64 / elapsed / 1000.0
         } else {
             0.0
         };
@@ -537,15 +550,18 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
         };
 
         log::info!(
-            "[音频流] 会话统计: 发送 {} 包, 接收 {} 包, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 实际比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
+            "[音频流] 会话统计: 发送 {} 包/{} KB, 接收 {} 包/{} KB, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 发送比特率 {:.1} kbps, 接收比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
             stats.packets_sent,
+            stats.opus_bytes_sent / 1024,
             stats.packets_received,
+            stats.opus_bytes_received / 1024,
             stats.packets_lost,
             loss_rate,
-            pcm_bytes as f64 / 1024.0 / 1024.0,
+            pcm_bytes_sent as f64 / 1024.0 / 1024.0,
             stats.opus_bytes_sent as f64 / 1024.0 / 1024.0,
             compression_ratio,
-            actual_bitrate,
+            send_bitrate,
+            recv_bitrate,
             elapsed,
         );
     }
