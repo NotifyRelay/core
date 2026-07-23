@@ -377,6 +377,10 @@ fn playback_loop(
     channels: i32,
     pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
 ) {
+    let frame_duration_us = (960 * 1_000_000) / sample_rate as u64;
+    let mut frame_count: u64 = 0;
+    let start_time = Instant::now();
+
     loop {
         if !active.load(Ordering::SeqCst) {
             break;
@@ -405,6 +409,13 @@ fn playback_loop(
                         channels,
                         user_data,
                     );
+                }
+
+                frame_count += 1;
+                let target_time = start_time + Duration::from_micros(frame_duration_us * frame_count);
+                let now = Instant::now();
+                if now < target_time {
+                    thread::sleep(target_time - now);
                 }
             }
             None => {
@@ -527,7 +538,7 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
     if let Ok(stats) = state.stats.try_lock() {
         let elapsed = stats.start_time.elapsed().as_secs_f64();
         let pcm_bytes_sent = stats.packets_sent * 960 * 2 * 2;
-        let pcm_bytes_received = stats.packets_received * 960 * 2 * 2;
+        let _pcm_bytes_received = stats.packets_received * 960 * 2 * 2;
         let compression_ratio = if pcm_bytes_sent > 0 {
             pcm_bytes_sent as f64 / stats.opus_bytes_sent as f64
         } else {
