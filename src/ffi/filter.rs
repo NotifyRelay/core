@@ -150,11 +150,7 @@ pub unsafe extern "C" fn nrc_check_filter_mode(
     } else {
         from_cstr(title)
     };
-    let text_str = if text.is_null() {
-        ""
-    } else {
-        from_cstr(text)
-    };
+    let text_str = if text.is_null() { "" } else { from_cstr(text) };
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
         Ok(g) => g,
@@ -189,11 +185,7 @@ pub unsafe extern "C" fn nrc_filter_notification(
     } else {
         from_cstr(title)
     };
-    let text_str = if text.is_null() {
-        ""
-    } else {
-        from_cstr(text)
-    };
+    let text_str = if text.is_null() { "" } else { from_cstr(text) };
 
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {

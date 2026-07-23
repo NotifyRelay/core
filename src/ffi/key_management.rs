@@ -36,7 +36,10 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn nrc_remove_device(ctx_ptr: *mut c_void, device_uuid: *const c_char) -> i32 {
+pub unsafe extern "C" fn nrc_remove_device(
+    ctx_ptr: *mut c_void,
+    device_uuid: *const c_char,
+) -> i32 {
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
         ctx.crypto.device_keys.remove(uuid);

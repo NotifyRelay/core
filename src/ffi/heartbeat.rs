@@ -132,8 +132,7 @@ pub unsafe extern "C" fn nrc_stop_offline_detector(ctx_ptr: *mut c_void) {
     if let Ok(mut guard) = ctx.lock() {
         if guard.offline_detector_handle != 0 {
             let boxed = Box::from_raw(
-                guard.offline_detector_handle
-                    as *mut std::sync::Arc<std::sync::atomic::AtomicBool>,
+                guard.offline_detector_handle as *mut std::sync::Arc<std::sync::atomic::AtomicBool>,
             );
             boxed.store(false, std::sync::atomic::Ordering::Relaxed);
             guard.offline_detector_handle = 0;
