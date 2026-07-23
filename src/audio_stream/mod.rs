@@ -270,6 +270,10 @@ fn read_loop(
                 }
 
                 loop {
+                    if !active.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     let (opus_data, lost_count) = {
                         let mut jitter_guard = jitter.lock().unwrap();
                         let jitter_buf = jitter_guard.as_mut().unwrap();
