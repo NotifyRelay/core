@@ -94,14 +94,14 @@ pub unsafe extern "C" fn nrc_audio_start(
     let mut start_ok = false;
 
     if !ctx_ptr.is_null() {
-        let ctx = &mut *(ctx_ptr as *mut SafeContext);
-        if let Ok(mut guard) = ctx.lock() {
-            let audio_state = &mut guard.audio.lock().unwrap();
+        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        if let Ok(guard) = ctx.lock() {
+            let mut audio_state = guard.audio.lock().unwrap();
             audio_state.remote_uuid = ruuid.clone();
             audio_state.peer_ip = ip.clone();
             start_ok = match dir.as_str() {
-                "send" => audio_stream::start_sender(audio_state, &ip, p, sample_rate, channels),
-                "recv" => audio_stream::start_receiver(audio_state, p, sample_rate, channels),
+                "send" => audio_stream::start_sender(&mut audio_state, &ip, p, sample_rate, channels),
+                "recv" => audio_stream::start_receiver(&mut audio_state, p, sample_rate, channels),
                 _ => {
                     log::error!("音频流 FFI: 未知方向 {dir}");
                     false
@@ -161,22 +161,22 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
         uuid
     });
 
-    let thread_handle = if !ctx_ptr.is_null() {
+    let thread_handles = if !ctx_ptr.is_null() {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
         if let Ok(guard) = ctx.lock() {
             let audio_state = &mut guard.audio.lock().unwrap();
             audio_stream::stop(audio_state)
         } else {
-            None
+            Vec::new()
         }
     } else {
-        None
+        Vec::new()
     };
 
-    if let Some(h) = thread_handle {
-        log::info!("音频流: 等待读取线程退出");
+    for h in thread_handles {
+        log::info!("音频流: 等待线程退出");
         h.join().ok();
-        log::info!("音频流: 读取线程已退出");
+        log::info!("音频流: 线程已退出");
     }
 
     log::info!("音频流: nrc_audio_stop 完成");

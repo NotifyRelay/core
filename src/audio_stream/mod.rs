@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +46,7 @@ pub struct AudioStreamState {
     pub sample_rate: i32,
     pub channels: i32,
     pub thread_handle: Option<thread::JoinHandle<()>>,
+    pub playback_handle: Option<thread::JoinHandle<()>>,
     pub on_data: AudioDataCb,
     pub on_event: AudioEventCb,
     pub user_data: *mut c_void,
@@ -60,6 +62,7 @@ pub struct AudioStreamState {
     pub rtp_ts: Arc<Mutex<u32>>,
     pub ssrc: u32,
     pub stats: Arc<Mutex<AudioStats>>,
+    pub pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
 }
 
 impl AudioStreamState {
@@ -69,6 +72,7 @@ impl AudioStreamState {
             sample_rate: 0,
             channels: 0,
             thread_handle: None,
+            playback_handle: None,
             on_data: None,
             on_event: None,
             user_data: std::ptr::null_mut(),
@@ -83,6 +87,7 @@ impl AudioStreamState {
             rtp_ts: Arc::new(Mutex::new(0)),
             ssrc: rand::random(),
             stats: Arc::new(Mutex::new(AudioStats::new())),
+            pcm_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -205,36 +210,44 @@ fn start_read_thread(state: &mut AudioStreamState) {
     let decoder = Arc::clone(&state.decoder);
     let jitter = Arc::clone(&state.jitter);
     let stats = Arc::clone(&state.stats);
+    let pcm_queue = Arc::clone(&state.pcm_queue);
 
+    let active_clone = Arc::clone(&active);
+    let pcm_queue_clone = Arc::clone(&pcm_queue);
     let handle = thread::spawn(move || {
-        let ud_ptr = ud as *mut c_void;
         log::info!("音频流: 读取线程已启动");
         read_loop(
             socket,
-            active,
+            active_clone,
             sample_rate,
             channels,
-            on_data,
-            ud_ptr,
             decoder,
             jitter,
             stats,
+            pcm_queue_clone,
         );
         log::info!("音频流: 读取线程已结束");
     });
     state.thread_handle = Some(handle);
+
+    let playback_handle = thread::spawn(move || {
+        let ud_ptr = ud as *mut c_void;
+        log::info!("音频流: 播放线程已启动");
+        playback_loop(active, on_data, ud_ptr, sample_rate, channels, pcm_queue);
+        log::info!("音频流: 播放线程已结束");
+    });
+    state.playback_handle = Some(playback_handle);
 }
 
 fn read_loop(
     socket: UdpSocket,
     active: Arc<AtomicBool>,
-    sample_rate: i32,
-    channels: i32,
-    on_data: AudioDataCb,
-    user_data: *mut c_void,
+    _sample_rate: i32,
+    _channels: i32,
     decoder: Arc<Mutex<Option<OpusDecoder>>>,
     jitter: Arc<Mutex<Option<JitterBuffer>>>,
     stats: Arc<Mutex<AudioStats>>,
+    pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
 ) {
     let mut buf = [0u8; 2048];
 
@@ -297,22 +310,12 @@ fn read_loop(
                                 }
                             };
 
-                            if let Some(cb) = on_data {
-                                let pcm_bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        pcm.as_ptr() as *const u8,
-                                        pcm.len() * std::mem::size_of::<i16>(),
-                                    )
-                                };
-                                let dev = std::ffi::CString::new("").unwrap();
-                                cb(
-                                    dev.as_ptr(),
-                                    pcm_bytes.as_ptr(),
-                                    pcm_bytes.len() as i32,
-                                    sample_rate,
-                                    channels,
-                                    user_data,
-                                );
+                            {
+                                let mut queue_guard = pcm_queue.lock().unwrap();
+                                queue_guard.push_back(pcm);
+                                if queue_guard.len() > 50 {
+                                    queue_guard.pop_front();
+                                }
                             }
                         }
                     }
@@ -331,22 +334,12 @@ fn read_loop(
                                 }
                             };
 
-                            if let Some(cb) = on_data {
-                                let pcm_bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        pcm.as_ptr() as *const u8,
-                                        pcm.len() * std::mem::size_of::<i16>(),
-                                    )
-                                };
-                                let dev = std::ffi::CString::new("").unwrap();
-                                cb(
-                                    dev.as_ptr(),
-                                    pcm_bytes.as_ptr(),
-                                    pcm_bytes.len() as i32,
-                                    sample_rate,
-                                    channels,
-                                    user_data,
-                                );
+                            {
+                                let mut queue_guard = pcm_queue.lock().unwrap();
+                                queue_guard.push_back(pcm);
+                                if queue_guard.len() > 50 {
+                                    queue_guard.pop_front();
+                                }
                             }
                         }
                         None => break,
@@ -367,6 +360,52 @@ fn read_loop(
     }
     active.store(false, Ordering::SeqCst);
     log::info!("音频流: 读取循环已退出");
+}
+
+fn playback_loop(
+    active: Arc<AtomicBool>,
+    on_data: AudioDataCb,
+    user_data: *mut c_void,
+    sample_rate: i32,
+    channels: i32,
+    pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
+) {
+    loop {
+        if !active.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let pcm = {
+            let mut queue_guard = pcm_queue.lock().unwrap();
+            queue_guard.pop_front()
+        };
+
+        match pcm {
+            Some(data) => {
+                if let Some(cb) = on_data {
+                    let pcm_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            data.as_ptr() as *const u8,
+                            data.len() * std::mem::size_of::<i16>(),
+                        )
+                    };
+                    let dev = std::ffi::CString::new("").unwrap();
+                    cb(
+                        dev.as_ptr(),
+                        pcm_bytes.as_ptr(),
+                        pcm_bytes.len() as i32,
+                        sample_rate,
+                        channels,
+                        user_data,
+                    );
+                }
+            }
+            None => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
+    }
 }
 
 pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
@@ -465,12 +504,18 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn stop(state: &mut AudioStreamState) -> Option<std::thread::JoinHandle<()>> {
+pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<()>> {
     state.active.store(false, Ordering::SeqCst);
 
     drop(state.udp_socket.take());
 
-    let handle = state.thread_handle.take();
+    let mut handles = Vec::new();
+    if let Some(h) = state.thread_handle.take() {
+        handles.push(h);
+    }
+    if let Some(h) = state.playback_handle.take() {
+        handles.push(h);
+    }
 
     if let Ok(stats) = state.stats.try_lock() {
         let elapsed = stats.start_time.elapsed().as_secs_f64();
@@ -509,6 +554,7 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Option<std::thread::JoinHand
     let _ = state.decoder.try_lock().map(|mut g| *g = None);
     let _ = state.jitter.try_lock().map(|mut g| *g = None);
     let _ = state.stats.try_lock().map(|mut g| *g = AudioStats::new());
+    let _ = state.pcm_queue.try_lock().map(|mut g| g.clear());
 
     state.on_data = None;
     state.on_event = None;
@@ -517,5 +563,5 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Option<std::thread::JoinHand
     state.peer_port = 0;
     log::info!("音频流: 已停止");
 
-    handle
+    handles
 }
