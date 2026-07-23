@@ -108,13 +108,30 @@ pub(crate) fn start_sender(
         return false;
     }
 
-    let socket = match UdpSocket::bind("0.0.0.0:0") {
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
         Ok(s) => s,
         Err(e) => {
             log::error!("音频流: 创建 UDP socket 失败: {e}");
             return false;
         }
     };
+
+    if let Err(e) = socket.set_reuse_address(true) {
+        log::warn!("音频流: 设置 SO_REUSEADDR 失败: {e}");
+    }
+
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let sock_addr: socket2::SockAddr = addr.into();
+    if let Err(e) = socket.bind(&sock_addr) {
+        log::error!("音频流: 绑定 UDP socket 失败: {e}");
+        return false;
+    }
+
+    let socket = UdpSocket::from(socket);
 
     let encoder = match OpusEncoder::new(sample_rate, channels) {
         Ok(e) => e,
@@ -158,13 +175,29 @@ pub(crate) fn start_receiver(
         }
     };
 
-    let socket = match UdpSocket::bind(&addr) {
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("音频流: 绑定端口 :{port} 失败: {e}");
+            log::error!("音频流: 创建 UDP socket 失败: {e}");
             return false;
         }
     };
+
+    if let Err(e) = socket.set_reuse_address(true) {
+        log::warn!("音频流: 设置 SO_REUSEADDR 失败: {e}");
+    }
+
+    let sock_addr: socket2::SockAddr = addr.into();
+    if let Err(e) = socket.bind(&sock_addr) {
+        log::error!("音频流: 绑定端口 :{port} 失败: {e}");
+        return false;
+    }
+
+    let socket = UdpSocket::from(socket);
 
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -654,13 +687,6 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
             elapsed,
         );
     }
-
-    let _ = state.encoder.try_lock().map(|mut g| *g = None);
-    let _ = state.decoder.try_lock().map(|mut g| *g = None);
-    let _ = state.jitter.try_lock().map(|mut g| *g = None);
-    let _ = state.stats.try_lock().map(|mut g| *g = AudioStats::new());
-    let _ = state.pcm_queue.try_lock().map(|mut g| g.clear());
-    let _ = state.pcm_buffer.try_lock().map(|mut g| g.clear());
 
     state.on_data = None;
     state.on_event = None;
