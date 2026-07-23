@@ -1,3 +1,4 @@
+pub mod audio_codec;
 pub mod audio_stream;
 mod crypto;
 mod dedup;

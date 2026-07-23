@@ -1,41 +1,46 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{SocketAddr, UdpSocket};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-fn bind_reusable(port: u16) -> Result<TcpListener, String> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", port)
-        .parse()
-        .map_err(|e| format!("地址解析失败: {}", e))?;
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )
-    .map_err(|e| format!("创建 socket 失败: {}", e))?;
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| format!("设置 SO_REUSEADDR 失败: {}", e))?;
-    socket
-        .bind(&socket2::SockAddr::from(addr))
-        .map_err(|e| format!("绑定端口 :{port} 失败: {}", e))?;
-    socket
-        .listen(1)
-        .map_err(|e| format!("监听失败: {}", e))?;
-    let listener = TcpListener::from(socket);
-    Ok(listener)
-}
+use bytes::Bytes;
+use rtp::header::Header;
+use rtp::packet::Packet;
+use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
+
+use crate::audio_codec::{JitterBuffer, OpusDecoder, OpusEncoder};
 
 pub type AudioDataCb = Option<extern "C" fn(*const c_char, *const u8, i32, i32, i32, *mut c_void)>;
 pub type AudioEventCb =
     Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>;
 
+pub struct AudioStats {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub packets_lost: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub opus_bytes_sent: u64,
+    pub start_time: Instant,
+}
+
+impl AudioStats {
+    pub fn new() -> Self {
+        Self {
+            packets_sent: 0,
+            packets_received: 0,
+            packets_lost: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            opus_bytes_sent: 0,
+            start_time: Instant::now(),
+        }
+    }
+}
+
 pub struct AudioStreamState {
-    pub listener: Option<TcpListener>,
-    pub stream_slot: Arc<Mutex<Option<TcpStream>>>,
     pub active: Arc<AtomicBool>,
     pub sample_rate: i32,
     pub channels: i32,
@@ -44,13 +49,22 @@ pub struct AudioStreamState {
     pub on_event: AudioEventCb,
     pub user_data: *mut c_void,
     pub remote_uuid: String,
+    pub peer_ip: String,
+    pub peer_port: u16,
+
+    pub udp_socket: Option<UdpSocket>,
+    pub encoder: Arc<Mutex<Option<OpusEncoder>>>,
+    pub decoder: Arc<Mutex<Option<OpusDecoder>>>,
+    pub jitter: Arc<Mutex<Option<JitterBuffer>>>,
+    pub rtp_seq: Arc<Mutex<u16>>,
+    pub rtp_ts: Arc<Mutex<u32>>,
+    pub ssrc: u32,
+    pub stats: Arc<Mutex<AudioStats>>,
 }
 
 impl AudioStreamState {
     pub fn new() -> Self {
         Self {
-            listener: None,
-            stream_slot: Arc::new(Mutex::new(None)),
             active: Arc::new(AtomicBool::new(false)),
             sample_rate: 0,
             channels: 0,
@@ -59,11 +73,20 @@ impl AudioStreamState {
             on_event: None,
             user_data: std::ptr::null_mut(),
             remote_uuid: String::new(),
+            peer_ip: String::new(),
+            peer_port: 0,
+            udp_socket: None,
+            encoder: Arc::new(Mutex::new(None)),
+            decoder: Arc::new(Mutex::new(None)),
+            jitter: Arc::new(Mutex::new(None)),
+            rtp_seq: Arc::new(Mutex::new(0)),
+            rtp_ts: Arc::new(Mutex::new(0)),
+            ssrc: rand::random(),
+            stats: Arc::new(Mutex::new(AudioStats::new())),
         }
     }
 }
 
-/// 连接接收端 :23335（用于推流或读取）
 pub(crate) fn start_sender(
     state: &mut AudioStreamState,
     ip: &str,
@@ -75,44 +98,38 @@ pub(crate) fn start_sender(
         log::warn!("音频流: 已在运行，无法重复启动发送端");
         return false;
     }
-    let addr = format!("{}:{}", ip, port);
-    let stream = match TcpStream::connect(&addr) {
+
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
-            log::error!("音频流: 连接对端 {addr} 失败: {e}");
+            log::error!("音频流: 创建 UDP socket 失败: {e}");
             return false;
         }
     };
+
+    let encoder = match OpusEncoder::new(sample_rate, channels) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("音频流: 创建 Opus 编码器失败: {e}");
+            return false;
+        }
+    };
+
     state.sample_rate = sample_rate;
     state.channels = channels;
-    let cloned = stream.try_clone().unwrap();
-    *state.stream_slot.lock().unwrap() = Some(cloned);
+    state.peer_ip = ip.to_string();
+    state.peer_port = port;
+    state.udp_socket = Some(socket);
+    *state.encoder.lock().unwrap() = Some(encoder);
     state.active.store(true, Ordering::SeqCst);
-    log::info!("音频流: 发送端已连接到 {addr}");
 
-    // 启动读取循环（接收端连接后也要读数据）
-    start_read_thread(state, stream);
+    let mut stats = state.stats.lock().unwrap();
+    *stats = AudioStats::new();
+
+    log::info!("音频流: 发送端已启动，对端 {ip}:{port}");
     true
 }
 
-/// 在独立线程中读取 PCM 数据并回调
-fn start_read_thread(state: &mut AudioStreamState, stream: TcpStream) {
-    let active = state.active.clone();
-    let sample_rate = state.sample_rate;
-    let channels = state.channels;
-    let on_data = state.on_data;
-    let ud = state.user_data as usize;
-
-    let handle = thread::spawn(move || {
-        let ud_ptr = ud as *mut c_void;
-        log::info!("音频流: 读取线程已启动");
-        read_loop(stream, active, sample_rate, channels, on_data, ud_ptr);
-        log::info!("音频流: 读取线程已结束");
-    });
-    state.thread_handle = Some(handle);
-}
-
-/// 接收端：监听 :23335，等待发送端连接
 pub(crate) fn start_receiver(
     state: &mut AudioStreamState,
     port: u16,
@@ -123,140 +140,368 @@ pub(crate) fn start_receiver(
         log::warn!("音频流: 已在运行，无法重复启动接收端");
         return false;
     }
-    let listener = match bind_reusable(port) {
-        Ok(l) => l,
+
+    let addr: SocketAddr = match format!("0.0.0.0:{}", port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            log::error!("音频流: 地址解析失败: {e}");
+            return false;
+        }
+    };
+
+    let socket = match UdpSocket::bind(&addr) {
+        Ok(s) => s,
         Err(e) => {
             log::error!("音频流: 绑定端口 :{port} 失败: {e}");
             return false;
         }
     };
+
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+
+    let decoder = match OpusDecoder::new(sample_rate, channels) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("音频流: 创建 Opus 解码器失败: {e}");
+            return false;
+        }
+    };
+
     state.sample_rate = sample_rate;
     state.channels = channels;
-    state.listener = Some(listener);
+    state.udp_socket = Some(socket);
+    *state.decoder.lock().unwrap() = Some(decoder);
+    *state.jitter.lock().unwrap() = Some(JitterBuffer::new());
     state.active.store(true, Ordering::SeqCst);
-    log::info!("音频流: 正在监听端口 :{port}");
+
+    {
+        let mut stats = state.stats.lock().unwrap();
+        *stats = AudioStats::new();
+    }
+
+    log::info!("音频流: 接收端已启动，监听 :{port}");
+
+    start_read_thread(state);
     true
 }
 
-/// 独立线程等待连接 → 连接后仅存储 stream（发送方写数据用）
-/// 使用非阻塞 accept + active 轮询，确保 stop 能正常 join
-pub(crate) fn start_accept_thread(state: &mut AudioStreamState) {
-    let listener = match state.listener.as_ref() {
-        Some(l) => l.try_clone().unwrap(),
+fn start_read_thread(state: &mut AudioStreamState) {
+    let socket = match state.udp_socket.as_ref() {
+        Some(s) => s.try_clone().unwrap(),
         None => return,
     };
-    let stream_slot = state.stream_slot.clone();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+
     let active = state.active.clone();
+    let sample_rate = state.sample_rate;
+    let channels = state.channels;
+    let on_data = state.on_data;
+    let ud = state.user_data as usize;
+
+    let decoder = Arc::clone(&state.decoder);
+    let jitter = Arc::clone(&state.jitter);
+    let stats = Arc::clone(&state.stats);
 
     let handle = thread::spawn(move || {
-        listener.set_nonblocking(true).ok();
-        log::info!("音频流: 等待对端连接...");
-        loop {
-            if !active.load(Ordering::SeqCst) {
-                break;
-            }
-            match listener.accept() {
-                Ok((stream, addr)) => {
-                    log::info!("音频流: 对端已连接 {addr}");
-                    stream.set_nonblocking(false).ok();
-                    if let Ok(cloned) = stream.try_clone() {
-                        *stream_slot.lock().unwrap() = Some(cloned);
-                    }
-                    break;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("音频流: 接受连接失败: {e}");
-                    break;
-                }
-            }
-        }
+        let ud_ptr = ud as *mut c_void;
+        log::info!("音频流: 读取线程已启动");
+        read_loop(
+            socket,
+            active,
+            sample_rate,
+            channels,
+            on_data,
+            ud_ptr,
+            decoder,
+            jitter,
+            stats,
+        );
+        log::info!("音频流: 读取线程已结束");
     });
     state.thread_handle = Some(handle);
 }
 
-/// 读取循环：读帧长(4B BE)→读PCM→回调
 fn read_loop(
-    mut stream: TcpStream,
+    socket: UdpSocket,
     active: Arc<AtomicBool>,
     sample_rate: i32,
     channels: i32,
     on_data: AudioDataCb,
     user_data: *mut c_void,
+    decoder: Arc<Mutex<Option<OpusDecoder>>>,
+    jitter: Arc<Mutex<Option<JitterBuffer>>>,
+    stats: Arc<Mutex<AudioStats>>,
 ) {
-    let mut len_buf = [0u8; 4];
+    let mut buf = [0u8; 2048];
+
     loop {
         if !active.load(Ordering::SeqCst) {
             break;
         }
-        if stream.read_exact(&mut len_buf).is_err() {
-            break;
-        }
-        let frame_len = u32::from_be_bytes(len_buf) as usize;
-        let mut pcm = vec![0u8; frame_len];
-        if stream.read_exact(&mut pcm).is_err() {
-            break;
-        }
-        if !active.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Some(cb) = on_data {
-            let dev = std::ffi::CString::new("").unwrap();
-            cb(
-                dev.as_ptr(),
-                pcm.as_ptr(),
-                frame_len as i32,
-                sample_rate,
-                channels,
-                user_data,
-            );
+
+        match socket.recv_from(&mut buf) {
+            Ok((n, _src)) => {
+                let mut data = &buf[..n];
+                let pkt = match Packet::unmarshal(&mut data) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::debug!("音频流: RTP 解包失败: {e}");
+                        continue;
+                    }
+                };
+
+                let seq = pkt.header.sequence_number;
+                let payload = pkt.payload.to_vec();
+
+                {
+                    let mut jitter_guard = jitter.lock().unwrap();
+                    let jitter_buf = jitter_guard.as_mut().unwrap();
+                    jitter_buf.push(seq, payload);
+                }
+
+                {
+                    let mut stats_guard = stats.lock().unwrap();
+                    stats_guard.packets_received += 1;
+                    stats_guard.bytes_received += n as u64;
+                }
+
+                loop {
+                    let (opus_data, lost_count) = {
+                        let mut jitter_guard = jitter.lock().unwrap();
+                        let jitter_buf = jitter_guard.as_mut().unwrap();
+                        jitter_buf.pop_with_gap()
+                    };
+
+                    if lost_count > 0 {
+                        let mut stats_guard = stats.lock().unwrap();
+                        stats_guard.packets_lost += lost_count;
+
+                        for _ in 0..lost_count {
+                            let pcm = {
+                                let mut decoder_guard = decoder.lock().unwrap();
+                                let dec = decoder_guard.as_mut().unwrap();
+                                match dec.decode_loss() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        log::warn!("音频流: Opus PLC 失败: {e}");
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            if let Some(cb) = on_data {
+                                let pcm_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        pcm.as_ptr() as *const u8,
+                                        pcm.len() * std::mem::size_of::<i16>(),
+                                    )
+                                };
+                                let dev = std::ffi::CString::new("").unwrap();
+                                cb(
+                                    dev.as_ptr(),
+                                    pcm_bytes.as_ptr(),
+                                    pcm_bytes.len() as i32,
+                                    sample_rate,
+                                    channels,
+                                    user_data,
+                                );
+                            }
+                        }
+                    }
+
+                    match opus_data {
+                        Some(data) => {
+                            let pcm = {
+                                let mut decoder_guard = decoder.lock().unwrap();
+                                let dec = decoder_guard.as_mut().unwrap();
+                                match dec.decode(&data) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        log::warn!("音频流: Opus 解码失败: {e}");
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            if let Some(cb) = on_data {
+                                let pcm_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        pcm.as_ptr() as *const u8,
+                                        pcm.len() * std::mem::size_of::<i16>(),
+                                    )
+                                };
+                                let dev = std::ffi::CString::new("").unwrap();
+                                cb(
+                                    dev.as_ptr(),
+                                    pcm_bytes.as_ptr(),
+                                    pcm_bytes.len() as i32,
+                                    sample_rate,
+                                    channels,
+                                    user_data,
+                                );
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => {
+                log::error!("音频流: UDP 接收失败: {e}");
+                break;
+            }
         }
     }
     active.store(false, Ordering::SeqCst);
     log::info!("音频流: 读取循环已退出");
 }
 
-/// 写入一帧 PCM（发送端调用）
 pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     if !state.active.load(Ordering::SeqCst) {
         return false;
     }
-    let mut guard = match state.stream_slot.lock() {
+
+    let pcm: Vec<i16> = pcm_data
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    let mut encoder_guard = match state.encoder.lock() {
         Ok(g) => g,
         Err(_) => return false,
     };
-    let stream = match guard.as_mut() {
+    let encoder = match encoder_guard.as_mut() {
+        Some(e) => e,
+        None => return false,
+    };
+
+    let opus_data = match encoder.encode(&pcm) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("音频流: Opus 编码失败: {e}");
+            return false;
+        }
+    };
+
+    let socket = match state.udp_socket.as_ref() {
         Some(s) => s,
         None => return false,
     };
-    let len_be = (pcm_data.len() as u32).to_be_bytes();
-    if stream.write_all(&len_be).is_err() {
-        return false;
-    }
-    if stream.write_all(pcm_data).is_err() {
-        return false;
-    }
-    true
-}
 
-/// 停止
-pub(crate) fn stop(state: &mut AudioStreamState) {
-    state.active.store(false, Ordering::SeqCst);
-    // 先关 listener 让 accept 线程退出
-    drop(state.listener.take());
-    // 关 stream 让 read_loop 退出
-    if let Ok(mut guard) = state.stream_slot.lock() {
-        if let Some(stream) = guard.take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+    let peer_addr = SocketAddr::new(
+        match state.peer_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        },
+        state.peer_port,
+    );
+
+    let mut seq_guard = state.rtp_seq.lock().unwrap();
+    let seq = *seq_guard;
+    *seq_guard = seq.wrapping_add(1);
+
+    let mut ts_guard = state.rtp_ts.lock().unwrap();
+    let ts = *ts_guard;
+    *ts_guard += encoder.frame_size() as u32;
+
+    let ssrc = state.ssrc;
+
+    let pkt = Packet {
+        header: Header {
+            version: 2,
+            marker: false,
+            payload_type: 97,
+            sequence_number: seq,
+            timestamp: ts,
+            ssrc,
+            csrc: vec![],
+            padding: false,
+            extension: false,
+            extension_profile: 0,
+            extensions: vec![],
+            extensions_padding: 0,
+        },
+        payload: Bytes::from(opus_data.clone()),
+    };
+
+    let mut rtp_buf = vec![0u8; pkt.marshal_size()];
+    if pkt.marshal_to(&mut rtp_buf).is_err() {
+        log::warn!("音频流: RTP 打包失败");
+        return false;
+    }
+
+    match socket.send_to(&rtp_buf, &peer_addr) {
+        Ok(n) => {
+            let mut stats = state.stats.lock().unwrap();
+            stats.packets_sent += 1;
+            stats.bytes_sent += n as u64;
+            stats.opus_bytes_sent += opus_data.len() as u64;
+            true
+        }
+        Err(e) => {
+            log::warn!("音频流: UDP 发送失败: {e}");
+            false
         }
     }
+}
+
+pub(crate) fn stop(state: &mut AudioStreamState) {
+    state.active.store(false, Ordering::SeqCst);
+
+    drop(state.udp_socket.take());
+
     state.thread_handle.take().map(|h| h.join());
-    // 清空回调防止残留
+
+    let stats = state.stats.lock().unwrap();
+    let elapsed = stats.start_time.elapsed().as_secs_f64();
+    let pcm_bytes = stats.packets_sent * 960 * 2 * 2;
+    let compression_ratio = if pcm_bytes > 0 {
+        pcm_bytes as f64 / stats.opus_bytes_sent as f64
+    } else {
+        0.0
+    };
+    let actual_bitrate = if elapsed > 0.0 {
+        (stats.opus_bytes_sent * 8) as f64 / elapsed / 1000.0
+    } else {
+        0.0
+    };
+    let loss_rate = if stats.packets_received > 0 {
+        (stats.packets_lost as f64 / stats.packets_received as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    log::info!(
+        "[音频流] 会话统计: 发送 {} 包, 接收 {} 包, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 实际比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
+        stats.packets_sent,
+        stats.packets_received,
+        stats.packets_lost,
+        loss_rate,
+        pcm_bytes as f64 / 1024.0 / 1024.0,
+        stats.opus_bytes_sent as f64 / 1024.0 / 1024.0,
+        compression_ratio,
+        actual_bitrate,
+        elapsed,
+    );
+
+    *state.encoder.lock().unwrap() = None;
+    *state.decoder.lock().unwrap() = None;
+    *state.jitter.lock().unwrap() = None;
+    *state.stats.lock().unwrap() = AudioStats::new();
+
     state.on_data = None;
     state.on_event = None;
     state.remote_uuid.clear();
+    state.peer_ip.clear();
+    state.peer_port = 0;
     log::info!("音频流: 已停止");
 }

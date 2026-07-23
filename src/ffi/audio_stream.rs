@@ -4,7 +4,6 @@ use super::common::{from_cstr, with_ctx};
 use crate::{audio_stream, crypto::aes, network, protocol::codec};
 use base64::Engine;
 
-/// 通过 oneshot TCP 连接发送 DATA_MEDIA_CONTROL 消息（与发送队列一致）
 fn send_control(
     ctx: &crate::CoreContext,
     remote_uuid: &str,
@@ -19,7 +18,7 @@ fn send_control(
     );
     let payload = if action == "audioStart" {
         format!(
-            r#"{{"type":"MEDIA_CONTROL","action":"{}","sampleRate":{},"channels":{}}}"#,
+            r#"{{"type":"MEDIA_CONTROL","action":"{}","sampleRate":{},"channels":{},"codec":"opus"}}"#,
             action, sample_rate, channels
         )
     } else {
@@ -51,12 +50,8 @@ fn send_control(
 
     if let Ok(encrypted) = aes::encrypt(&key_arr, payload.as_bytes()) {
         let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, "", &encrypted);
-        let ip = ctx
-            .device_ips
-            .lock()
-            .ok()
-            .and_then(|ips| ips.get(remote_uuid).cloned())
-            .unwrap_or_default();
+        let ip = ctx.audio.peer_ip.clone();
+
         if !ip.is_empty() && ip != "0.0.0.0" {
             if network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000) {
                 log::info!("音频流: 已发送控制消息 action={}", action);
@@ -99,15 +94,10 @@ pub unsafe extern "C" fn nrc_audio_start(
     let start_ok = with_ctx(ctx_ptr, |ctx| -> bool {
         let state = &mut ctx.audio;
         state.remote_uuid = ruuid.clone();
+        state.peer_ip = ip.clone();
         match dir.as_str() {
-            "send" => {
-                let ok = audio_stream::start_receiver(state, p, sample_rate, channels);
-                if ok {
-                    audio_stream::start_accept_thread(state);
-                }
-                ok
-            }
-            "recv" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
+            "send" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
+            "recv" => audio_stream::start_receiver(state, p, sample_rate, channels),
             _ => {
                 log::error!("音频流 FFI: 未知方向 {dir}");
                 false
@@ -117,7 +107,6 @@ pub unsafe extern "C" fn nrc_audio_start(
 
     if start_ok {
         log::info!("音频流: nrc_audio_start 成功");
-        // 启动成功后发控制消息
         if dir == "send" {
             with_ctx(ctx_ptr, |ctx| {
                 send_control(ctx, &ruuid, "audioStart", sample_rate, channels);

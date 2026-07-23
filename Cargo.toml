@@ -23,5 +23,13 @@ log = "0.4"
 libc = "0.2"
 mdns-sd = "0.12"
 socket2 = "0.5"
+opus = "0.3"
+rtp = "0.14"
+bytes = "1"
+webrtc-util = "0.12"
+
+[build-dependencies]
+glob = "0.3"
+regex = "1"
 
 
