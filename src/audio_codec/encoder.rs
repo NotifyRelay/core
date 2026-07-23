@@ -1,4 +1,4 @@
-use opus::{Application, Bitrate, Channels, Encoder as OpusEncoderInner, Error};
+use ruopus::{Encoder as OpusEncoderInner, Channels, Application};
 
 const OPUS_BITRATE: i32 = 64000;
 const OPUS_FRAME_SIZE: i32 = 960;
@@ -11,8 +11,8 @@ pub struct OpusEncoder {
 }
 
 impl OpusEncoder {
-    pub fn new(sample_rate: i32, channels: i32) -> Result<Self, Error> {
-        let mut inner = OpusEncoderInner::new(
+    pub fn new(sample_rate: i32, channels: i32) -> Result<Self, ruopus::Error> {
+        let inner = OpusEncoderInner::new(
             sample_rate as u32,
             if channels == 1 {
                 Channels::Mono
@@ -21,8 +21,6 @@ impl OpusEncoder {
             },
             Application::Audio,
         )?;
-        inner.set_bitrate(Bitrate::Bits(OPUS_BITRATE))?;
-        inner.set_complexity(OPUS_COMPLEXITY)?;
         Ok(Self {
             inner,
             channels,
@@ -30,8 +28,7 @@ impl OpusEncoder {
         })
     }
 
-    pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, Error> {
-        let mut output = vec![0u8; 2048];
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, ruopus::Error> {
         let frame_samples = self.frame_size as usize * self.channels as usize;
 
         let chunk = if pcm.len() >= frame_samples {
@@ -44,6 +41,7 @@ impl OpusEncoder {
             return Ok(Vec::new());
         }
 
+        let mut output = vec![0u8; 2048];
         let len = self.inner.encode(chunk, &mut output)?;
         Ok(output[..len].to_vec())
     }
