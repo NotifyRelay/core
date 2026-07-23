@@ -65,6 +65,7 @@ pub struct AudioStreamState {
     pub ssrc: u32,
     pub stats: Arc<Mutex<AudioStats>>,
     pub pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
+    pub pcm_buffer: Arc<Mutex<Vec<i16>>>,
 }
 
 impl AudioStreamState {
@@ -90,6 +91,7 @@ impl AudioStreamState {
             ssrc: rand::random(),
             stats: Arc::new(Mutex::new(AudioStats::new())),
             pcm_queue: Arc::new(Mutex::new(VecDeque::new())),
+            pcm_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -234,6 +236,22 @@ fn start_read_thread(state: &mut AudioStreamState) {
 
     let playback_handle = thread::spawn(move || {
         let ud_ptr = ud as *mut c_void;
+
+        let mut wait_count = 0;
+        while active.load(Ordering::SeqCst) {
+            if let Ok(queue_guard) = pcm_queue.lock() {
+                if queue_guard.len() >= 3 {
+                    break;
+                }
+            }
+            wait_count += 1;
+            thread::sleep(Duration::from_millis(5));
+            if wait_count > 200 {
+                log::warn!("音频流: 等待预填充超时，直接启动播放");
+                break;
+            }
+        }
+
         log::info!("音频流: 播放线程已启动");
         playback_loop(active, on_data, ud_ptr, sample_rate, channels, pcm_queue);
         log::info!("音频流: 播放线程已结束");
@@ -380,7 +398,7 @@ fn playback_loop(
     let frame_samples = (sample_rate * 20) / 1000;
     let frame_duration_us = (frame_samples as u64 * 1_000_000) / sample_rate as u64;
     let mut frame_count: u64 = 0;
-    let start_time = Instant::now();
+    let mut start_time = Instant::now();
 
     loop {
         if !active.load(Ordering::SeqCst) {
@@ -415,7 +433,13 @@ fn playback_loop(
                 frame_count += 1;
                 let target_time = start_time + Duration::from_micros(frame_duration_us * frame_count);
                 let now = Instant::now();
-                if now < target_time {
+
+                let lag_us = now.duration_since(target_time).as_micros() as i64;
+                if lag_us > 50_000 {
+                    log::debug!("音频流: 播放落后 {}ms，重置定时器", lag_us / 1000);
+                    start_time = now;
+                    frame_count = 1;
+                } else if now < target_time {
                     thread::sleep(target_time - now);
                 }
             }
@@ -437,90 +461,135 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let mut encoder_guard = match state.encoder.try_lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let encoder = match encoder_guard.as_mut() {
-        Some(e) => e,
-        None => return false,
-    };
-
-    let opus_data = match encoder.encode(&pcm) {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("音频流: Opus 编码失败: {e}");
-            return false;
-        }
-    };
-
-    let socket = match state.udp_socket.as_ref() {
-        Some(s) => s,
-        None => return false,
-    };
-
-    let peer_addr = SocketAddr::new(
-        match state.peer_ip.parse() {
-            Ok(ip) => ip,
+    let frame_samples = {
+        let encoder_guard = match state.encoder.try_lock() {
+            Ok(g) => g,
             Err(_) => return false,
-        },
-        state.peer_port,
-    );
+        };
+        let encoder = match encoder_guard.as_ref() {
+            Some(e) => e,
+            None => return false,
+        };
+        encoder.frame_size() as usize * encoder.channels() as usize
+    };
 
-    let mut seq_guard = match state.rtp_seq.try_lock() {
+    let mut buffer_guard = match state.pcm_buffer.try_lock() {
         Ok(g) => g,
         Err(_) => return false,
     };
-    let seq = *seq_guard;
-    *seq_guard = seq.wrapping_add(1);
+    buffer_guard.extend_from_slice(&pcm);
 
-    let mut ts_guard = match state.rtp_ts.try_lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let ts = *ts_guard;
-    *ts_guard += encoder.frame_size() as u32;
+    let mut result = true;
+    while buffer_guard.len() >= frame_samples {
+        let frame_data = buffer_guard.drain(..frame_samples).collect::<Vec<_>>();
+        drop(buffer_guard);
 
-    let ssrc = state.ssrc;
+        let mut encoder_guard = match state.encoder.try_lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let encoder = match encoder_guard.as_mut() {
+            Some(e) => e,
+            None => return false,
+        };
 
-    let pkt = Packet {
-        header: Header {
-            version: 2,
-            marker: false,
-            payload_type: 97,
-            sequence_number: seq,
-            timestamp: ts,
-            ssrc,
-            csrc: vec![],
-            padding: false,
-            extension: false,
-            extension_profile: 0,
-            extensions: vec![],
-            extensions_padding: 0,
-        },
-        payload: Bytes::from(opus_data.clone()),
-    };
-
-    let mut rtp_buf = vec![0u8; pkt.marshal_size()];
-    if pkt.marshal_to(&mut rtp_buf).is_err() {
-        log::warn!("音频流: RTP 打包失败");
-        return false;
-    }
-
-    match socket.send_to(&rtp_buf, &peer_addr) {
-        Ok(n) => {
-            if let Ok(mut stats) = state.stats.try_lock() {
-                stats.packets_sent += 1;
-                stats.bytes_sent += n as u64;
-                stats.opus_bytes_sent += opus_data.len() as u64;
+        let opus_data = match encoder.encode(&frame_data) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("音频流: Opus 编码失败: {e}");
+                result = false;
+                break;
             }
-            true
+        };
+
+        let socket = match state.udp_socket.as_ref() {
+            Some(s) => s,
+            None => {
+                result = false;
+                break;
+            }
+        };
+
+        let peer_addr = SocketAddr::new(
+            match state.peer_ip.parse() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    result = false;
+                    break;
+                }
+            },
+            state.peer_port,
+        );
+
+        let mut seq_guard = match state.rtp_seq.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                result = false;
+                break;
+            }
+        };
+        let seq = *seq_guard;
+        *seq_guard = seq.wrapping_add(1);
+
+        let mut ts_guard = match state.rtp_ts.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                result = false;
+                break;
+            }
+        };
+        let ts = *ts_guard;
+        *ts_guard += encoder.frame_size() as u32;
+
+        let ssrc = state.ssrc;
+
+        let pkt = Packet {
+            header: Header {
+                version: 2,
+                marker: false,
+                payload_type: 97,
+                sequence_number: seq,
+                timestamp: ts,
+                ssrc,
+                csrc: vec![],
+                padding: false,
+                extension: false,
+                extension_profile: 0,
+                extensions: vec![],
+                extensions_padding: 0,
+            },
+            payload: Bytes::from(opus_data.clone()),
+        };
+
+        let mut rtp_buf = vec![0u8; pkt.marshal_size()];
+        if pkt.marshal_to(&mut rtp_buf).is_err() {
+            log::warn!("音频流: RTP 打包失败");
+            result = false;
+            break;
         }
-        Err(e) => {
-            log::warn!("音频流: UDP 发送失败: {e}");
-            false
+
+        match socket.send_to(&rtp_buf, &peer_addr) {
+            Ok(n) => {
+                if let Ok(mut stats) = state.stats.try_lock() {
+                    stats.packets_sent += 1;
+                    stats.bytes_sent += n as u64;
+                    stats.opus_bytes_sent += opus_data.len() as u64;
+                }
+            }
+            Err(e) => {
+                log::warn!("音频流: UDP 发送失败: {e}");
+                result = false;
+                break;
+            }
         }
+
+        buffer_guard = match state.pcm_buffer.try_lock() {
+            Ok(g) => g,
+            Err(_) => return result,
+        };
     }
+
+    result
 }
 
 pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<()>> {
@@ -591,6 +660,7 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
     let _ = state.jitter.try_lock().map(|mut g| *g = None);
     let _ = state.stats.try_lock().map(|mut g| *g = AudioStats::new());
     let _ = state.pcm_queue.try_lock().map(|mut g| g.clear());
+    let _ = state.pcm_buffer.try_lock().map(|mut g| g.clear());
 
     state.on_data = None;
     state.on_event = None;

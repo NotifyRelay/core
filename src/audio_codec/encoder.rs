@@ -47,4 +47,8 @@ impl OpusEncoder {
     pub fn bitrate(&self) -> i32 {
         OPUS_BITRATE as i32
     }
+
+    pub fn channels(&self) -> i32 {
+        self.channels
+    }
 }
