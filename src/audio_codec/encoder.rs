@@ -34,7 +34,7 @@ impl OpusEncoder {
         }
 
         let pcm_f32: Vec<f32> = chunk.iter().map(|&x| x as f32 / 32768.0).collect();
-        self.inner.encode_auto(&pcm_f32, 2048)
+        self.inner.encode_auto(&pcm_f32, 1275)
     }
 
     pub fn frame_size(&self) -> i32 {
