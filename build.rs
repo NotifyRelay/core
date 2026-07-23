@@ -1,4 +1,5 @@
 fn main() {
+    setup_android_cmake_toolchain();
     fix_audiopus_cmake();
 
     let hash = std::process::Command::new("git")
@@ -26,6 +27,49 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/refs/tags");
+}
+
+fn setup_android_cmake_toolchain() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !target.starts_with("aarch64-linux-android") && !target.starts_with("x86_64-linux-android") {
+        return;
+    }
+
+    let ndk_home = match std::env::var("ANDROID_NDK_HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            if let Ok(sdk_home) = std::env::var("ANDROID_HOME") {
+                let ndk_path = format!("{sdk_home}/ndk");
+                if std::path::Path::new(&ndk_path).exists() {
+                    if let Ok(entries) = std::fs::read_dir(&ndk_path) {
+                        if let Some(entry) = entries.filter_map(|e| e.ok()).next() {
+                            entry.path().to_string_lossy().to_string()
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+    };
+
+    let toolchain_path = format!("{ndk_home}/build/cmake/android.toolchain.cmake");
+    if std::path::Path::new(&toolchain_path).exists() {
+        println!("cargo:rustc-env=CMAKE_TOOLCHAIN_FILE={toolchain_path}");
+        println!("build.rs: set CMAKE_TOOLCHAIN_FILE for Android target: {toolchain_path}");
+    }
+
+    let ninja_path = format!("{ndk_home}/prebuilt/windows-x86_64/bin/ninja.exe");
+    if std::path::Path::new(&ninja_path).exists() {
+        println!("cargo:rustc-env=CMAKE_MAKE_PROGRAM={ninja_path}");
+        println!("build.rs: set CMAKE_MAKE_PROGRAM for Android target: {ninja_path}");
+    }
 }
 
 fn fix_audiopus_cmake() {
