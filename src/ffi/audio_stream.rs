@@ -1,7 +1,7 @@
 use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, with_ctx};
-use crate::{audio_stream, crypto::aes, network, protocol::codec};
+use crate::{audio_stream, crypto::aes, network, protocol::codec, SafeContext};
 use base64::Engine;
 
 fn send_control(
@@ -50,7 +50,7 @@ fn send_control(
 
     if let Ok(encrypted) = aes::encrypt(&key_arr, payload.as_bytes()) {
         let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, "", &encrypted);
-        let ip = ctx.audio.peer_ip.clone();
+        let ip = ctx.audio.lock().unwrap().peer_ip.clone();
 
         if !ip.is_empty() && ip != "0.0.0.0" {
             if network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000) {
@@ -91,19 +91,24 @@ pub unsafe extern "C" fn nrc_audio_start(
         ruuid
     );
 
-    let start_ok = with_ctx(ctx_ptr, |ctx| -> bool {
-        let state = &mut ctx.audio;
-        state.remote_uuid = ruuid.clone();
-        state.peer_ip = ip.clone();
-        match dir.as_str() {
-            "send" => audio_stream::start_sender(state, &ip, p, sample_rate, channels),
-            "recv" => audio_stream::start_receiver(state, p, sample_rate, channels),
-            _ => {
-                log::error!("音频流 FFI: 未知方向 {dir}");
-                false
-            }
+    let mut start_ok = false;
+
+    if !ctx_ptr.is_null() {
+        let ctx = &mut *(ctx_ptr as *mut SafeContext);
+        if let Ok(mut guard) = ctx.lock() {
+            let audio_state = &mut guard.audio.lock().unwrap();
+            audio_state.remote_uuid = ruuid.clone();
+            audio_state.peer_ip = ip.clone();
+            start_ok = match dir.as_str() {
+                "send" => audio_stream::start_sender(audio_state, &ip, p, sample_rate, channels),
+                "recv" => audio_stream::start_receiver(audio_state, p, sample_rate, channels),
+                _ => {
+                    log::error!("音频流 FFI: 未知方向 {dir}");
+                    false
+                }
+            };
         }
-    });
+    }
 
     if start_ok {
         log::info!("音频流: nrc_audio_start 成功");
@@ -129,21 +134,26 @@ pub unsafe extern "C" fn nrc_audio_write_frame(
         return -1;
     }
     let pcm = std::slice::from_raw_parts(pcm_data, pcm_len as usize);
-    with_ctx(ctx_ptr, |ctx| {
-        if audio_stream::write_frame(&ctx.audio, pcm) {
-            0
-        } else {
-            -1
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+    let ctx = &mut *(ctx_ptr as *mut SafeContext);
+    if let Ok(guard) = ctx.lock() {
+        if let Ok(audio_state) = guard.audio.try_lock() {
+            if audio_stream::write_frame(&audio_state, pcm) {
+                return 0;
+            }
         }
-    })
+    }
+    -1
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
     log::info!("音频流: nrc_audio_stop 开始停止");
 
-    let ruuid = with_ctx(ctx_ptr, |ctx| {
-        let uuid = ctx.audio.remote_uuid.clone();
+    let _ruuid = with_ctx(ctx_ptr, |ctx| {
+        let uuid = ctx.audio.lock().unwrap().remote_uuid.clone();
         if !uuid.is_empty() {
             log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
             send_control(ctx, &uuid, "audioStop", 0, 0);
@@ -151,7 +161,17 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
         uuid
     });
 
-    let thread_handle = with_ctx(ctx_ptr, |ctx| audio_stream::stop(&mut ctx.audio));
+    let thread_handle = if !ctx_ptr.is_null() {
+        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        if let Ok(guard) = ctx.lock() {
+            let audio_state = &mut guard.audio.lock().unwrap();
+            audio_stream::stop(audio_state)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     if let Some(h) = thread_handle {
         log::info!("音频流: 等待读取线程退出");
@@ -165,15 +185,18 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn nrc_audio_is_active(ctx_ptr: *mut c_void) -> i32 {
-    with_ctx(ctx_ptr, |ctx| {
-        let active = ctx.audio.active.load(std::sync::atomic::Ordering::SeqCst);
-        log::debug!("音频流: 查询活跃状态={}", active);
-        if active {
-            1
-        } else {
-            0
+    if ctx_ptr.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    if let Ok(guard) = ctx.lock() {
+        if let Ok(audio_state) = guard.audio.try_lock() {
+            let active = audio_state.active.load(std::sync::atomic::Ordering::SeqCst);
+            log::debug!("音频流: 查询活跃状态={}", active);
+            return if active { 1 } else { 0 };
         }
-    })
+    }
+    0
 }
 
 #[no_mangle]
@@ -181,9 +204,15 @@ pub extern "C" fn nrc_register_audio_data_cb(
     ctx_ptr: *mut c_void,
     cb: crate::audio_stream::AudioDataCb,
 ) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.audio.on_data = cb;
-    });
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    if let Ok(guard) = ctx.lock() {
+        if let Ok(mut audio_state) = guard.audio.try_lock() {
+            audio_state.on_data = cb;
+        }
+    }
 }
 
 #[no_mangle]
@@ -191,7 +220,13 @@ pub extern "C" fn nrc_register_audio_event_cb(
     ctx_ptr: *mut c_void,
     cb: crate::audio_stream::AudioEventCb,
 ) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.audio.on_event = cb;
-    });
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    if let Ok(guard) = ctx.lock() {
+        if let Ok(mut audio_state) = guard.audio.try_lock() {
+            audio_state.on_event = cb;
+        }
+    }
 }
