@@ -379,7 +379,7 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let mut encoder_guard = match state.encoder.lock() {
+    let mut encoder_guard = match state.encoder.try_lock() {
         Ok(g) => g,
         Err(_) => return false,
     };
@@ -409,11 +409,17 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         state.peer_port,
     );
 
-    let mut seq_guard = state.rtp_seq.lock().unwrap();
+    let mut seq_guard = match state.rtp_seq.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
     let seq = *seq_guard;
     *seq_guard = seq.wrapping_add(1);
 
-    let mut ts_guard = state.rtp_ts.lock().unwrap();
+    let mut ts_guard = match state.rtp_ts.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
     let ts = *ts_guard;
     *ts_guard += encoder.frame_size() as u32;
 
@@ -445,10 +451,11 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
 
     match socket.send_to(&rtp_buf, &peer_addr) {
         Ok(n) => {
-            let mut stats = state.stats.lock().unwrap();
-            stats.packets_sent += 1;
-            stats.bytes_sent += n as u64;
-            stats.opus_bytes_sent += opus_data.len() as u64;
+            if let Ok(mut stats) = state.stats.try_lock() {
+                stats.packets_sent += 1;
+                stats.bytes_sent += n as u64;
+                stats.opus_bytes_sent += opus_data.len() as u64;
+            }
             true
         }
         Err(e) => {
@@ -465,42 +472,43 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Option<std::thread::JoinHand
 
     let handle = state.thread_handle.take();
 
-    let stats = state.stats.lock().unwrap();
-    let elapsed = stats.start_time.elapsed().as_secs_f64();
-    let pcm_bytes = stats.packets_sent * 960 * 2 * 2;
-    let compression_ratio = if pcm_bytes > 0 {
-        pcm_bytes as f64 / stats.opus_bytes_sent as f64
-    } else {
-        0.0
-    };
-    let actual_bitrate = if elapsed > 0.0 {
-        (stats.opus_bytes_sent * 8) as f64 / elapsed / 1000.0
-    } else {
-        0.0
-    };
-    let loss_rate = if stats.packets_received > 0 {
-        (stats.packets_lost as f64 / stats.packets_received as f64) * 100.0
-    } else {
-        0.0
-    };
+    if let Ok(stats) = state.stats.try_lock() {
+        let elapsed = stats.start_time.elapsed().as_secs_f64();
+        let pcm_bytes = stats.packets_sent * 960 * 2 * 2;
+        let compression_ratio = if pcm_bytes > 0 {
+            pcm_bytes as f64 / stats.opus_bytes_sent as f64
+        } else {
+            0.0
+        };
+        let actual_bitrate = if elapsed > 0.0 {
+            (stats.opus_bytes_sent * 8) as f64 / elapsed / 1000.0
+        } else {
+            0.0
+        };
+        let loss_rate = if stats.packets_received > 0 {
+            (stats.packets_lost as f64 / stats.packets_received as f64) * 100.0
+        } else {
+            0.0
+        };
 
-    log::info!(
-        "[音频流] 会话统计: 发送 {} 包, 接收 {} 包, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 实际比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
-        stats.packets_sent,
-        stats.packets_received,
-        stats.packets_lost,
-        loss_rate,
-        pcm_bytes as f64 / 1024.0 / 1024.0,
-        stats.opus_bytes_sent as f64 / 1024.0 / 1024.0,
-        compression_ratio,
-        actual_bitrate,
-        elapsed,
-    );
+        log::info!(
+            "[音频流] 会话统计: 发送 {} 包, 接收 {} 包, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 实际比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
+            stats.packets_sent,
+            stats.packets_received,
+            stats.packets_lost,
+            loss_rate,
+            pcm_bytes as f64 / 1024.0 / 1024.0,
+            stats.opus_bytes_sent as f64 / 1024.0 / 1024.0,
+            compression_ratio,
+            actual_bitrate,
+            elapsed,
+        );
+    }
 
-    *state.encoder.lock().unwrap() = None;
-    *state.decoder.lock().unwrap() = None;
-    *state.jitter.lock().unwrap() = None;
-    *state.stats.lock().unwrap() = AudioStats::new();
+    let _ = state.encoder.try_lock().map(|mut g| *g = None);
+    let _ = state.decoder.try_lock().map(|mut g| *g = None);
+    let _ = state.jitter.try_lock().map(|mut g| *g = None);
+    let _ = state.stats.try_lock().map(|mut g| *g = AudioStats::new());
 
     state.on_data = None;
     state.on_event = None;
