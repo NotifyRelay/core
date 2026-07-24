@@ -70,25 +70,18 @@ fn send_control(
 pub unsafe extern "C" fn nrc_audio_start(
     ctx_ptr: *mut c_void,
     direction: *const c_char,
-    device_ip: *const c_char,
     port: i32,
     sample_rate: i32,
     channels: i32,
     remote_uuid: *const c_char,
 ) -> i32 {
     let dir = from_cstr(direction).to_string();
-    let ip = from_cstr(device_ip).to_string();
     let ruuid = from_cstr(remote_uuid).to_string();
     let p = port as u16;
 
     log::info!(
-        "音频流: nrc_audio_start 方向={}, 对端IP={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
-        dir,
-        ip,
-        port,
-        sample_rate,
-        channels,
-        ruuid
+        "音频流: nrc_audio_start 方向={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
+        dir, port, sample_rate, channels, ruuid
     );
 
     let mut start_ok = false;
@@ -98,10 +91,27 @@ pub unsafe extern "C" fn nrc_audio_start(
         if let Ok(guard) = ctx.lock() {
             let mut audio_state = guard.audio.lock().unwrap();
             audio_state.remote_uuid = ruuid.clone();
-            audio_state.peer_ip = ip.clone();
+
             start_ok = match dir.as_str() {
-                "send" => audio_stream::start_sender(&mut audio_state, &ip, p, sample_rate, channels),
-                "recv" => audio_stream::start_receiver(&mut audio_state, p, sample_rate, channels),
+                "send" => {
+                    let resolved_ip = guard.device_ips.lock().ok()
+                        .and_then(|m| m.get(&ruuid).cloned())
+                        .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+                        .unwrap_or_else(|| {
+                            log::error!("音频流: 无法解析对端IP uuid={}", ruuid);
+                            String::new()
+                        });
+                    if resolved_ip.is_empty() {
+                        false
+                    } else {
+                        audio_state.peer_ip = resolved_ip.clone();
+                        audio_stream::start_sender(&mut audio_state, &resolved_ip, p, sample_rate, channels)
+                    }
+                }
+                "recv" => {
+                    audio_state.peer_ip = String::new();
+                    audio_stream::start_receiver(&mut audio_state, p, sample_rate, channels)
+                }
                 _ => {
                     log::error!("音频流 FFI: 未知方向 {dir}");
                     false
@@ -180,7 +190,7 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
     }
 
     with_ctx(ctx_ptr, |ctx| {
-        let mut audio_state = ctx.audio.lock().unwrap();
+        let audio_state = ctx.audio.lock().unwrap();
         let _ = audio_state.encoder.lock().map(|mut g| *g = None);
         let _ = audio_state.decoder.lock().map(|mut g| *g = None);
         let _ = audio_state.jitter.lock().map(|mut g| *g = None);
@@ -221,21 +231,6 @@ pub extern "C" fn nrc_register_audio_data_cb(
     if let Ok(guard) = ctx.lock() {
         let mut audio_state = guard.audio.lock().unwrap();
         audio_state.on_data = cb;
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_set_audio_user_data(
-    ctx_ptr: *mut c_void,
-    user_data: *mut c_void,
-) {
-    if ctx_ptr.is_null() {
-        return;
-    }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(guard) = ctx.lock() {
-        let mut audio_state = guard.audio.lock().unwrap();
-        audio_state.user_data = user_data;
     }
 }
 
