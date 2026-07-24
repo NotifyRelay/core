@@ -689,8 +689,6 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
         );
     }
 
-    state.on_data = None;
-    state.on_event = None;
     state.remote_uuid.clear();
     state.peer_ip.clear();
     state.peer_port = 0;
