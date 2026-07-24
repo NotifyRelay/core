@@ -219,9 +219,23 @@ pub extern "C" fn nrc_register_audio_data_cb(
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     if let Ok(guard) = ctx.lock() {
-        if let Ok(mut audio_state) = guard.audio.try_lock() {
-            audio_state.on_data = cb;
-        }
+        let mut audio_state = guard.audio.lock().unwrap();
+        audio_state.on_data = cb;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_set_audio_user_data(
+    ctx_ptr: *mut c_void,
+    user_data: *mut c_void,
+) {
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    if let Ok(guard) = ctx.lock() {
+        let mut audio_state = guard.audio.lock().unwrap();
+        audio_state.user_data = user_data;
     }
 }
 

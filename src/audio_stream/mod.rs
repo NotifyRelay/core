@@ -200,7 +200,7 @@ pub(crate) fn start_receiver(
     let socket = UdpSocket::from(socket);
 
     socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
+        .set_read_timeout(Some(Duration::from_millis(10)))
         .ok();
 
     let decoder = match OpusDecoder::new(sample_rate, channels) {
@@ -235,7 +235,7 @@ fn start_read_thread(state: &mut AudioStreamState) {
         None => return,
     };
     socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
+        .set_read_timeout(Some(Duration::from_millis(10)))
         .ok();
 
     let active = state.active.clone();
@@ -315,7 +315,7 @@ fn read_loop(
                 let pkt = match Packet::unmarshal(&mut data) {
                     Ok(p) => p,
                     Err(e) => {
-                        log::debug!("音频流: RTP 解包失败: {e}");
+                        log::warn!("音频流: RTP 解包失败: {e}, 原始数据前16字节: {:02x?}", &buf[..std::cmp::min(16, n)]);
                         continue;
                     }
                 };
@@ -400,7 +400,9 @@ fn read_loop(
                                 }
                             }
                         }
-                        None => break,
+                        None => {
+                            break;
+                        }
                     }
                 }
             }
@@ -469,7 +471,6 @@ fn playback_loop(
 
                 let lag_us = now.duration_since(target_time).as_micros() as i64;
                 if lag_us > 50_000 {
-                    log::debug!("音频流: 播放落后 {}ms，重置定时器", lag_us / 1000);
                     start_time = now;
                     frame_count = 1;
                 } else if now < target_time {
