@@ -27,6 +27,8 @@ ruopus = "0.1"
 rtp = "0.14"
 bytes = "1"
 webrtc-util = "0.12"
+local-ip-address = "0.6"
+strsim = "0.11"
 
 [dev-dependencies]
 env_logger = "0.11"

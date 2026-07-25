@@ -1,4 +1,3 @@
-use std::net::UdpSocket;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 
@@ -183,21 +182,7 @@ fn text_similarity_impl(a: &str, b: &str) -> f64 {
     if a_lower.contains(&b_lower) || b_lower.contains(&a_lower) {
         return 0.9;
     }
-    let set_a: std::collections::HashSet<char> = a_lower.chars().collect();
-    let set_b: std::collections::HashSet<char> = b_lower.chars().collect();
-    if set_a.is_empty() && set_b.is_empty() {
-        return 1.0;
-    }
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
-    let jaccard = if union > 0 {
-        intersection as f64 / union as f64
-    } else {
-        0.0
-    };
-    let len_ratio =
-        a_lower.len().min(b_lower.len()) as f64 / a_lower.len().max(b_lower.len()) as f64;
-    jaccard * 0.7 + len_ratio * 0.3
+    strsim::sorensen_dice(&a_lower, &b_lower)
 }
 
 fn combined_similarity_impl(
@@ -317,11 +302,7 @@ pub extern "C" fn nrc_get_local_ip() -> *mut c_char {
 }
 
 pub(crate) fn get_local_ip_impl() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // 连接 Google DNS 以确定本地接口，不实际发送数据
-    socket.connect("8.8.8.8:53").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-    Some(local_addr.ip().to_string())
+    local_ip_address::local_ip().ok().map(|ip| ip.to_string())
 }
 
 #[cfg(test)]
