@@ -130,26 +130,17 @@ pub unsafe extern "C" fn nrc_map_local_package(
     to_cstr(&mapped)
 }
 
-/// 检查过滤模式（返回 1=通过, 0=被过滤）
-/// 参数: ctx, mappedPkg, originalPkg, title, text
-/// title/text 用于关键词匹配
-#[no_mangle]
-pub unsafe extern "C" fn nrc_check_filter_mode(
+unsafe fn check_filter_impl(
     ctx_ptr: *mut crate::SafeContext,
-    mapped_package: *const c_char,
-    _original_package: *const c_char,
+    package: *const c_char,
     title: *const c_char,
     text: *const c_char,
 ) -> i32 {
-    if ctx_ptr.is_null() || mapped_package.is_null() {
+    if ctx_ptr.is_null() || package.is_null() {
         return 1;
     }
-    let pkg = from_cstr(mapped_package);
-    let title_str = if title.is_null() {
-        ""
-    } else {
-        from_cstr(title)
-    };
+    let pkg = from_cstr(package);
+    let title_str = if title.is_null() { "" } else { from_cstr(title) };
     let text_str = if text.is_null() { "" } else { from_cstr(text) };
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {
@@ -167,41 +158,31 @@ pub unsafe extern "C" fn nrc_check_filter_mode(
     }
 }
 
+/// 检查过滤模式（返回 1=通过, 0=被过滤）
+/// 参数: ctx, mappedPkg, originalPkg, title, text
+/// title/text 用于关键词匹配
+#[no_mangle]
+pub unsafe extern "C" fn nrc_check_filter_mode(
+    ctx_ptr: *mut crate::SafeContext,
+    mapped_package: *const c_char,
+    _original_package: *const c_char,
+    title: *const c_char,
+    text: *const c_char,
+) -> i32 {
+    check_filter_impl(ctx_ptr, mapped_package, title, text)
+}
+
 /// 过滤通知（返回 1=通过, 0=被过滤）
 /// 支持通过 title/text 关键词匹配过滤条目
 #[no_mangle]
+#[deprecated(note = "请使用 nrc_check_filter_mode，后续版本将合并为一个统一的过滤检查函数")]
 pub unsafe extern "C" fn nrc_filter_notification(
     ctx_ptr: *mut crate::SafeContext,
     package_name: *const c_char,
     title: *const c_char,
     text: *const c_char,
 ) -> i32 {
-    if ctx_ptr.is_null() || package_name.is_null() {
-        return 1;
-    }
-    let pkg = from_cstr(package_name);
-    let title_str = if title.is_null() {
-        ""
-    } else {
-        from_cstr(title)
-    };
-    let text_str = if text.is_null() { "" } else { from_cstr(text) };
-
-    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return 1,
-    };
-    let config = match guard.filter.config.lock() {
-        Ok(c) => c,
-        Err(_) => return 1,
-    };
-
-    if config.check_filter_mode(&pkg, title_str, text_str) {
-        1
-    } else {
-        0
-    }
+    check_filter_impl(ctx_ptr, package_name, title, text)
 }
 
 #[cfg(test)]

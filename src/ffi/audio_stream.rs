@@ -2,7 +2,6 @@ use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, with_ctx};
 use crate::{audio_stream, crypto::aes, network, protocol::codec, SafeContext};
-use base64::Engine;
 
 fn send_control(
     ctx: &crate::CoreContext,
@@ -25,22 +24,13 @@ fn send_control(
         format!(r#"{{"type":"MEDIA_CONTROL","action":"{}"}}"#, action)
     };
 
-    let key_b64 = match ctx.crypto.device_keys.get(remote_uuid) {
-        Some(k) => k.aes_key_b64.clone(),
+    let key_arr = match ctx.crypto.get_aes_key(remote_uuid) {
+        Some(k) => k,
         None => {
-            log::warn!("音频流: 未找到对端密钥 uuid={}", remote_uuid);
+            log::warn!("音频流: 未找到对端密钥或密钥无效 uuid={}", remote_uuid);
             return;
         }
     };
-    let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
-        Ok(b) if b.len() == 32 => b,
-        _ => {
-            log::warn!("音频流: 密钥格式无效");
-            return;
-        }
-    };
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&key_bytes);
 
     let local_uuid = ctx
         .broadcast_info

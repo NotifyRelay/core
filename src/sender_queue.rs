@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-
 use crate::crypto::aes;
 use crate::protocol::codec;
 use crate::SafeContext;
@@ -179,13 +177,9 @@ impl SenderQueue {
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        let (key_b64, local_uuid) = match ctx.lock() {
+        let (key_arr, local_uuid) = match ctx.lock() {
             Ok(guard) => {
-                let key = guard
-                    .crypto
-                    .device_keys
-                    .get(&item.device_uuid)
-                    .map(|k| k.aes_key_b64.clone());
+                let key = guard.crypto.get_aes_key(&item.device_uuid);
                 let uuid = guard
                     .broadcast_info
                     .as_ref()
@@ -196,20 +190,13 @@ impl SenderQueue {
             Err(_) => return Err(()),
         };
 
-        let key_b64 = match key_b64 {
+        let key_arr = match key_arr {
             Some(k) => k,
             None => {
                 log::warn!("发送队列: 未找到密钥 uuid={}", item.device_uuid);
                 return Ok(false);
             }
         };
-
-        let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
-            Ok(b) if b.len() == 32 => b,
-            _ => return Ok(false),
-        };
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&key_bytes);
 
         if !local_uuid.is_empty() && item.device_uuid == local_uuid {
             log::warn!("发送队列: 跳过向自身发送 uuid={}", item.device_uuid);

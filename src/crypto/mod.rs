@@ -3,6 +3,7 @@ pub mod ecdh;
 pub mod hkdf;
 pub mod spake2;
 
+use base64::Engine;
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,5 +34,19 @@ impl CryptoState {
             local_pub_key_b64: None,
             device_keys: HashMap::new(),
         }
+    }
+
+    /// 获取指定对端的 AES-256 密钥
+    pub fn get_aes_key(&self, remote_uuid: &str) -> Option<[u8; 32]> {
+        let key_b64 = self.device_keys.get(remote_uuid)?.aes_key_b64.clone();
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&key_b64)
+            .ok()?;
+        if key_bytes.len() != 32 {
+            return None;
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key_bytes);
+        Some(key_arr)
     }
 }

@@ -311,40 +311,29 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     return -1;
                 }
             };
-            let guard = match ctx.lock() {
-                Ok(g) => g,
+            let key_arr = match ctx.lock() {
+                Ok(guard) => {
+                    let key = guard.crypto.get_aes_key(fields.local_uuid);
+                    let _ud = guard.router.user_data;
+                    drop(guard);
+                    key
+                }
                 Err(_) => {
                     log::error!("处理消息: DATA 消息加锁失败");
                     return -1;
                 }
             };
-            let key_b64 = guard
-                .crypto
-                .device_keys
-                .get(fields.local_uuid)
-                .map(|k| k.aes_key_b64.clone());
-            let _ud = guard.router.user_data;
-            drop(guard);
-            let key_b64 = match key_b64 {
+            let key_arr = match key_arr {
                 Some(k) => k,
                 None => {
                     log::warn!(
-                        "处理消息: 未找到密钥 uuid={}, header={}",
+                        "处理消息: 未找到密钥或密钥无效 uuid={}, header={}",
                         fields.local_uuid,
                         hdr
                     );
                     return -1;
                 }
             };
-            let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&key_b64) {
-                Ok(b) if b.len() == 32 => b,
-                _ => {
-                    log::error!("处理消息: 密钥格式无效 uuid={}", fields.local_uuid);
-                    return -1;
-                }
-            };
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(&key_bytes);
             let plain = match aes::decrypt(&key_arr, fields.encrypted_payload) {
                 Ok(p) => p,
                 Err(_) => {
