@@ -140,7 +140,11 @@ unsafe fn check_filter_impl(
         return 1;
     }
     let pkg = from_cstr(package);
-    let title_str = if title.is_null() { "" } else { from_cstr(title) };
+    let title_str = if title.is_null() {
+        ""
+    } else {
+        from_cstr(title)
+    };
     let text_str = if text.is_null() { "" } else { from_cstr(text) };
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = match ctx.lock() {

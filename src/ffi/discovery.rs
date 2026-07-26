@@ -69,8 +69,7 @@ pub unsafe extern "C" fn nrc_get_discovered_devices(ctx_ptr: *mut c_void) -> *mu
 #[no_mangle]
 pub unsafe extern "C" fn nrc_start_known_device_scanner(ctx_ptr: *mut c_void) {
     with_ctx(ctx_ptr, |ctx| {
-        ctx.discovery
-            .start_known_device_scanner(ctx_ptr as usize);
+        ctx.discovery.start_known_device_scanner(ctx_ptr as usize);
     });
 }
 

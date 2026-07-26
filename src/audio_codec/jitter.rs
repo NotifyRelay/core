@@ -81,7 +81,7 @@ impl JitterBuffer {
         }
 
         let (first_available, (_, arrival_time)) = self.packets.iter().next().unwrap();
-        
+
         if now.duration_since(*arrival_time) < self.hold_window {
             return (None, 0);
         }

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use notify_relay_core::{ffi, BroadcastInfo, CoreContext, SafeContext};
 
 fn init_logger() {
-    let _ = env_logger::builder().filter_level(log::LevelFilter::Info).try_init();
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
 }
 
 static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(23336);
@@ -28,7 +30,10 @@ extern "C" fn recv_callback(
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(pcm_data, pcm_len as usize) };
-    let pcm: Vec<i16> = data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let pcm: Vec<i16> = data
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let frames = unsafe { &*(user_data as *const Mutex<Vec<Vec<i16>>>) };
     if let Ok(mut guard) = frames.lock() {
         guard.push(pcm);
@@ -52,14 +57,21 @@ fn set_temp_key(ctx: &mut SafeContext, remote_uuid: &str) {
     let uuid_cstr = CString::new(remote_uuid).unwrap();
     unsafe {
         ffi::key_management::nrc_migrate_shared_secret(
-            ctx_ptr, uuid_cstr.as_ptr(), temp_key.as_ptr(), temp_key.len() as u32,
+            ctx_ptr,
+            uuid_cstr.as_ptr(),
+            temp_key.as_ptr(),
+            temp_key.len() as u32,
         );
     }
 }
 
 fn set_device_ip(ctx: &mut SafeContext, uuid: &str, ip: &str) {
     let guard = ctx.lock().unwrap();
-    guard.device_ips.lock().unwrap().insert(uuid.to_string(), ip.to_string());
+    guard
+        .device_ips
+        .lock()
+        .unwrap()
+        .insert(uuid.to_string(), ip.to_string());
 }
 
 fn ensure_tcp_listener() {
@@ -146,8 +158,22 @@ fn test_audio_basic_loopback() {
     }
     ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
     unsafe {
-        ffi::audio_stream::nrc_audio_start(ctx_b_ptr, dir_recv.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
-        ffi::audio_stream::nrc_audio_start(ctx_a_ptr, dir_send.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
+        ffi::audio_stream::nrc_audio_start(
+            ctx_b_ptr,
+            dir_recv.as_ptr(),
+            port as i32,
+            48000,
+            2,
+            uuid.as_ptr(),
+        );
+        ffi::audio_stream::nrc_audio_start(
+            ctx_a_ptr,
+            dir_send.as_ptr(),
+            port as i32,
+            48000,
+            2,
+            uuid.as_ptr(),
+        );
     }
 
     let frame = sine_frame();
@@ -159,7 +185,10 @@ fn test_audio_basic_loopback() {
     }
 
     let frames = unsafe { &*frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>() };
-    assert!(wait_for_frames(frames, 1, Duration::from_secs(5)), "未收到音频帧");
+    assert!(
+        wait_for_frames(frames, 1, Duration::from_secs(5)),
+        "未收到音频帧"
+    );
 
     ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
     ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
@@ -202,14 +231,32 @@ fn test_audio_stop_start_idempotent() {
         }
         ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
         unsafe {
-            ffi::audio_stream::nrc_audio_start(ctx_b_ptr, dir_recv.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
-            ffi::audio_stream::nrc_audio_start(ctx_a_ptr, dir_send.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
+            ffi::audio_stream::nrc_audio_start(
+                ctx_b_ptr,
+                dir_recv.as_ptr(),
+                port as i32,
+                48000,
+                2,
+                uuid.as_ptr(),
+            );
+            ffi::audio_stream::nrc_audio_start(
+                ctx_a_ptr,
+                dir_send.as_ptr(),
+                port as i32,
+                48000,
+                2,
+                uuid.as_ptr(),
+            );
         }
 
         let frame = sine_frame();
         for _ in 0..10 {
             unsafe {
-                ffi::audio_stream::nrc_audio_write_frame(ctx_a_ptr, frame.as_ptr(), frame.len() as i32);
+                ffi::audio_stream::nrc_audio_write_frame(
+                    ctx_a_ptr,
+                    frame.as_ptr(),
+                    frame.len() as i32,
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -224,7 +271,9 @@ fn test_audio_stop_start_idempotent() {
         ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
         ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
 
-        unsafe { drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>())); }
+        unsafe {
+            drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>()));
+        }
 
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -262,8 +311,22 @@ fn test_audio_reconnect_multiple() {
         }
         ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
         unsafe {
-            ffi::audio_stream::nrc_audio_start(ctx_b_ptr, dir_recv.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
-            ffi::audio_stream::nrc_audio_start(ctx_a_ptr, dir_send.as_ptr(), port as i32, 48000, 2, uuid.as_ptr());
+            ffi::audio_stream::nrc_audio_start(
+                ctx_b_ptr,
+                dir_recv.as_ptr(),
+                port as i32,
+                48000,
+                2,
+                uuid.as_ptr(),
+            );
+            ffi::audio_stream::nrc_audio_start(
+                ctx_a_ptr,
+                dir_send.as_ptr(),
+                port as i32,
+                48000,
+                2,
+                uuid.as_ptr(),
+            );
         }
 
         std::thread::sleep(Duration::from_millis(200));
@@ -271,7 +334,11 @@ fn test_audio_reconnect_multiple() {
         let frame = sine_frame();
         for _ in 0..10 {
             unsafe {
-                ffi::audio_stream::nrc_audio_write_frame(ctx_a_ptr, frame.as_ptr(), frame.len() as i32);
+                ffi::audio_stream::nrc_audio_write_frame(
+                    ctx_a_ptr,
+                    frame.as_ptr(),
+                    frame.len() as i32,
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -285,12 +352,19 @@ fn test_audio_reconnect_multiple() {
 
         let captured = frames.lock().unwrap().clone();
         let avg_rms: f64 = captured.iter().map(|x| rms(x)).sum::<f64>() / captured.len() as f64;
-        assert!(avg_rms > 4000.0, "第 {} 轮: 平均 RMS 过低: {:.1}", round, avg_rms);
+        assert!(
+            avg_rms > 4000.0,
+            "第 {} 轮: 平均 RMS 过低: {:.1}",
+            round,
+            avg_rms
+        );
 
         ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
         ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
 
-        unsafe { drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>())); }
+        unsafe {
+            drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>()));
+        }
 
         std::thread::sleep(Duration::from_millis(200));
     }

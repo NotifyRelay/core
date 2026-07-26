@@ -71,7 +71,11 @@ pub unsafe extern "C" fn nrc_audio_start(
 
     log::info!(
         "音频流: nrc_audio_start 方向={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
-        dir, port, sample_rate, channels, ruuid
+        dir,
+        port,
+        sample_rate,
+        channels,
+        ruuid
     );
 
     let mut start_ok = false;
@@ -84,7 +88,10 @@ pub unsafe extern "C" fn nrc_audio_start(
 
             start_ok = match dir.as_str() {
                 "send" => {
-                    let resolved_ip = guard.device_ips.lock().ok()
+                    let resolved_ip = guard
+                        .device_ips
+                        .lock()
+                        .ok()
                         .and_then(|m| m.get(&ruuid).cloned())
                         .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
                         .unwrap_or_else(|| {
@@ -95,7 +102,13 @@ pub unsafe extern "C" fn nrc_audio_start(
                         false
                     } else {
                         audio_state.peer_ip = resolved_ip.clone();
-                        audio_stream::start_sender(&mut audio_state, &resolved_ip, p, sample_rate, channels)
+                        audio_stream::start_sender(
+                            &mut audio_state,
+                            &resolved_ip,
+                            p,
+                            sample_rate,
+                            channels,
+                        )
                     }
                 }
                 "recv" => {
@@ -184,7 +197,10 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
         let _ = audio_state.encoder.lock().map(|mut g| *g = None);
         let _ = audio_state.decoder.lock().map(|mut g| *g = None);
         let _ = audio_state.jitter.lock().map(|mut g| *g = None);
-        let _ = audio_state.stats.lock().map(|mut g| *g = crate::audio_stream::AudioStats::new());
+        let _ = audio_state
+            .stats
+            .lock()
+            .map(|mut g| *g = crate::audio_stream::AudioStats::new());
         let _ = audio_state.pcm_queue.lock().map(|mut g| g.clear());
         let _ = audio_state.pcm_buffer.lock().map(|mut g| g.clear());
     });

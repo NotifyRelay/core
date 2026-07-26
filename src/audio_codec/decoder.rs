@@ -32,7 +32,7 @@ impl OpusDecoder {
 
     pub fn decode_loss(&mut self) -> Result<Vec<i16>, ruopus::packet::PacketError> {
         let frame_samples = self.frame_size as usize * self.channels as usize;
-        
+
         let pcm_f32 = self.inner.decode_lost(frame_samples);
         let pcm_i16: Vec<i16> = pcm_f32.iter().map(|&x| (x * 32768.0) as i16).collect();
         Ok(pcm_i16)

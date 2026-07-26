@@ -315,7 +315,10 @@ fn read_loop(
                 let pkt = match Packet::unmarshal(&mut data) {
                     Ok(p) => p,
                     Err(e) => {
-                        log::warn!("音频流: RTP 解包失败: {e}, 原始数据前16字节: {:02x?}", &buf[..std::cmp::min(16, n)]);
+                        log::warn!(
+                            "音频流: RTP 解包失败: {e}, 原始数据前16字节: {:02x?}",
+                            &buf[..std::cmp::min(16, n)]
+                        );
                         continue;
                     }
                 };
@@ -466,7 +469,8 @@ fn playback_loop(
                 }
 
                 frame_count += 1;
-                let target_time = start_time + Duration::from_micros(frame_duration_us * frame_count);
+                let target_time =
+                    start_time + Duration::from_micros(frame_duration_us * frame_count);
                 let now = Instant::now();
 
                 let lag_us = now.duration_since(target_time).as_micros() as i64;
@@ -640,12 +644,12 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
     }
 
     let frame_size = match state.encoder.lock().unwrap().as_ref() {
-            Some(e) => e.frame_size(),
-            None => match state.decoder.lock().unwrap().as_ref() {
-                Some(d) => d.frame_size(),
-                None => 960,
-            },
-        };
+        Some(e) => e.frame_size(),
+        None => match state.decoder.lock().unwrap().as_ref() {
+            Some(d) => d.frame_size(),
+            None => 960,
+        },
+    };
 
     if let Ok(stats) = state.stats.try_lock() {
         let elapsed = stats.start_time.elapsed().as_secs_f64();
