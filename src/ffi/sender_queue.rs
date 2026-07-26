@@ -61,6 +61,7 @@ pub extern "C" fn nrc_enqueue_message(
             Some(dk.to_string())
         },
         retries_left: 0,
+        coalesce_key: None,
     });
 }
 

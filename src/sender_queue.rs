@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,44 +15,121 @@ pub struct SendItem {
     pub plaintext: String,
     pub dedup_key: Option<String>,
     pub retries_left: u32,
+    /// 队列内合并键（媒体类消息为 "device_uuid|header"）：
+    /// 全量状态入队时移除队列中同键旧项，避免积压后爆发式回放
+    pub coalesce_key: Option<String>,
 }
 
 pub struct SenderQueue {
     inner: Arc<Mutex<SenderQueueInner>>,
     running: Arc<AtomicBool>,
+    /// 当前并发发送任务数
+    active: Arc<AtomicUsize>,
 }
 
 struct SenderQueueInner {
     items: Vec<SendItem>,
     /// dedup_key -> 发送开始时间
     in_flight: HashMap<String, Instant>,
+    /// device_uuid -> 发送开始时间（同设备串行发送，保证消息顺序）
+    busy_devices: HashMap<String, Instant>,
+    /// device_uuid -> 冷却截止时间（发送失败退避，避免反复烧满连接超时）
+    device_cooldown: HashMap<String, Instant>,
+    /// device_uuid -> 连续失败次数
+    device_fail_streak: HashMap<String, u32>,
+}
+
+/// 发送任务完成/异常时清理并发状态（RAII，防止线程 panic 导致状态泄漏）
+struct TaskGuard {
+    inner: Arc<Mutex<SenderQueueInner>>,
+    active: Arc<AtomicUsize>,
+    device_uuid: String,
+    dedup_key: Option<String>,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.busy_devices.remove(&self.device_uuid);
+            if let Some(ref key) = self.dedup_key {
+                if !key.is_empty() {
+                    guard.in_flight.remove(key);
+                }
+            }
+        }
+    }
 }
 
 impl SenderQueue {
     const MAX_CONCURRENT: usize = 5;
     const MAX_RETRIES: u32 = 3;
+    /// 媒体类消息连接超时（毫秒）：过期状态无重发价值，快速失败
+    const MEDIA_TIMEOUT_MS: u32 = 800;
+    /// 普通消息连接超时（毫秒）
+    const DEFAULT_TIMEOUT_MS: u32 = 3000;
+    /// 失败退避冷却上限（秒）
+    const MAX_COOLDOWN_SECS: u64 = 5;
 
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SenderQueueInner {
                 items: Vec::new(),
                 in_flight: HashMap::new(),
+                busy_devices: HashMap::new(),
+                device_cooldown: HashMap::new(),
+                device_fail_streak: HashMap::new(),
             })),
             running: Arc::new(AtomicBool::new(true)),
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// 媒体类消息 header（高频全量状态，仅保留最新）
+    fn is_media_header(header: &str) -> bool {
+        matches!(header, "DATA_MEDIAPLAY" | "DATA_SUPERISLAND")
+    }
+
+    /// 是否为增量负载（含 changes 的差量消息依赖前序消息，不可替换旧项）
+    fn is_delta_payload(plaintext: &str) -> bool {
+        plaintext.contains("\"changes\"")
+    }
+
     pub fn enqueue(&self, mut item: SendItem) {
-        item.retries_left = Self::MAX_RETRIES;
+        let is_media = Self::is_media_header(&item.header);
+        // 媒体状态失败即弃（过期状态重发只会造成回放追赶），其他消息保留重试
+        item.retries_left = if is_media { 1 } else { Self::MAX_RETRIES };
+        if is_media && item.coalesce_key.is_none() {
+            item.coalesce_key = Some(format!("{}|{}", item.device_uuid, item.header));
+        }
         if let Ok(mut inner) = self.inner.lock() {
+            // 全量媒体状态入队时移除同键旧项（含未发出的增量），只保留最新，
+            // 根除网络恢复后过期状态的爆发式回放
+            if let Some(ref key) = item.coalesce_key {
+                if !Self::is_delta_payload(&item.plaintext) {
+                    let before = inner.items.len();
+                    inner
+                        .items
+                        .retain(|it| it.coalesce_key.as_deref() != Some(key.as_str()));
+                    let dropped = before - inner.items.len();
+                    if dropped > 0 {
+                        log::debug!(
+                            "发送队列: 合并过期媒体状态 key={}, 丢弃 {} 条旧项",
+                            key,
+                            dropped
+                        );
+                    }
+                }
+            }
             inner.items.push(item);
         }
     }
 
-    /// 启动后台处理线程
+    /// 启动后台调度线程（实际发送在并发任务线程中执行，同设备串行）
     pub fn start_worker(&self, ctx_ptr: usize) {
         let inner = self.inner.clone();
         let running = self.running.clone();
+        let active = self.active.clone();
 
         thread::Builder::new()
             .name("sender-queue".to_string())
@@ -60,6 +137,11 @@ impl SenderQueue {
                 loop {
                     if !running.load(Ordering::Relaxed) {
                         break;
+                    }
+
+                    if active.load(Ordering::Relaxed) >= Self::MAX_CONCURRENT {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
                     }
 
                     let item = {
@@ -70,40 +152,63 @@ impl SenderQueue {
                                 continue;
                             }
                         };
-                        // 清理 5 秒超时的 in_flight
                         let now = Instant::now();
+                        // 清理超时状态（防异常泄漏）
                         guard
                             .in_flight
                             .retain(|_, &mut ts| now.duration_since(ts).as_secs() < 5);
-                        let available = Self::MAX_CONCURRENT.saturating_sub(guard.in_flight.len());
-                        if available == 0 {
-                            thread::sleep(Duration::from_millis(50));
-                            continue;
-                        }
+                        guard
+                            .busy_devices
+                            .retain(|_, &mut ts| now.duration_since(ts).as_secs() < 30);
+                        guard.device_cooldown.retain(|_, &mut until| until > now);
 
-                        let idx = guard.items.iter().position(|item| {
-                            let key = item.dedup_key.as_deref().unwrap_or("");
-                            key.is_empty() || !guard.in_flight.contains_key(key)
+                        // 选取可发送项：同 dedup_key 不并发、同设备串行、冷却中的设备跳过
+                        let idx = guard.items.iter().position(|it| {
+                            let key = it.dedup_key.as_deref().unwrap_or("");
+                            (key.is_empty() || !guard.in_flight.contains_key(key))
+                                && !guard.busy_devices.contains_key(&it.device_uuid)
+                                && !guard.device_cooldown.contains_key(&it.device_uuid)
                         });
                         match idx {
                             Some(i) => {
-                                let item = guard.items.remove(i);
-                                if let Some(ref key) = item.dedup_key {
+                                let it = guard.items.remove(i);
+                                if let Some(ref key) = it.dedup_key {
                                     if !key.is_empty() {
                                         guard.in_flight.insert(key.clone(), now);
                                     }
                                 }
-                                Some(item)
+                                guard.busy_devices.insert(it.device_uuid.clone(), now);
+                                Some(it)
                             }
-                            None => {
-                                thread::sleep(Duration::from_millis(50));
-                                continue;
-                            }
+                            None => None,
                         }
                     };
 
-                    if let Some(item) = item {
-                        Self::process_item(ctx_ptr, &item, &inner);
+                    match item {
+                        Some(item) => {
+                            active.fetch_add(1, Ordering::Relaxed);
+                            let task_guard = TaskGuard {
+                                inner: inner.clone(),
+                                active: active.clone(),
+                                device_uuid: item.device_uuid.clone(),
+                                dedup_key: item.dedup_key.clone(),
+                            };
+                            let task_inner = inner.clone();
+                            let spawn_result = thread::Builder::new()
+                                .name("sender-task".to_string())
+                                .spawn(move || {
+                                    let _guard = task_guard;
+                                    Self::process_item(ctx_ptr, &item, &task_inner);
+                                });
+                            if let Err(e) = spawn_result {
+                                // spawn 失败时闭包被丢弃，TaskGuard 的 Drop 已清理状态
+                                log::warn!("发送队列: 派生发送任务失败: {}", e);
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                        None => {
+                            thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
             })
@@ -126,12 +231,43 @@ impl SenderQueue {
                     }
                 }
             }
+            // 发送成功：清除该设备的失败退避状态
+            if let Ok(mut guard) = inner.lock() {
+                guard.device_fail_streak.remove(&item.device_uuid);
+                guard.device_cooldown.remove(&item.device_uuid);
+            }
             log::debug!(
                 "发送队列: 已发送 uuid={}, header={}",
                 item.device_uuid,
                 item.header
             );
-        } else if item.retries_left > 1 {
+            return;
+        }
+
+        // 发送失败：设置递增冷却，避免对不可达设备反复握手占用并发槽位
+        if let Ok(mut guard) = inner.lock() {
+            let streak = {
+                let entry = guard
+                    .device_fail_streak
+                    .entry(item.device_uuid.clone())
+                    .or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            let secs = u64::from(streak).min(Self::MAX_COOLDOWN_SECS);
+            guard.device_cooldown.insert(
+                item.device_uuid.clone(),
+                Instant::now() + Duration::from_secs(secs),
+            );
+            log::debug!(
+                "发送队列: 设备失败退避 uuid={}, 连续失败 {} 次, 冷却 {}s",
+                item.device_uuid,
+                streak,
+                secs
+            );
+        }
+
+        if item.retries_left > 1 {
             log::debug!(
                 "发送队列: 重试第 {} 次 uuid={}, header={}",
                 Self::MAX_RETRIES - item.retries_left + 1,
@@ -140,14 +276,12 @@ impl SenderQueue {
             );
             if let Ok(mut guard) = inner.lock() {
                 guard.items.push(SendItem {
+                    device_uuid: item.device_uuid.clone(),
+                    header: item.header.clone(),
+                    plaintext: item.plaintext.clone(),
+                    dedup_key: item.dedup_key.clone(),
                     retries_left: item.retries_left - 1,
-                    ..SendItem {
-                        device_uuid: item.device_uuid.clone(),
-                        header: item.header.clone(),
-                        plaintext: item.plaintext.clone(),
-                        dedup_key: item.dedup_key.clone(),
-                        retries_left: 0,
-                    }
+                    coalesce_key: item.coalesce_key.clone(),
                 });
             }
         } else {
@@ -158,19 +292,18 @@ impl SenderQueue {
                     }
                 }
             }
-            log::warn!(
-                "发送队列: 发送失败已达最大重试 uuid={}, header={}",
-                item.device_uuid,
-                item.header
-            );
-        }
-
-        // 清理 in_flight
-        if let Some(ref key) = item.dedup_key {
-            if !key.is_empty() {
-                if let Ok(mut guard) = inner.lock() {
-                    guard.in_flight.remove(key);
-                }
+            if Self::is_media_header(&item.header) {
+                log::debug!(
+                    "发送队列: 媒体状态发送失败即弃 uuid={}, header={}",
+                    item.device_uuid,
+                    item.header
+                );
+            } else {
+                log::warn!(
+                    "发送队列: 发送失败已达最大重试 uuid={}, header={}",
+                    item.device_uuid,
+                    item.header
+                );
             }
         }
     }
@@ -220,11 +353,17 @@ impl SenderQueue {
             Err(_) => String::new(),
         };
         if !ip.is_empty() && ip != "0.0.0.0" {
+            // 媒体类消息用短超时快速失败，避免长时间占用并发槽位
+            let timeout_ms = if Self::is_media_header(&item.header) {
+                Self::MEDIA_TIMEOUT_MS
+            } else {
+                Self::DEFAULT_TIMEOUT_MS
+            };
             Ok(crate::network::oneshot_send_only(
                 &msg,
                 &ip,
                 codec::DEFAULT_TCP_PORT,
-                3000,
+                timeout_ms,
             ))
         } else {
             log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
@@ -234,5 +373,92 @@ impl SenderQueue {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(uuid: &str, header: &str, text: &str) -> SendItem {
+        SendItem {
+            device_uuid: uuid.to_string(),
+            header: header.to_string(),
+            plaintext: text.to_string(),
+            dedup_key: None,
+            retries_left: 0,
+            coalesce_key: None,
+        }
+    }
+
+    #[test]
+    fn test_media_full_coalesce_keeps_latest() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"b"}"#));
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"c"}"#));
+        let inner = q.inner.lock().unwrap();
+        assert_eq!(inner.items.len(), 1);
+        assert!(inner.items[0].plaintext.contains("\"c\""));
+    }
+
+    #[test]
+    fn test_media_retries_disabled() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        q.enqueue(item("dev1", "DATA_NOTIFICATION", r#"{"title":"n"}"#));
+        let inner = q.inner.lock().unwrap();
+        assert_eq!(inner.items[0].retries_left, 1);
+        assert_eq!(inner.items[1].retries_left, SenderQueue::MAX_RETRIES);
+    }
+
+    #[test]
+    fn test_media_delta_not_replaced() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        q.enqueue(item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"changes":{"title":"b"}}"#,
+        ));
+        let inner = q.inner.lock().unwrap();
+        // 增量项不替换旧项，追加保持顺序
+        assert_eq!(inner.items.len(), 2);
+    }
+
+    #[test]
+    fn test_full_removes_pending_deltas() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        q.enqueue(item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"changes":{"title":"b"}}"#,
+        ));
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"c"}"#));
+        let inner = q.inner.lock().unwrap();
+        // 全量状态覆盖此前未发出的全量与增量
+        assert_eq!(inner.items.len(), 1);
+        assert!(inner.items[0].plaintext.contains("\"c\""));
+    }
+
+    #[test]
+    fn test_different_devices_and_headers_not_coalesced() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        q.enqueue(item("dev2", "DATA_MEDIAPLAY", r#"{"title":"b"}"#));
+        q.enqueue(item("dev1", "DATA_SUPERISLAND", r#"{"features":[]}"#));
+        let inner = q.inner.lock().unwrap();
+        assert_eq!(inner.items.len(), 3);
+    }
+
+    #[test]
+    fn test_non_media_never_coalesced() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_NOTIFICATION", r#"{"title":"a"}"#));
+        q.enqueue(item("dev1", "DATA_NOTIFICATION", r#"{"title":"a"}"#));
+        let inner = q.inner.lock().unwrap();
+        assert_eq!(inner.items.len(), 2);
+        assert!(inner.items[0].coalesce_key.is_none());
     }
 }
