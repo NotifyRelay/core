@@ -95,10 +95,23 @@ impl SenderQueue {
         plaintext.contains("\"changes\"")
     }
 
+    /// 是否为媒体/超级岛"结束包"（会话终止，对端需据此移除卡片/岛）：
+    /// 平台端统一用 terminateValue=="__END__" 或 terminate:true 标识。
+    /// 结束包丢失会导致对端残留过期媒体展示，故必须可靠重试。
+    fn is_media_end_packet(plaintext: &str) -> bool {
+        plaintext.contains("__END__") || plaintext.contains("\"terminate\":true")
+    }
+
     pub fn enqueue(&self, mut item: SendItem) {
         let is_media = Self::is_media_header(&item.header);
-        // 媒体状态失败即弃（过期状态重发只会造成回放追赶），其他消息保留重试
-        item.retries_left = if is_media { 1 } else { Self::MAX_RETRIES };
+        let is_end = is_media && Self::is_media_end_packet(&item.plaintext);
+        // 媒体高频状态失败即弃（过期状态重发只会造成回放追赶）；
+        // 但结束包必须可靠送达（否则对端媒体卡片/岛无法消失），与通知/控制一样重试。
+        item.retries_left = if is_media && !is_end {
+            1
+        } else {
+            Self::MAX_RETRIES
+        };
         if is_media && item.coalesce_key.is_none() {
             item.coalesce_key = Some(format!("{}|{}", item.device_uuid, item.header));
         }
@@ -292,9 +305,9 @@ impl SenderQueue {
                     }
                 }
             }
-            if Self::is_media_header(&item.header) {
+            if Self::is_media_header(&item.header) && !Self::is_media_end_packet(&item.plaintext) {
                 log::debug!(
-                    "发送队列: 媒体状态发送失败即弃 uuid={}, header={}",
+                    "发送队列: 媒体高频状态发送失败即弃 uuid={}, header={}",
                     item.device_uuid,
                     item.header
                 );
@@ -409,6 +422,25 @@ mod tests {
         q.enqueue(item("dev1", "DATA_NOTIFICATION", r#"{"title":"n"}"#));
         let inner = q.inner.lock().unwrap();
         assert_eq!(inner.items[0].retries_left, 1);
+        assert_eq!(inner.items[1].retries_left, SenderQueue::MAX_RETRIES);
+    }
+
+    #[test]
+    fn test_media_end_packet_retries_enabled() {
+        let q = SenderQueue::new();
+        // 结束包（terminateValue=__END__）必须可靠送达，需重试
+        q.enqueue(item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"terminate":true,"terminateValue":"__END__"}"#,
+        ));
+        q.enqueue(item(
+            "dev1",
+            "DATA_SUPERISLAND",
+            r#"{"terminateValue":"__END__"}"#,
+        ));
+        let inner = q.inner.lock().unwrap();
+        assert_eq!(inner.items[0].retries_left, SenderQueue::MAX_RETRIES);
         assert_eq!(inner.items[1].retries_left, SenderQueue::MAX_RETRIES);
     }
 
