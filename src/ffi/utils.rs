@@ -316,7 +316,7 @@ mod tests {
         let title = to_cstr("Hello");
         let text = to_cstr("World");
         let iid = to_cstr("inst-123");
-        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
+        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
         let s = unsafe { from_cstr(result).to_string() };
         assert!(!s.is_empty());
         assert_eq!(s.len(), 40);
@@ -329,7 +329,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
+        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -341,7 +341,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
+        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -353,7 +353,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
+        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -362,12 +362,12 @@ mod tests {
     fn test_text_similarity() {
         let a = to_cstr("hello world");
         let b = to_cstr("hello world");
-        let result = unsafe { nrc_text_similarity(a, b) };
+        let result = nrc_text_similarity(a, b);
         assert_eq!(result, 1.0);
 
         let c = to_cstr("hello");
         let d = to_cstr("world");
-        let result2 = unsafe { nrc_text_similarity(c, d) };
+        let result2 = nrc_text_similarity(c, d);
         assert!(result2 < 1.0);
     }
 
@@ -377,21 +377,21 @@ mod tests {
         let ntx = to_cstr("World");
         let ot = to_cstr("Hello");
         let otx = to_cstr("World");
-        let result = unsafe { nrc_should_deduplicate(nt, ntx, ot, otx) };
+        let result = nrc_should_deduplicate(nt, ntx, ot, otx);
         assert_eq!(result, 1);
 
         let nt2 = to_cstr("Completely different title");
         let ntx2 = to_cstr("Completely different text body that is very long");
         let ot2 = to_cstr("Something else entirely");
         let otx2 = to_cstr("Another message that shares no words with the other");
-        let result2 = unsafe { nrc_should_deduplicate(nt2, ntx2, ot2, otx2) };
+        let result2 = nrc_should_deduplicate(nt2, ntx2, ot2, otx2);
         assert_eq!(result2, 0);
     }
 
     #[test]
     fn test_derive_ftp_credentials() {
         let secret = to_cstr("dGVzdHNlY3JldA==");
-        let result = unsafe { nrc_derive_ftp_credentials(secret) };
+        let result = nrc_derive_ftp_credentials(secret);
         let s = unsafe { from_cstr(result).to_string() };
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(v["username"].as_str().unwrap().starts_with("ftp_"));
@@ -401,14 +401,14 @@ mod tests {
     #[test]
     fn test_derive_password_hash() {
         let pw = to_cstr("mypassword");
-        let result = unsafe { nrc_derive_password_hash(pw) };
+        let result = nrc_derive_password_hash(pw);
         let s = unsafe { from_cstr(result).to_string() };
         assert!(!s.is_empty());
     }
 
     #[test]
     fn test_generate_random_password() {
-        let result = unsafe { nrc_generate_random_password() };
+        let result = nrc_generate_random_password();
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 12);
     }
