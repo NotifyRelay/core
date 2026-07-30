@@ -14,6 +14,7 @@ mod protocol;
 pub mod reconnect;
 mod router;
 pub mod sender_queue;
+mod state_merge;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -51,6 +52,8 @@ pub struct CoreContext {
     pub offline_detector_handle: i64,
     pub sender_queue: i64,
     pub reconnect_state: i64,
+    /// 超级岛 / 媒体 状态合并引擎（diff/merge/ACK/心跳全部在此闭环）
+    pub state_merge: state_merge::StateMerge,
 }
 
 pub struct PairingContext {
@@ -95,6 +98,7 @@ impl CoreContext {
             offline_detector_handle: 0,
             sender_queue: 0,
             reconnect_state: 0,
+            state_merge: state_merge::StateMerge::new(),
         }
     }
 }

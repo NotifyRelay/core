@@ -21,19 +21,14 @@ pub extern "C" fn nrc_compute_dedup_key(
     to_cstr(&hex)
 }
 
-#[no_mangle]
-pub extern "C" fn nrc_compute_feature_id(
-    super_pkg: *const c_char,
-    param_v2_raw: *const c_char,
-    title: *const c_char,
-    text: *const c_char,
-    instance_id: *const c_char,
-) -> *mut c_char {
-    let pkg = unsafe { from_cstr(super_pkg) };
-    let param = unsafe { from_cstr(param_v2_raw) };
-    let t = unsafe { from_cstr(title) };
-    let tx = unsafe { from_cstr(text) };
-    let iid = unsafe { from_cstr(instance_id) };
+/// 计算"岛"的特征ID（与 Kotlin computeFeatureId 对齐）。抽取为可复用实现供状态合并引擎调用。
+pub(crate) fn compute_feature_id_impl(
+    pkg: &str,
+    param: &str,
+    t: &str,
+    tx: &str,
+    iid: &str,
+) -> String {
     let mut key_parts: Vec<String> = Vec::new();
     key_parts.push(pkg.to_string());
     if !param.is_empty() {
@@ -81,8 +76,24 @@ pub extern "C" fn nrc_compute_feature_id(
     }
     let raw = key_parts.join("|");
     let hash = sha1::Sha1::digest(raw.as_bytes());
-    let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-    to_cstr(&hex)
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[no_mangle]
+pub extern "C" fn nrc_compute_feature_id(
+    super_pkg: *const c_char,
+    param_v2_raw: *const c_char,
+    title: *const c_char,
+    text: *const c_char,
+    instance_id: *const c_char,
+) -> *mut c_char {
+    let pkg = unsafe { from_cstr(super_pkg) };
+    let param = unsafe { from_cstr(param_v2_raw) };
+    let t = unsafe { from_cstr(title) };
+    let tx = unsafe { from_cstr(text) };
+    let iid = unsafe { from_cstr(instance_id) };
+    let result = compute_feature_id_impl(&pkg, &param, &t, &tx, &iid);
+    to_cstr(&result)
 }
 
 #[no_mangle]

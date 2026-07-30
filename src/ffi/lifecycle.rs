@@ -15,7 +15,9 @@ pub extern "C" fn nrc_init() -> *mut c_void {
         env!("NOTIFY_RELAY_GIT_HASH")
     );
     let ctx = Box::new(std::sync::Mutex::new(CoreContext::new()));
-    Box::into_raw(ctx) as *mut c_void
+    let ptr = Box::into_raw(ctx) as *mut c_void;
+    crate::state_merge::start_heartbeat_thread(ptr as usize);
+    ptr
 }
 
 #[no_mangle]

@@ -15,6 +15,7 @@ pub mod processing;
 pub mod reconnect;
 pub mod send;
 pub mod sender_queue;
+pub mod state_merge;
 pub mod utils;
 
 pub use audio_stream::*;

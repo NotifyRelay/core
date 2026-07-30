@@ -354,6 +354,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 fields.encrypted_payload.len()
             );
 
+            // 超级岛 / 媒体：交给状态合并引擎，Rust 内部合并为全量后通过全量回调交给平台。
+            // 平台永远只见到全键值状态，差异合并仅在 Rust 内闭环。
+            if hdr == "DATA_MEDIAPLAY" || hdr == "DATA_SUPERISLAND" {
+                let is_media = hdr == "DATA_MEDIAPLAY";
+                crate::state_merge::handle_state_message(&mut *ctx, &uuid_s, is_media, &plaintext);
+                return 0;
+            }
+
             let msg_type = match hdr {
                 "DATA_NOTIFICATION" => "NOTIFICATION",
                 "DATA_MEDIAPLAY" => "MEDIAPLAY",
