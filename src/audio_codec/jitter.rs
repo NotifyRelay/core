@@ -3,14 +3,13 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_JITTER_DEPTH_MS: u64 = 100;
 const HOLD_WINDOW_MS: u64 = 40;
-const CLEANUP_THRESHOLD: usize = 200;
+const MAX_GAP_SIZE: u16 = u16::MAX / 2;
 
 pub struct JitterBuffer {
     packets: BTreeMap<u16, (Vec<u8>, Instant)>,
     last_seq: Option<u16>,
     jitter_depth: Duration,
     hold_window: Duration,
-    pending_cleanup: bool,
 }
 
 impl JitterBuffer {
@@ -20,19 +19,14 @@ impl JitterBuffer {
             last_seq: None,
             jitter_depth: Duration::from_millis(DEFAULT_JITTER_DEPTH_MS),
             hold_window: Duration::from_millis(HOLD_WINDOW_MS),
-            pending_cleanup: false,
         }
     }
 
+    #[inline]
     pub fn push(&mut self, seq: u16, data: Vec<u8>) {
         let now = Instant::now();
         self.packets.insert(seq, (data, now));
-        if self.pending_cleanup || self.packets.len() > CLEANUP_THRESHOLD {
-            self.cleanup(now);
-            self.pending_cleanup = false;
-        } else if self.packets.len() > 100 {
-            self.pending_cleanup = true;
-        }
+        self.cleanup(now);
     }
 
     #[inline]
@@ -97,7 +91,7 @@ impl JitterBuffer {
 
         let gap_size = first_available.wrapping_sub(next_seq);
 
-        if gap_size > 0 && gap_size < 1000 {
+        if gap_size > 0 && gap_size < MAX_GAP_SIZE {
             self.last_seq = Some(first_available.wrapping_sub(1));
             (None, gap_size as u64)
         } else {
@@ -116,6 +110,5 @@ impl JitterBuffer {
     pub fn reset(&mut self) {
         self.packets.clear();
         self.last_seq = None;
-        self.pending_cleanup = false;
     }
 }
