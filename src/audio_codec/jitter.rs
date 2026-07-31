@@ -3,12 +3,14 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_JITTER_DEPTH_MS: u64 = 100;
 const HOLD_WINDOW_MS: u64 = 40;
+const CLEANUP_THRESHOLD: usize = 200;
 
 pub struct JitterBuffer {
     packets: BTreeMap<u16, (Vec<u8>, Instant)>,
     last_seq: Option<u16>,
     jitter_depth: Duration,
     hold_window: Duration,
+    pending_cleanup: bool,
 }
 
 impl JitterBuffer {
@@ -18,15 +20,22 @@ impl JitterBuffer {
             last_seq: None,
             jitter_depth: Duration::from_millis(DEFAULT_JITTER_DEPTH_MS),
             hold_window: Duration::from_millis(HOLD_WINDOW_MS),
+            pending_cleanup: false,
         }
     }
 
     pub fn push(&mut self, seq: u16, data: Vec<u8>) {
         let now = Instant::now();
         self.packets.insert(seq, (data, now));
-        self.cleanup(now);
+        if self.pending_cleanup || self.packets.len() > CLEANUP_THRESHOLD {
+            self.cleanup(now);
+            self.pending_cleanup = false;
+        } else if self.packets.len() > 100 {
+            self.pending_cleanup = true;
+        }
     }
 
+    #[inline]
     fn cleanup(&mut self, now: Instant) {
         self.packets
             .retain(|_, (_, ts)| now.duration_since(*ts) <= self.jitter_depth);
@@ -107,5 +116,6 @@ impl JitterBuffer {
     pub fn reset(&mut self) {
         self.packets.clear();
         self.last_seq = None;
+        self.pending_cleanup = false;
     }
 }

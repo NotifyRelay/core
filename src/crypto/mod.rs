@@ -12,6 +12,8 @@ use std::collections::HashMap;
 pub struct DeviceKeyEntry {
     pub remote_pub_key: String,
     pub aes_key_b64: String,
+    #[serde(skip)]
+    pub aes_key_bytes: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,9 +40,12 @@ impl CryptoState {
 
     /// 获取指定对端的 AES-256 密钥
     pub fn get_aes_key(&self, remote_uuid: &str) -> Option<[u8; 32]> {
-        let key_b64 = self.device_keys.get(remote_uuid)?.aes_key_b64.clone();
+        let entry = self.device_keys.get(remote_uuid)?;
+        if let Some(cached) = entry.aes_key_bytes {
+            return Some(cached);
+        }
         let key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&key_b64)
+            .decode(&entry.aes_key_b64)
             .ok()?;
         if key_bytes.len() != 32 {
             return None;
@@ -48,5 +53,34 @@ impl CryptoState {
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&key_bytes);
         Some(key_arr)
+    }
+
+    /// 存储设备密钥并预解码 AES key
+    pub fn set_device_key(
+        &mut self,
+        uuid: String,
+        remote_pub_key: String,
+        aes_key_b64: String,
+    ) {
+        let aes_key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&aes_key_b64)
+            .ok()
+            .and_then(|bytes| {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else {
+                    None
+                }
+            });
+        self.device_keys.insert(
+            uuid,
+            DeviceKeyEntry {
+                remote_pub_key,
+                aes_key_b64,
+                aes_key_bytes,
+            },
+        );
     }
 }

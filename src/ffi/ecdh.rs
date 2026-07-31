@@ -61,6 +61,7 @@ pub unsafe extern "C" fn nrc_ecdh_derive_shared_secret(
                         crypto::DeviceKeyEntry {
                             remote_pub_key: peer.clone(),
                             aes_key_b64: b64,
+                            aes_key_bytes: Some(aes_key),
                         },
                     );
                     0

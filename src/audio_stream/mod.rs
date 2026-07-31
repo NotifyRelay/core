@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::raw::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU16, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use rtp::header::Header;
 use rtp::packet::Packet;
 use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
@@ -18,28 +19,39 @@ pub type AudioEventCb =
     Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>;
 
 pub struct AudioStats {
-    pub packets_sent: u64,
-    pub packets_received: u64,
-    pub packets_lost: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub opus_bytes_sent: u64,
-    pub opus_bytes_received: u64,
-    pub start_time: Instant,
+    pub packets_sent: AtomicU64,
+    pub packets_received: AtomicU64,
+    pub packets_lost: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+    pub opus_bytes_sent: AtomicU64,
+    pub opus_bytes_received: AtomicU64,
+    pub start_time: parking_lot::Mutex<Instant>,
 }
 
 impl AudioStats {
     pub fn new() -> Self {
         Self {
-            packets_sent: 0,
-            packets_received: 0,
-            packets_lost: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            opus_bytes_sent: 0,
-            opus_bytes_received: 0,
-            start_time: Instant::now(),
+            packets_sent: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+            packets_lost: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            opus_bytes_sent: AtomicU64::new(0),
+            opus_bytes_received: AtomicU64::new(0),
+            start_time: parking_lot::Mutex::new(Instant::now()),
         }
+    }
+
+    pub fn reset(&self) {
+        self.packets_sent.store(0, Ordering::Relaxed);
+        self.packets_received.store(0, Ordering::Relaxed);
+        self.packets_lost.store(0, Ordering::Relaxed);
+        self.bytes_sent.store(0, Ordering::Relaxed);
+        self.bytes_received.store(0, Ordering::Relaxed);
+        self.opus_bytes_sent.store(0, Ordering::Relaxed);
+        self.opus_bytes_received.store(0, Ordering::Relaxed);
+        *self.start_time.lock() = Instant::now();
     }
 }
 
@@ -60,10 +72,10 @@ pub struct AudioStreamState {
     pub encoder: Arc<Mutex<Option<OpusEncoder>>>,
     pub decoder: Arc<Mutex<Option<OpusDecoder>>>,
     pub jitter: Arc<Mutex<Option<JitterBuffer>>>,
-    pub rtp_seq: Arc<Mutex<u16>>,
-    pub rtp_ts: Arc<Mutex<u32>>,
+    pub rtp_seq: AtomicU16,
+    pub rtp_ts: AtomicU32,
     pub ssrc: u32,
-    pub stats: Arc<Mutex<AudioStats>>,
+    pub stats: Arc<AudioStats>,
     pub pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
     pub pcm_buffer: Arc<Mutex<Vec<i16>>>,
 }
@@ -86,10 +98,10 @@ impl AudioStreamState {
             encoder: Arc::new(Mutex::new(None)),
             decoder: Arc::new(Mutex::new(None)),
             jitter: Arc::new(Mutex::new(None)),
-            rtp_seq: Arc::new(Mutex::new(0)),
-            rtp_ts: Arc::new(Mutex::new(0)),
+            rtp_seq: AtomicU16::new(0),
+            rtp_ts: AtomicU32::new(0),
             ssrc: rand::random(),
-            stats: Arc::new(Mutex::new(AudioStats::new())),
+            stats: Arc::new(AudioStats::new()),
             pcm_queue: Arc::new(Mutex::new(VecDeque::new())),
             pcm_buffer: Arc::new(Mutex::new(Vec::new())),
         }
@@ -146,11 +158,11 @@ pub(crate) fn start_sender(
     state.peer_ip = ip.to_string();
     state.peer_port = port;
     state.udp_socket = Some(socket);
-    *state.encoder.lock().unwrap() = Some(encoder);
+    *state.encoder.lock() = Some(encoder);
     state.active.store(true, Ordering::SeqCst);
 
-    let mut stats = state.stats.lock().unwrap();
-    *stats = AudioStats::new();
+    state.stats.reset();
+    *state.stats.start_time.lock() = Instant::now();
 
     log::info!("音频流: 发送端已启动，对端 {ip}:{port}");
     true
@@ -214,14 +226,12 @@ pub(crate) fn start_receiver(
     state.sample_rate = sample_rate;
     state.channels = channels;
     state.udp_socket = Some(socket);
-    *state.decoder.lock().unwrap() = Some(decoder);
-    *state.jitter.lock().unwrap() = Some(JitterBuffer::new());
+    *state.decoder.lock() = Some(decoder);
+    *state.jitter.lock() = Some(JitterBuffer::new());
     state.active.store(true, Ordering::SeqCst);
 
-    {
-        let mut stats = state.stats.lock().unwrap();
-        *stats = AudioStats::new();
-    }
+    state.stats.reset();
+    *state.stats.start_time.lock() = Instant::now();
 
     log::info!("音频流: 接收端已启动，监听 :{port}");
 
@@ -272,10 +282,8 @@ fn start_read_thread(state: &mut AudioStreamState) {
 
         let mut wait_count = 0;
         while active.load(Ordering::SeqCst) {
-            if let Ok(queue_guard) = pcm_queue.lock() {
-                if queue_guard.len() >= 3 {
-                    break;
-                }
+            if pcm_queue.lock().len() >= 3 {
+                break;
             }
             wait_count += 1;
             thread::sleep(Duration::from_millis(5));
@@ -299,7 +307,7 @@ fn read_loop(
     _channels: i32,
     decoder: Arc<Mutex<Option<OpusDecoder>>>,
     jitter: Arc<Mutex<Option<JitterBuffer>>>,
-    stats: Arc<Mutex<AudioStats>>,
+    stats: Arc<AudioStats>,
     pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
 ) {
     let mut buf = [0u8; 2048];
@@ -327,16 +335,14 @@ fn read_loop(
                 let payload = pkt.payload.to_vec();
 
                 {
-                    let mut jitter_guard = jitter.lock().unwrap();
-                    let jitter_buf = jitter_guard.as_mut().unwrap();
-                    jitter_buf.push(seq, payload);
+                    let mut jitter_guard = jitter.lock();
+                    if let Some(jitter_buf) = jitter_guard.as_mut() {
+                        jitter_buf.push(seq, payload);
+                    }
                 }
 
-                {
-                    let mut stats_guard = stats.lock().unwrap();
-                    stats_guard.packets_received += 1;
-                    stats_guard.bytes_received += n as u64;
-                }
+                stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
 
                 loop {
                     if !active.load(Ordering::SeqCst) {
@@ -344,30 +350,33 @@ fn read_loop(
                     }
 
                     let (opus_data, lost_count) = {
-                        let mut jitter_guard = jitter.lock().unwrap();
-                        let jitter_buf = jitter_guard.as_mut().unwrap();
-                        jitter_buf.pop_with_gap()
+                        let mut jitter_guard = jitter.lock();
+                        match jitter_guard.as_mut() {
+                            Some(jitter_buf) => jitter_buf.pop_with_gap(),
+                            None => break,
+                        }
                     };
 
                     if lost_count > 0 {
-                        let mut stats_guard = stats.lock().unwrap();
-                        stats_guard.packets_lost += lost_count;
+                        stats.packets_lost.fetch_add(lost_count, Ordering::Relaxed);
 
                         for _ in 0..lost_count {
                             let pcm = {
-                                let mut decoder_guard = decoder.lock().unwrap();
-                                let dec = decoder_guard.as_mut().unwrap();
-                                match dec.decode_loss() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        log::warn!("音频流: Opus PLC 失败: {e}");
-                                        continue;
-                                    }
+                                let mut decoder_guard = decoder.lock();
+                                match decoder_guard.as_mut() {
+                                    Some(dec) => match dec.decode_loss() {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            log::warn!("音频流: Opus PLC 失败: {e}");
+                                            continue;
+                                        }
+                                    },
+                                    None => break,
                                 }
                             };
 
                             {
-                                let mut queue_guard = pcm_queue.lock().unwrap();
+                                let mut queue_guard = pcm_queue.lock();
                                 queue_guard.push_back(pcm);
                                 if queue_guard.len() > 50 {
                                     queue_guard.pop_front();
@@ -379,24 +388,23 @@ fn read_loop(
                     match opus_data {
                         Some(data) => {
                             let pcm = {
-                                let mut decoder_guard = decoder.lock().unwrap();
-                                let dec = decoder_guard.as_mut().unwrap();
-                                match dec.decode(&data) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        log::warn!("音频流: Opus 解码失败: {e}");
-                                        continue;
-                                    }
+                                let mut decoder_guard = decoder.lock();
+                                match decoder_guard.as_mut() {
+                                    Some(dec) => match dec.decode(&data) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            log::warn!("音频流: Opus 解码失败: {e}");
+                                            continue;
+                                        }
+                                    },
+                                    None => break,
                                 }
                             };
 
-                            {
-                                let mut stats_guard = stats.lock().unwrap();
-                                stats_guard.opus_bytes_received += data.len() as u64;
-                            }
+                            stats.opus_bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
 
                             {
-                                let mut queue_guard = pcm_queue.lock().unwrap();
+                                let mut queue_guard = pcm_queue.lock();
                                 queue_guard.push_back(pcm);
                                 if queue_guard.len() > 50 {
                                     queue_guard.pop_front();
@@ -444,7 +452,7 @@ fn playback_loop(
         }
 
         let pcm = {
-            let mut queue_guard = pcm_queue.lock().unwrap();
+            let mut queue_guard = pcm_queue.lock();
             queue_guard.pop_front()
         };
 
@@ -501,19 +509,18 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
 
     let frame_samples = {
         let encoder_guard = match state.encoder.try_lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        let encoder = match encoder_guard.as_ref() {
-            Some(e) => e,
+            Some(g) => g,
             None => return false,
         };
-        encoder.frame_size() as usize * encoder.channels() as usize
+        match encoder_guard.as_ref() {
+            Some(e) => e.frame_size() as usize * e.channels() as usize,
+            None => return false,
+        }
     };
 
     let mut buffer_guard = match state.pcm_buffer.try_lock() {
-        Ok(g) => g,
-        Err(_) => return false,
+        Some(g) => g,
+        None => return false,
     };
     buffer_guard.extend_from_slice(&pcm);
 
@@ -523,8 +530,8 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         drop(buffer_guard);
 
         let mut encoder_guard = match state.encoder.try_lock() {
-            Ok(g) => g,
-            Err(_) => return false,
+            Some(g) => g,
+            None => return false,
         };
         let encoder = match encoder_guard.as_mut() {
             Some(e) => e,
@@ -559,28 +566,11 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
             state.peer_port,
         );
 
-        let mut seq_guard = match state.rtp_seq.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                result = false;
-                break;
-            }
-        };
-        let seq = *seq_guard;
-        *seq_guard = seq.wrapping_add(1);
-
-        let mut ts_guard = match state.rtp_ts.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                result = false;
-                break;
-            }
-        };
-        let ts = *ts_guard;
-        *ts_guard += encoder.frame_size() as u32;
-
+        let seq = state.rtp_seq.fetch_add(1, Ordering::SeqCst);
+        let ts = state.rtp_ts.fetch_add(encoder.frame_size() as u32, Ordering::SeqCst);
         let ssrc = state.ssrc;
 
+        let opus_len = opus_data.len() as u64;
         let pkt = Packet {
             header: Header {
                 version: 2,
@@ -596,7 +586,7 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
                 extensions: vec![],
                 extensions_padding: 0,
             },
-            payload: Bytes::from(opus_data.clone()),
+            payload: Bytes::from(opus_data),
         };
 
         let mut rtp_buf = vec![0u8; pkt.marshal_size()];
@@ -608,11 +598,9 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
 
         match socket.send_to(&rtp_buf, &peer_addr) {
             Ok(n) => {
-                if let Ok(mut stats) = state.stats.try_lock() {
-                    stats.packets_sent += 1;
-                    stats.bytes_sent += n as u64;
-                    stats.opus_bytes_sent += opus_data.len() as u64;
-                }
+                state.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                state.stats.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                state.stats.opus_bytes_sent.fetch_add(opus_len, Ordering::Relaxed);
             }
             Err(e) => {
                 log::warn!("音频流: UDP 发送失败: {e}");
@@ -622,8 +610,8 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         }
 
         buffer_guard = match state.pcm_buffer.try_lock() {
-            Ok(g) => g,
-            Err(_) => return result,
+            Some(g) => g,
+            None => return result,
         };
     }
 
@@ -643,55 +631,60 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
         handles.push(h);
     }
 
-    let frame_size = match state.encoder.lock().unwrap().as_ref() {
+    let frame_size = match state.encoder.lock().as_ref() {
         Some(e) => e.frame_size(),
-        None => match state.decoder.lock().unwrap().as_ref() {
+        None => match state.decoder.lock().as_ref() {
             Some(d) => d.frame_size(),
             None => 960,
         },
     };
 
-    if let Ok(stats) = state.stats.try_lock() {
-        let elapsed = stats.start_time.elapsed().as_secs_f64();
-        let pcm_bytes_sent = stats.packets_sent * frame_size as u64 * 2 * 2;
-        let _pcm_bytes_received = stats.packets_received * frame_size as u64 * 2 * 2;
-        let compression_ratio = if pcm_bytes_sent > 0 {
-            pcm_bytes_sent as f64 / stats.opus_bytes_sent as f64
-        } else {
-            0.0
-        };
-        let send_bitrate = if elapsed > 0.0 {
-            (stats.opus_bytes_sent * 8) as f64 / elapsed / 1000.0
-        } else {
-            0.0
-        };
-        let recv_bitrate = if elapsed > 0.0 {
-            (stats.opus_bytes_received * 8) as f64 / elapsed / 1000.0
-        } else {
-            0.0
-        };
-        let loss_rate = if stats.packets_received > 0 {
-            (stats.packets_lost as f64 / stats.packets_received as f64) * 100.0
-        } else {
-            0.0
-        };
+    let elapsed = state.stats.start_time.lock().elapsed().as_secs_f64();
+    let packets_sent = state.stats.packets_sent.load(Ordering::Relaxed);
+    let packets_received = state.stats.packets_received.load(Ordering::Relaxed);
+    let packets_lost = state.stats.packets_lost.load(Ordering::Relaxed);
+    let opus_bytes_sent = state.stats.opus_bytes_sent.load(Ordering::Relaxed);
+    let opus_bytes_received = state.stats.opus_bytes_received.load(Ordering::Relaxed);
 
-        log::info!(
-            "[音频流] 会话统计: 发送 {} 包/{} KB, 接收 {} 包/{} KB, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 发送比特率 {:.1} kbps, 接收比特率 {:.1} kbps, 帧大小 960, 持续时间 {:.1}s",
-            stats.packets_sent,
-            stats.opus_bytes_sent / 1024,
-            stats.packets_received,
-            stats.opus_bytes_received / 1024,
-            stats.packets_lost,
-            loss_rate,
-            pcm_bytes_sent as f64 / 1024.0 / 1024.0,
-            stats.opus_bytes_sent as f64 / 1024.0 / 1024.0,
-            compression_ratio,
-            send_bitrate,
-            recv_bitrate,
-            elapsed,
-        );
-    }
+    let pcm_bytes_sent = packets_sent * frame_size as u64 * 2 * 2;
+    let _pcm_bytes_received = packets_received * frame_size as u64 * 2 * 2;
+    let compression_ratio = if pcm_bytes_sent > 0 {
+        pcm_bytes_sent as f64 / opus_bytes_sent as f64
+    } else {
+        0.0
+    };
+    let send_bitrate = if elapsed > 0.0 {
+        (opus_bytes_sent * 8) as f64 / elapsed / 1000.0
+    } else {
+        0.0
+    };
+    let recv_bitrate = if elapsed > 0.0 {
+        (opus_bytes_received * 8) as f64 / elapsed / 1000.0
+    } else {
+        0.0
+    };
+    let loss_rate = if packets_received > 0 {
+        (packets_lost as f64 / packets_received as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    log::info!(
+        "[音频流] 会话统计: 发送 {} 包/{} KB, 接收 {} 包/{} KB, 丢包 {} ({:.2}%), 原始 PCM {:.1} MB → Opus {:.1} MB (压缩比 {:.1}:1), 发送比特率 {:.1} kbps, 接收比特率 {:.1} kbps, 帧大小 {}, 持续时间 {:.1}s",
+        packets_sent,
+        opus_bytes_sent / 1024,
+        packets_received,
+        opus_bytes_received / 1024,
+        packets_lost,
+        loss_rate,
+        pcm_bytes_sent as f64 / 1024.0 / 1024.0,
+        opus_bytes_sent as f64 / 1024.0 / 1024.0,
+        compression_ratio,
+        send_bitrate,
+        recv_bitrate,
+        frame_size,
+        elapsed,
+    );
 
     state.remote_uuid.clear();
     state.peer_ip.clear();

@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use threadpool::ThreadPool;
+
 use crate::heartbeat;
 use crate::protocol::codec;
 
@@ -131,7 +133,15 @@ pub fn start_tcp_server(
         state.port = port;
     }
 
+    let pool_size = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool = Arc::new(
+        ThreadPool::new(pool_size.max(2)),
+    );
+
     let state_clone = state.clone();
+    let pool_clone = pool.clone();
     let on_connected = on_device_connected;
     let on_disconnected = on_device_disconnected;
     let on_message = on_message_received;
@@ -140,6 +150,7 @@ pub fn start_tcp_server(
     thread::spawn(move || {
         accept_loop(
             state_clone,
+            pool_clone,
             on_connected,
             on_disconnected,
             on_message,
@@ -147,7 +158,7 @@ pub fn start_tcp_server(
         );
     });
 
-    log::info!("TCP 服务器已启动，监听端口 {}", port);
+    log::info!("TCP 服务器已启动，监听端口 {}，线程池大小 {}", port, pool_size);
     Ok(())
 }
 
@@ -170,6 +181,7 @@ pub fn stop_tcp_server(state: Arc<Mutex<TcpServerState>>) -> Result<(), String> 
 /// 接受连接循环
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
+    pool: Arc<ThreadPool>,
     on_connected: Option<ConnectedCallback>,
     on_disconnected: Option<DisconnectedCallback>,
     on_message: Option<MessageCallback>,
@@ -198,7 +210,7 @@ fn accept_loop(
                 let on_message = on_message.clone();
                 let on_err = on_error.clone();
 
-                thread::spawn(move || {
+                pool.execute(move || {
                     handle_connection(
                         stream,
                         addr,
@@ -211,7 +223,7 @@ fn accept_loop(
                 });
             }
             None => {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(5));
             }
         }
     }

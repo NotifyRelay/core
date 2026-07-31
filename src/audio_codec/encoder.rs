@@ -8,11 +8,13 @@ pub struct OpusEncoder {
     channels: i32,
     frame_size: i32,
     sample_rate: i32,
+    pcm_f32_buffer: Vec<f32>,
 }
 
 impl OpusEncoder {
     pub fn new(sample_rate: i32, channels: i32) -> Result<Self, EncodeError> {
         let frame_size = (sample_rate * OPUS_FRAME_MS) / 1000;
+        let frame_samples = frame_size as usize * channels as usize;
         let mut inner = ruopus::OpusEncoder::new(channels as usize);
         inner.set_bitrate(Some(OPUS_BITRATE));
         Ok(Self {
@@ -20,9 +22,11 @@ impl OpusEncoder {
             channels,
             frame_size,
             sample_rate,
+            pcm_f32_buffer: vec![0.0f32; frame_samples],
         })
     }
 
+    #[inline]
     pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, EncodeError> {
         let frame_samples = self.frame_size as usize * self.channels as usize;
 
@@ -36,8 +40,11 @@ impl OpusEncoder {
             return Ok(Vec::new());
         }
 
-        let pcm_f32: Vec<f32> = chunk.iter().map(|&x| x as f32 / 32768.0).collect();
-        self.inner.encode_auto(&pcm_f32, 1275)
+        let buf = &mut self.pcm_f32_buffer[..chunk.len()];
+        for (i, &s) in chunk.iter().enumerate() {
+            buf[i] = s as f32 / 32768.0;
+        }
+        self.inner.encode_auto(buf, 1275)
     }
 
     pub fn frame_size(&self) -> i32 {

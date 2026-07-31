@@ -81,6 +81,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                 crate::crypto::DeviceKeyEntry {
                                     remote_pub_key: peer_pub_str.clone(),
                                     aes_key_b64: b64,
+                                    aes_key_bytes: Some(aes_key),
                                 },
                             );
                         }
@@ -191,6 +192,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                     crate::crypto::DeviceKeyEntry {
                                         remote_pub_key: lt_pub.clone(),
                                         aes_key_b64: b64,
+                                        aes_key_bytes: Some(aes_key),
                                     },
                                 );
                                 guard.spake2_prover = None;

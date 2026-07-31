@@ -24,12 +24,10 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
     }
     with_ctx(ctx_ptr, |ctx| {
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
-        ctx.crypto.device_keys.insert(
+        ctx.crypto.set_device_key(
             uuid.to_string(),
-            crypto::DeviceKeyEntry {
-                remote_pub_key: String::new(),
-                aes_key_b64: b64,
-            },
+            String::new(),
+            b64,
         );
         0
     })
@@ -114,7 +112,19 @@ pub unsafe extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_c
                     ctx.crypto.local_key = ecdh::secret_from_pem(pem).ok();
                 }
                 ctx.crypto.local_pub_key_b64 = data.local_public_key_b64;
-                ctx.crypto.device_keys = data.devices;
+                let mut device_keys = data.devices;
+                for (_uuid, entry) in device_keys.iter_mut() {
+                    if entry.aes_key_bytes.is_none() {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64) {
+                            if bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&bytes);
+                                entry.aes_key_bytes = Some(arr);
+                            }
+                        }
+                    }
+                }
+                ctx.crypto.device_keys = device_keys;
                 0
             }
             Err(e) => {

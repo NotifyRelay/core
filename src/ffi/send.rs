@@ -241,6 +241,7 @@ pub extern "C" fn nrc_send_pairing_init(
                         crate::crypto::DeviceKeyEntry {
                             remote_pub_key: lt_pub.clone(),
                             aes_key_b64: b64,
+                            aes_key_bytes: Some(aes_key),
                         },
                     );
                     guard.spake2_prover = None;

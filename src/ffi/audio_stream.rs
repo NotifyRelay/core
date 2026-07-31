@@ -194,15 +194,12 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
 
     with_ctx(ctx_ptr, |ctx| {
         let audio_state = ctx.audio.lock().unwrap();
-        let _ = audio_state.encoder.lock().map(|mut g| *g = None);
-        let _ = audio_state.decoder.lock().map(|mut g| *g = None);
-        let _ = audio_state.jitter.lock().map(|mut g| *g = None);
-        let _ = audio_state
-            .stats
-            .lock()
-            .map(|mut g| *g = crate::audio_stream::AudioStats::new());
-        let _ = audio_state.pcm_queue.lock().map(|mut g| g.clear());
-        let _ = audio_state.pcm_buffer.lock().map(|mut g| g.clear());
+        *audio_state.encoder.lock() = None;
+        *audio_state.decoder.lock() = None;
+        *audio_state.jitter.lock() = None;
+        audio_state.stats.reset();
+        audio_state.pcm_queue.lock().clear();
+        audio_state.pcm_buffer.lock().clear();
     });
 
     log::info!("音频流: nrc_audio_stop 完成");
