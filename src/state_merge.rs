@@ -459,18 +459,17 @@ pub fn handle_state_message(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if let Ok(mut g) = ctx.lock() {
+        {
+            let g = ctx.get_mut().unwrap();
             g.state_merge.handle_ack(uuid, &fid, &hash);
         }
         return true;
     }
     let (fid, full, is_end) = {
-        match ctx.lock() {
-            Ok(mut g) => match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
-                Some(r) => r,
-                None => return false,
-            },
-            Err(_) => return false,
+        let g = ctx.get_mut().unwrap();
+        match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
+            Some(r) => r,
+            None => return false,
         }
     };
     // 合并后的全量经旧的 on_data 回调传出，platform 侧无需感知 delta。
@@ -479,9 +478,9 @@ pub fn handle_state_message(
     let wire_val: Value = serde_json::from_str(&full).unwrap_or(Value::Object(Map::new()));
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
-    let (cb, ud) = match ctx.lock() {
-        Ok(g) => (g.router.on_data, g.router.user_data),
-        Err(_) => return false,
+    let (cb, ud) = {
+        let g = ctx.get_mut().unwrap();
+        (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(uuid).unwrap_or_default();
@@ -493,26 +492,25 @@ pub fn handle_state_message(
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
     if !is_media && !is_end {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
-            if let Ok(g) = ctx.lock() {
-                if g.sender_queue != 0 {
-                    let q = unsafe { &*(g.sender_queue as *mut SenderQueue) };
-                    let ack = json!({
-                        "type": "SI_ACK",
-                        "device": uuid,
-                        "featureKeyValue": fid,
-                        "hash": hash,
-                    })
-                    .to_string();
-                    let item = SendItem {
-                        device_uuid: uuid.to_string(),
-                        header: "DATA_SUPERISLAND".to_string(),
-                        plaintext: ack,
-                        dedup_key: None,
-                        retries_left: 0,
-                        coalesce_key: None,
-                    };
-                    q.enqueue(item);
-                }
+            let g = ctx.get_mut().unwrap();
+            if g.sender_queue != 0 {
+                let q = unsafe { &*(g.sender_queue as *mut SenderQueue) };
+                let ack = json!({
+                    "type": "SI_ACK",
+                    "device": uuid,
+                    "featureKeyValue": fid,
+                    "hash": hash,
+                })
+                .to_string();
+                let item = SendItem {
+                    device_uuid: uuid.to_string(),
+                    header: "DATA_SUPERISLAND".to_string(),
+                    plaintext: ack,
+                    dedup_key: None,
+                    retries_left: 0,
+                    coalesce_key: None,
+                };
+                q.enqueue(item);
             }
         }
     }

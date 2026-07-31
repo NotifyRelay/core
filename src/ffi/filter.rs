@@ -17,6 +17,12 @@ impl FilterState {
     }
 }
 
+impl Default for FilterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 设置过滤配置（JSON 格式）
 #[no_mangle]
 pub unsafe extern "C" fn nrc_set_filter_config(
@@ -28,10 +34,7 @@ pub unsafe extern "C" fn nrc_set_filter_config(
     }
     let json_str = from_cstr(config_json);
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
 
     let config = &guard.filter.config;
     let mut cfg = match config.lock() {
@@ -39,7 +42,7 @@ pub unsafe extern "C" fn nrc_set_filter_config(
         Err(_) => return -1,
     };
 
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(v) = parsed
             .get("enablePackageGroupMapping")
             .and_then(|v| v.as_bool())
@@ -118,15 +121,12 @@ pub unsafe extern "C" fn nrc_map_local_package(
     }
     let pkg = from_cstr(remote_package);
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return to_cstr(""),
-    };
+    let guard = ctx.get_mut().unwrap();
     let config = match guard.filter.config.lock() {
         Ok(c) => c,
         Err(_) => return to_cstr(""),
     };
-    let mapped = config.map_to_local_package(&pkg);
+    let mapped = config.map_to_local_package(pkg);
     to_cstr(&mapped)
 }
 
@@ -147,15 +147,12 @@ unsafe fn check_filter_impl(
     };
     let text_str = if text.is_null() { "" } else { from_cstr(text) };
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return 1,
-    };
+    let guard = ctx.get_mut().unwrap();
     let config = match guard.filter.config.lock() {
         Ok(c) => c,
         Err(_) => return 1,
     };
-    if config.check_filter_mode(&pkg, title_str, text_str) {
+    if config.check_filter_mode(pkg, title_str, text_str) {
         1
     } else {
         0

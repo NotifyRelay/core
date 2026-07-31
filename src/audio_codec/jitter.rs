@@ -21,7 +21,15 @@ impl JitterBuffer {
             hold_window: Duration::from_millis(HOLD_WINDOW_MS),
         }
     }
+}
 
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JitterBuffer {
     #[inline]
     pub fn push(&mut self, seq: u16, data: Vec<u8>) {
         let now = Instant::now();

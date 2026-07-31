@@ -4,7 +4,7 @@
 //! - 调用 `nrc_push_superisland_state` / `nrc_push_media_state` 传入全量状态；
 //! - 接收端合并后的全量通过既有的 `nrc_set_on_data_cb`（`SUPERISLAND` / `MEDIAPLAY`）传出，
 //!   无需注册新的输出回调。
-//! 所有差异计算、合并、ACK 与心跳都在 Rust 内闭环。
+//!   所有差异计算、合并、ACK 与心跳都在 Rust 内闭环。
 
 use std::os::raw::c_char;
 use std::os::raw::c_void;
@@ -55,7 +55,7 @@ fn push_state_impl(
     };
     if guard
         .state_merge
-        .push_state(queue, &uuid, is_media, &full, is_end != 0)
+        .push_state(queue, uuid, is_media, full, is_end != 0)
     {
         0
     } else {

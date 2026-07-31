@@ -7,7 +7,6 @@ pub struct OpusEncoder {
     inner: ruopus::OpusEncoder,
     channels: i32,
     frame_size: i32,
-    sample_rate: i32,
     pcm_f32_buffer: Vec<f32>,
 }
 
@@ -21,7 +20,6 @@ impl OpusEncoder {
             inner,
             channels,
             frame_size,
-            sample_rate,
             pcm_f32_buffer: vec![0.0f32; frame_samples],
         })
     }

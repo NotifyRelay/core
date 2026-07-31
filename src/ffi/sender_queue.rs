@@ -15,9 +15,7 @@ pub extern "C" fn nrc_create_sender_queue(ctx_ptr: *mut c_void) -> i64 {
     let ptr = Box::into_raw(queue) as i64;
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(mut guard) = ctx.lock() {
-        guard.sender_queue = ptr;
-    }
+    ctx.get_mut().unwrap().sender_queue = ptr;
 
     ptr
 }
@@ -34,7 +32,7 @@ pub extern "C" fn nrc_start_sender_queue(ctx_ptr: *mut c_void, queue_ptr: i64) {
 
 /// 入队消息（IP 由 Rust 内部管理，无需平台端传入）
 #[no_mangle]
-pub extern "C" fn nrc_enqueue_message(
+pub unsafe extern "C" fn nrc_enqueue_message(
     ctx_ptr: *mut c_void,
     queue_ptr: i64,
     device_uuid: *const c_char,
@@ -73,7 +71,8 @@ pub extern "C" fn nrc_stop_sender_queue(ctx_ptr: *mut c_void, queue_ptr: i64) {
     }
     let queue = unsafe { Box::from_raw(queue_ptr as *mut SenderQueue) };
     queue.stop();
-    if let Ok(mut guard) = unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-        guard.sender_queue = 0;
-    }
+    unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+        .get_mut()
+        .unwrap()
+        .sender_queue = 0;
 }

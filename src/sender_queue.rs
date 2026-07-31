@@ -84,7 +84,15 @@ impl SenderQueue {
             active: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
 
+impl Default for SenderQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SenderQueue {
     /// 媒体类消息 header（高频全量状态，仅保留最新）
     fn is_media_header(header: &str) -> bool {
         matches!(header, "DATA_MEDIAPLAY" | "DATA_SUPERISLAND")
@@ -239,9 +247,7 @@ impl SenderQueue {
         if send_ok {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    if let Ok(mut guard) = ctx.lock() {
-                        guard.dedup.mark_sent(key);
-                    }
+                    ctx.get_mut().unwrap().dedup.mark_sent(key);
                 }
             }
             // 发送成功：清除该设备的失败退避状态
@@ -300,9 +306,7 @@ impl SenderQueue {
         } else {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    if let Ok(mut guard) = ctx.lock() {
-                        guard.dedup.clear_pending(key);
-                    }
+                    ctx.get_mut().unwrap().dedup.clear_pending(key);
                 }
             }
             if Self::is_media_header(&item.header) && !Self::is_media_end_packet(&item.plaintext) {
@@ -323,17 +327,15 @@ impl SenderQueue {
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        let (key_arr, local_uuid) = match ctx.lock() {
-            Ok(guard) => {
-                let key = guard.crypto.get_aes_key(&item.device_uuid);
-                let uuid = guard
-                    .broadcast_info
-                    .as_ref()
-                    .map(|i| i.uuid.clone())
-                    .unwrap_or_default();
-                (key, uuid)
-            }
-            Err(_) => return Err(()),
+        let (key_arr, local_uuid) = {
+            let guard = ctx.get_mut().unwrap();
+            let key = guard.crypto.get_aes_key(&item.device_uuid);
+            let uuid = guard
+                .broadcast_info
+                .as_ref()
+                .map(|i| i.uuid.clone())
+                .unwrap_or_default();
+            (key, uuid)
         };
 
         let key_arr = match key_arr {
@@ -356,14 +358,14 @@ impl SenderQueue {
         let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
 
         // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
-        let ip = match ctx.lock() {
-            Ok(guard) => guard
+        let ip = {
+            let guard = ctx.get_mut().unwrap();
+            guard
                 .device_ips
                 .lock()
                 .ok()
                 .and_then(|ips| ips.get(&item.device_uuid).cloned())
-                .unwrap_or_default(),
-            Err(_) => String::new(),
+                .unwrap_or_default()
         };
         if !ip.is_empty() && ip != "0.0.0.0" {
             // 媒体类消息用短超时快速失败，避免长时间占用并发槽位

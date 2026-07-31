@@ -272,7 +272,7 @@ fn handle_connection(
                 return;
             }
 
-            ///log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
+            //log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
             {
                 let mut state = state.lock().unwrap();
                 state.sessions.insert(
@@ -338,20 +338,9 @@ fn handle_connection(
         state.sessions.remove(&uuid);
     }
 
-    ///log::info!("TCP连接已断开 uuid={}", uuid);
+    //log::info!("TCP连接已断开 uuid={}", uuid);
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
-    }
-}
-
-/// 发送消息到指定设备（FFI 用）
-pub fn send_to_device(state: Arc<Mutex<TcpServerState>>, uuid: &str, message: &str) -> bool {
-    match state.lock() {
-        Ok(mut state) => state.send_to_device(uuid, message),
-        Err(e) => {
-            log::error!("加锁失败: {}", e);
-            false
-        }
     }
 }
 
@@ -610,8 +599,8 @@ mod tests {
 
     #[test]
     fn test_send_to_device_not_connected() {
-        let state = Arc::new(Mutex::new(TcpServerState::new()));
-        let result = send_to_device(state.clone(), "test-uuid", "test message");
+        let mut state = TcpServerState::new();
+        let result = state.send_to_device("test-uuid", "test message");
         assert!(!result);
     }
 

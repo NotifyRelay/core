@@ -73,8 +73,8 @@ where
         return R::default();
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    match ctx.lock() {
-        Ok(mut guard) => f(&mut guard),
+    match ctx.get_mut() {
+        Ok(g) => f(g),
         Err(_) => R::default(),
     }
 }

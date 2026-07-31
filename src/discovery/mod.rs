@@ -119,15 +119,15 @@ impl DiscoveryState {
 
                     for (uuid, ip) in known_list {
                         // 检查是否已连接
-                        let connected = match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock()
-                        {
-                            Ok(ctx) => ctx
+                        let connected = {
+                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                            ctx.get_mut()
+                                .unwrap()
                                 .network
                                 .tcp
                                 .lock()
                                 .map(|tcp| tcp.is_connected(&uuid))
-                                .unwrap_or(false),
-                            Err(_) => false,
+                                .unwrap_or(false)
                         };
 
                         if connected {
@@ -135,24 +135,22 @@ impl DiscoveryState {
                         }
 
                         // 尝试握手建立连接
-                        let handshake = match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock()
-                        {
-                            Ok(guard) => {
-                                let local_uuid = guard
-                                    .broadcast_info
-                                    .as_ref()
-                                    .map(|i| i.uuid.clone())
-                                    .unwrap_or_default();
-                                let local_pub =
-                                    guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
-                                let dt = guard
-                                    .broadcast_info
-                                    .as_ref()
-                                    .map(|i| i.device_type.clone())
-                                    .unwrap_or_default();
-                                codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
-                            }
-                            Err(_) => continue,
+                        let handshake = {
+                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                            let guard = ctx.get_mut().unwrap();
+                            let local_uuid = guard
+                                .broadcast_info
+                                .as_ref()
+                                .map(|i| i.uuid.clone())
+                                .unwrap_or_default();
+                            let local_pub =
+                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
+                            let dt = guard
+                                .broadcast_info
+                                .as_ref()
+                                .map(|i| i.device_type.clone())
+                                .unwrap_or_default();
+                            codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
                         };
 
                         let resp = network::oneshot_send_receive(

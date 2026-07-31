@@ -4,7 +4,6 @@ pub struct OpusDecoder {
     inner: ruopus::OpusDecoder,
     channels: i32,
     frame_size: i32,
-    sample_rate: i32,
     pcm_i16_buffer: Vec<i16>,
 }
 
@@ -17,7 +16,6 @@ impl OpusDecoder {
             inner,
             channels,
             frame_size,
-            sample_rate,
             pcm_i16_buffer: vec![0i16; frame_samples],
         })
     }

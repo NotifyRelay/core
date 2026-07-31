@@ -82,7 +82,8 @@ pub unsafe extern "C" fn nrc_audio_start(
 
     if !ctx_ptr.is_null() {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        if let Ok(guard) = ctx.lock() {
+        {
+            let guard = ctx.get_mut().unwrap();
             let mut audio_state = guard.audio.lock().unwrap();
             audio_state.remote_uuid = ruuid.clone();
 
@@ -151,7 +152,8 @@ pub unsafe extern "C" fn nrc_audio_write_frame(
         return -1;
     }
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    if let Ok(guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         if let Ok(audio_state) = guard.audio.try_lock() {
             if audio_stream::write_frame(&audio_state, pcm) {
                 return 0;
@@ -176,11 +178,10 @@ pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
 
     let thread_handles = if !ctx_ptr.is_null() {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        if let Ok(guard) = ctx.lock() {
+        {
+            let guard = ctx.get_mut().unwrap();
             let audio_state = &mut guard.audio.lock().unwrap();
             audio_stream::stop(audio_state)
-        } else {
-            Vec::new()
         }
     } else {
         Vec::new()
@@ -212,7 +213,8 @@ pub extern "C" fn nrc_audio_is_active(ctx_ptr: *mut c_void) -> i32 {
         return 0;
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         if let Ok(audio_state) = guard.audio.try_lock() {
             let active = audio_state.active.load(std::sync::atomic::Ordering::SeqCst);
             log::debug!("音频流: 查询活跃状态={}", active);
@@ -231,7 +233,8 @@ pub extern "C" fn nrc_register_audio_data_cb(
         return;
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         let mut audio_state = guard.audio.lock().unwrap();
         audio_state.on_data = cb;
     }
@@ -246,7 +249,8 @@ pub extern "C" fn nrc_register_audio_event_cb(
         return;
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         if let Ok(mut audio_state) = guard.audio.try_lock() {
             audio_state.on_event = cb;
         }

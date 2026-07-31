@@ -14,15 +14,13 @@ pub extern "C" fn nrc_create_reconnect_state(ctx_ptr: *mut c_void) -> i64 {
     let state = Box::new(ReconnectState::new());
     let ptr = Box::into_raw(state) as i64;
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    if let Ok(mut guard) = ctx.lock() {
-        guard.reconnect_state = ptr;
-    }
+    ctx.get_mut().unwrap().reconnect_state = ptr;
     ptr
 }
 
 /// 添加重连目标
 #[no_mangle]
-pub extern "C" fn nrc_reconnect_add_target(
+pub unsafe extern "C" fn nrc_reconnect_add_target(
     ctx_ptr: *mut c_void,
     state_ptr: i64,
     uuid: *const c_char,
@@ -39,7 +37,7 @@ pub extern "C" fn nrc_reconnect_add_target(
 
 /// 移除重连目标
 #[no_mangle]
-pub extern "C" fn nrc_reconnect_remove_target(
+pub unsafe extern "C" fn nrc_reconnect_remove_target(
     ctx_ptr: *mut c_void,
     state_ptr: i64,
     uuid: *const c_char,
@@ -76,7 +74,8 @@ pub extern "C" fn nrc_reconnect_stop(ctx_ptr: *mut c_void, state_ptr: i64) {
     }
     let state = unsafe { Box::from_raw(state_ptr as *mut ReconnectState) };
     state.stop();
-    if let Ok(mut guard) = unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-        guard.reconnect_state = 0;
-    }
+    unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+        .get_mut()
+        .unwrap()
+        .reconnect_state = 0;
 }

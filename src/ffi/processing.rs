@@ -21,9 +21,9 @@ fn fire_pairing_cb(
     int_value: i32,
     extra: &str,
 ) {
-    let (cb, ud) = match ctx.lock() {
-        Ok(g) => (g.router.on_pairing, g.router.user_data),
-        Err(_) => return,
+    let (cb, ud) = {
+        let g = ctx.get_mut().unwrap();
+        (g.router.on_pairing, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(uuid).unwrap_or_default();
@@ -42,9 +42,9 @@ fn fire_pairing_cb(
 }
 
 fn fire_data_cb(ctx: &mut SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
-    let (cb, ud) = match ctx.lock() {
-        Ok(g) => (g.router.on_data, g.router.user_data),
-        Err(_) => return,
+    let (cb, ud) = {
+        let g = ctx.get_mut().unwrap();
+        (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(uuid).unwrap_or_default();
@@ -66,16 +66,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let uuid_str = f.uuid.to_string();
                 let peer_pub_str = f.pub_key.to_string();
                 if let Some(ref key) = {
-                    let guard = match ctx.lock() {
-                        Ok(g) => g,
-                        Err(_) => return -1,
-                    };
+                    let guard = ctx.get_mut().unwrap();
                     guard.crypto.local_key.clone()
                 } {
                     if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
                         let aes_key = hkdf::derive_session_key(&shared);
                         let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                        if let Ok(mut guard) = ctx.lock() {
+                        {
+                            let guard = ctx.get_mut().unwrap();
                             guard.crypto.device_keys.insert(
                                 uuid_str.clone(),
                                 crate::crypto::DeviceKeyEntry {
@@ -95,7 +93,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     "device_type": f.device_type,
                 })
                 .to_string();
-                fire_pairing_cb(ctx, &uuid_str, "HANDSHAKE", &data, f.battery, &f.pub_key);
+                fire_pairing_cb(ctx, &uuid_str, "HANDSHAKE", &data, f.battery, f.pub_key);
                 0
             } else {
                 log::error!("处理消息: HANDSHAKE 解析失败");
@@ -104,16 +102,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::PairingInit => {
             if let Some(f) = codec::decode_pairing_init(line_str) {
-                let mut guard = match ctx.lock() {
-                    Ok(g) => g,
-                    Err(_) => return -1,
-                };
-                guard.pairing_ctx = Some(crate::PairingContext {
-                    peer_uuid: f.uuid.to_string(),
-                    peer_spake2_pub: f.spake2_pub.to_string(),
-                    peer_lt_pub: None,
-                });
-                drop(guard);
+                {
+                    let guard = ctx.get_mut().unwrap();
+                    guard.pairing_ctx = Some(crate::PairingContext {
+                        peer_uuid: f.uuid.to_string(),
+                        peer_spake2_pub: f.spake2_pub.to_string(),
+                        peer_lt_pub: None,
+                    });
+                }
                 let data = serde_json::json!({
                     "uuid": f.uuid,
                     "spake2_pub": f.spake2_pub,
@@ -122,14 +118,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     "device_type": f.device_type,
                 })
                 .to_string();
-                fire_pairing_cb(
-                    ctx,
-                    &f.uuid,
-                    "PAIRING_INIT",
-                    &data,
-                    f.battery,
-                    &f.spake2_pub,
-                );
+                fire_pairing_cb(ctx, f.uuid, "PAIRING_INIT", &data, f.battery, f.spake2_pub);
                 0
             } else {
                 log::error!("处理消息: PAIRING_INIT 解析失败");
@@ -140,7 +129,8 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             if let Some(f) = codec::decode_pairing_resp(line_str) {
                 let peer_spake2 = f.spake2_pub.to_string();
                 let peer_lt = f.lt_pub.to_string();
-                if let Ok(mut guard) = ctx.lock() {
+                {
+                    let guard = ctx.get_mut().unwrap();
                     guard.pairing_ctx = Some(crate::PairingContext {
                         peer_uuid: f.uuid.to_string(),
                         peer_spake2_pub: peer_spake2.clone(),
@@ -156,7 +146,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     "device_type": f.device_type,
                 })
                 .to_string();
-                fire_pairing_cb(ctx, &f.uuid, "PAIRING_RESP", &data, f.battery, &f.lt_pub);
+                fire_pairing_cb(ctx, f.uuid, "PAIRING_RESP", &data, f.battery, f.lt_pub);
                 0
             } else {
                 log::error!("处理消息: PAIRING_RESP 解析失败");
@@ -168,10 +158,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let uuid = f.uuid.to_string();
                 let lt_pub = f.lt_pub_key.to_string();
                 let (verifier_session, peer_spake2_pub) = {
-                    let mut guard = match ctx.lock() {
-                        Ok(g) => g,
-                        Err(_) => return -1,
-                    };
+                    let guard = ctx.get_mut().unwrap();
                     (
                         guard.spake2_verifier.take(),
                         guard
@@ -186,7 +173,8 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         Ok(shared_secret) => {
                             let aes_key = hkdf::derive_session_key(&shared_secret);
                             let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                            if let Ok(mut guard) = ctx.lock() {
+                            {
+                                let guard = ctx.get_mut().unwrap();
                                 guard.crypto.device_keys.insert(
                                     uuid.clone(),
                                     crate::crypto::DeviceKeyEntry {
@@ -217,16 +205,12 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     "device_type": f.device_type,
                 })
                 .to_string();
-                fire_pairing_cb(ctx, &uuid, "ACCEPT", &data, f.battery, &f.lt_pub_key);
+                fire_pairing_cb(ctx, &uuid, "ACCEPT", &data, f.battery, f.lt_pub_key);
                 fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
                 {
                     let ack = codec::encode_ack(&uuid);
-                    match ctx.lock() {
-                        Ok(ref guard) => {
-                            do_send(guard, &uuid, &ack);
-                        }
-                        _ => {}
-                    }
+                    let guard = ctx.get_mut().unwrap();
+                    do_send(guard, &uuid, &ack);
                 }
                 0
             } else {
@@ -255,12 +239,8 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 );
                 {
                     let ack = codec::encode_ack(payload);
-                    match ctx.lock() {
-                        Ok(ref guard) => {
-                            do_send(guard, payload, &ack);
-                        }
-                        _ => {}
-                    }
+                    let guard = ctx.get_mut().unwrap();
+                    do_send(guard, payload, &ack);
                 }
                 0
             } else {
@@ -270,18 +250,13 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::HeartbeatTcp => {
             if let Some(f) = codec::decode_heartbeat_tcp(line_str) {
-                let mut guard = match ctx.lock() {
-                    Ok(g) => g,
-                    Err(_) => return -1,
-                };
-                guard.heartbeat.record(&f.uuid);
+                ctx.get_mut().unwrap().heartbeat.record(f.uuid);
                 let name_decoded = String::from_utf8(
                     base64::engine::general_purpose::STANDARD
-                        .decode(&f.name)
+                        .decode(f.name)
                         .unwrap_or_default(),
                 )
                 .unwrap_or(f.name.to_string());
-                drop(guard);
                 let data = serde_json::json!({
                     "uuid": f.uuid,
                     "name": name_decoded,
@@ -293,7 +268,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 .to_string();
                 fire_pairing_cb(
                     ctx,
-                    &f.uuid,
+                    f.uuid,
                     "HEARTBEAT_TCP",
                     &data,
                     f.battery,
@@ -313,17 +288,11 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     return -1;
                 }
             };
-            let key_arr = match ctx.lock() {
-                Ok(guard) => {
-                    let key = guard.crypto.get_aes_key(fields.local_uuid);
-                    let _ud = guard.router.user_data;
-                    drop(guard);
-                    key
-                }
-                Err(_) => {
-                    log::error!("处理消息: DATA 消息加锁失败");
-                    return -1;
-                }
+            let key_arr = {
+                let guard = ctx.get_mut().unwrap();
+                let key = guard.crypto.get_aes_key(fields.local_uuid);
+                let _ud = guard.router.user_data;
+                key
             };
             let key_arr = match key_arr {
                 Some(k) => k,
@@ -360,7 +329,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             // 平台永远只见到全键值状态，差异合并仅在 Rust 内闭环。
             if hdr == "DATA_MEDIAPLAY" || hdr == "DATA_SUPERISLAND" {
                 let is_media = hdr == "DATA_MEDIAPLAY";
-                crate::state_merge::handle_state_message(&mut *ctx, &uuid_s, is_media, &plaintext);
+                crate::state_merge::handle_state_message(&mut *ctx, uuid_s, is_media, &plaintext);
                 return 0;
             }
 
@@ -459,7 +428,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
+pub unsafe extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
     if ctx_ptr.is_null() || line.is_null() {
         log::error!("处理消息: 空指针");
         return -1;

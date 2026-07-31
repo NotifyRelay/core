@@ -110,7 +110,7 @@ pub unsafe extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_c
                 }
                 ctx.crypto.local_pub_key_b64 = data.local_public_key_b64;
                 let mut device_keys = data.devices;
-                for (_uuid, entry) in device_keys.iter_mut() {
+                for entry in device_keys.values_mut() {
                     if entry.aes_key_bytes.is_none() {
                         if let Ok(bytes) =
                             base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64)

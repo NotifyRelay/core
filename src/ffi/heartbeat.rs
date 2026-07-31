@@ -30,17 +30,18 @@ pub unsafe extern "C" fn nrc_start_heartbeat_sender(
 
     match HeartbeatHandle::start(
         ctx_ptr as usize,
-        &u,
-        &n,
+        u,
+        n,
         battery,
-        &d,
-        &ip_str,
+        d,
+        ip_str,
         interval_ms,
         mode,
     ) {
         Ok(handle) => {
             let ctx = &mut *(ctx_ptr as *mut SafeContext);
-            if let Ok(mut guard) = ctx.lock() {
+            {
+                let guard = ctx.get_mut().unwrap();
                 let name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
                 guard.broadcast_info = Some(crate::BroadcastInfo {
                     uuid: u.to_string(),
@@ -52,8 +53,6 @@ pub unsafe extern "C" fn nrc_start_heartbeat_sender(
                 let ptr = Box::into_raw(handle_box) as i64;
                 guard.heartbeat_handle = ptr;
                 ptr
-            } else {
-                -1
             }
         }
         Err(_) => -1,
@@ -89,7 +88,8 @@ pub unsafe extern "C" fn nrc_stop_heartbeat_sender(ctx_ptr: *mut c_void, handle_
     let handle = Box::from_raw(handle_ptr as *mut HeartbeatHandle);
     handle.stop();
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    if let Ok(mut guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         guard.heartbeat_handle = 0;
     }
 }
@@ -109,13 +109,12 @@ pub unsafe extern "C" fn nrc_start_offline_detector(
     match heartbeat::start_offline_detector(ctx_ptr as usize, check_interval_ms, timeout_sec) {
         Ok(running) => {
             let ctx = &mut *(ctx_ptr as *mut SafeContext);
-            if let Ok(mut guard) = ctx.lock() {
+            {
+                let guard = ctx.get_mut().unwrap();
                 let boxed = Box::new(running);
                 let ptr = Box::into_raw(boxed) as i64;
                 guard.offline_detector_handle = ptr;
                 ptr
-            } else {
-                -1
             }
         }
         Err(_) => -1,
@@ -129,7 +128,8 @@ pub unsafe extern "C" fn nrc_stop_offline_detector(ctx_ptr: *mut c_void) {
         return;
     }
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    if let Ok(mut guard) = ctx.lock() {
+    {
+        let guard = ctx.get_mut().unwrap();
         if guard.offline_detector_handle != 0 {
             let boxed = Box::from_raw(
                 guard.offline_detector_handle as *mut std::sync::Arc<std::sync::atomic::AtomicBool>,

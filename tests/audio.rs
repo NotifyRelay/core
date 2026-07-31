@@ -66,7 +66,7 @@ fn set_temp_key(ctx: &mut SafeContext, remote_uuid: &str) {
 }
 
 fn set_device_ip(ctx: &mut SafeContext, uuid: &str, ip: &str) {
-    let guard = ctx.lock().unwrap();
+    let guard = ctx.get_mut().unwrap();
     guard
         .device_ips
         .lock()
@@ -81,11 +81,12 @@ fn ensure_tcp_listener() {
             .expect("无法绑定哑TCP监听器到127.0.0.1:23333");
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                if let Ok(mut s) = stream {
-                    let mut buf = [0u8; 4096];
-                    let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = s.read(&mut buf);
-                }
+                let Ok(mut s) = stream else {
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = s.read(&mut buf);
             }
         })
     });
@@ -152,7 +153,7 @@ fn test_audio_basic_loopback() {
 
     unsafe {
         let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-        let core_guard = guard.lock().unwrap();
+        let core_guard = guard.get_mut().unwrap();
         let mut audio_state = core_guard.audio.lock().unwrap();
         audio_state.user_data = frames_ptr;
     }
@@ -225,7 +226,7 @@ fn test_audio_stop_start_idempotent() {
 
         unsafe {
             let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-            let core_guard = guard.lock().unwrap();
+            let core_guard = guard.get_mut().unwrap();
             let mut audio_state = core_guard.audio.lock().unwrap();
             audio_state.user_data = frames_ptr;
         }
@@ -305,7 +306,7 @@ fn test_audio_reconnect_multiple() {
 
         unsafe {
             let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-            let core_guard = guard.lock().unwrap();
+            let core_guard = guard.get_mut().unwrap();
             let mut audio_state = core_guard.audio.lock().unwrap();
             audio_state.user_data = frames_ptr;
         }

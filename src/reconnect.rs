@@ -10,7 +10,6 @@ use crate::SafeContext;
 /// 重连目标设备信息
 #[derive(Clone)]
 struct ReconnectTarget {
-    uuid: String,
     ip: String,
     last_attempt: Option<Instant>,
 }
@@ -42,14 +41,21 @@ impl ReconnectState {
             running: Arc::new(AtomicBool::new(false)),
         }
     }
+}
 
+impl Default for ReconnectState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReconnectState {
     /// 添加重连目标
     pub fn add_target(&self, uuid: &str, ip: &str) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.targets.insert(
                 uuid.to_string(),
                 ReconnectTarget {
-                    uuid: uuid.to_string(),
                     ip: ip.to_string(),
                     last_attempt: None,
                 },
@@ -100,16 +106,16 @@ impl ReconnectState {
                         let uuids: Vec<String> = guard.targets.keys().cloned().collect();
 
                         for uuid in &uuids {
-                            let connected =
-                                match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-                                    Ok(ctx) => ctx
-                                        .network
-                                        .tcp
-                                        .lock()
-                                        .map(|tcp| tcp.is_connected(uuid))
-                                        .unwrap_or(false),
-                                    Err(_) => false,
-                                };
+                            let connected = {
+                                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                                ctx.get_mut()
+                                    .unwrap()
+                                    .network
+                                    .tcp
+                                    .lock()
+                                    .map(|tcp| tcp.is_connected(uuid))
+                                    .unwrap_or(false)
+                            };
 
                             if connected {
                                 guard.attempt_counts.remove(uuid);
@@ -151,25 +157,23 @@ impl ReconnectState {
 
                     for (uuid, ip) in to_reconnect {
                         log::info!("重连: 尝试连接 uuid={}, ip={}", uuid, ip);
-                        let handshake_msg =
-                            match unsafe { &mut *(ctx_ptr as *mut SafeContext) }.lock() {
-                                Ok(guard) => {
-                                    let local_uuid = guard
-                                        .broadcast_info
-                                        .as_ref()
-                                        .map(|i| i.uuid.clone())
-                                        .unwrap_or_default();
-                                    let local_pub =
-                                        guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
-                                    let dt = guard
-                                        .broadcast_info
-                                        .as_ref()
-                                        .map(|i| i.device_type.clone())
-                                        .unwrap_or_default();
-                                    codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
-                                }
-                                Err(_) => continue,
-                            };
+                        let handshake_msg = {
+                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                            let guard = ctx.get_mut().unwrap();
+                            let local_uuid = guard
+                                .broadcast_info
+                                .as_ref()
+                                .map(|i| i.uuid.clone())
+                                .unwrap_or_default();
+                            let local_pub =
+                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
+                            let dt = guard
+                                .broadcast_info
+                                .as_ref()
+                                .map(|i| i.device_type.clone())
+                                .unwrap_or_default();
+                            codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
+                        };
 
                         let _ = crate::network::oneshot_send_receive(
                             &handshake_msg,

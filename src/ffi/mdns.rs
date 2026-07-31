@@ -25,10 +25,7 @@ pub unsafe extern "C" fn nrc_start_mdns_advertiser(
     let dt = from_cstr(device_type).to_string();
 
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
 
     match guard.mdns.start_advertiser(&u, &n, port, &pk, &dt) {
         Ok(_) => 0,
@@ -45,10 +42,7 @@ pub unsafe extern "C" fn nrc_stop_mdns_advertiser(ctx_ptr: *mut c_void) -> i32 {
         return -1;
     }
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
     guard.mdns.stop_advertiser();
     0
 }
@@ -61,16 +55,13 @@ pub unsafe extern "C" fn nrc_start_mdns_discovery(ctx_ptr: *mut c_void) -> i32 {
 
     let ctx_ptr_usize = ctx_ptr as usize;
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let (on_mdns_discovered, user_data) = match ctx.lock() {
-        Ok(guard) => (guard.router.on_mdns_discovered, guard.router.user_data),
-        Err(_) => return -1,
+    let (on_mdns_discovered, user_data) = {
+        let guard = ctx.get_mut().unwrap();
+        (guard.router.on_mdns_discovered, guard.router.user_data)
     };
 
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
 
     match guard
         .mdns
@@ -90,10 +81,7 @@ pub unsafe extern "C" fn nrc_stop_mdns_discovery(ctx_ptr: *mut c_void) -> i32 {
         return -1;
     }
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
     guard.mdns.stop_browser();
     0
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 pub mod audio_codec;
 pub mod audio_stream;
 mod crypto;
@@ -100,6 +102,12 @@ impl CoreContext {
             reconnect_state: 0,
             state_merge: state_merge::StateMerge::new(),
         }
+    }
+}
+
+impl Default for CoreContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

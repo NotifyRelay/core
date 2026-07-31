@@ -253,17 +253,12 @@ pub fn start_offline_detector(
             }
 
             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-            let (timeouts, on_timeout_cb, user_data) = match ctx.lock() {
-                Ok(guard) => {
-                    let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
-                    let cb = guard.router.on_device_timeout;
-                    let ud = guard.router.user_data;
-                    (timed_out, cb, ud)
-                }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(check_interval_ms));
-                    continue;
-                }
+            let (timeouts, on_timeout_cb, user_data) = {
+                let guard = ctx.get_mut().unwrap();
+                let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
+                let cb = guard.router.on_device_timeout;
+                let ud = guard.router.user_data;
+                (timed_out, cb, ud)
             };
 
             for uuid in &timeouts {
@@ -273,14 +268,12 @@ pub fn start_offline_detector(
                         cb(uuid_c.as_ptr(), user_data);
                     }
                 }
-                if let Ok(mut guard) = ctx.lock() {
+                {
+                    let guard = ctx.get_mut().unwrap();
                     guard.heartbeat.remove(uuid);
-                    guard
-                        .network
-                        .tcp
-                        .lock()
-                        .ok()
-                        .map(|mut tcp| tcp.remove_session(uuid));
+                    if let Ok(mut tcp) = guard.network.tcp.lock() {
+                        tcp.remove_session(uuid);
+                    }
                 }
             }
 

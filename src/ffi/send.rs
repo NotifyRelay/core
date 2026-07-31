@@ -63,7 +63,7 @@ fn oneshot_send_and_process(
 
 /// 发送 HANDSHAKE 并通过 oneshot 处理 ACCEPT 响应
 #[no_mangle]
-pub extern "C" fn nrc_send_handshake(
+pub unsafe extern "C" fn nrc_send_handshake(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     pub_key: *const c_char,
@@ -93,15 +93,13 @@ pub extern "C" fn nrc_send_handshake(
 
 /// 发送配对结果回调并清理临时状态
 fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
-    let (cb, ud) = match ctx.lock() {
-        Ok(mut g) => {
-            g.spake2_prover = None;
-            g.spake2_verifier = None;
-            g.pairing_ctx = None;
-            g.expected_pairing_code = None;
-            (g.router.on_pairing, g.router.user_data)
-        }
-        Err(_) => return,
+    let (cb, ud) = {
+        let g = ctx.get_mut().unwrap();
+        g.spake2_prover = None;
+        g.spake2_verifier = None;
+        g.pairing_ctx = None;
+        g.expected_pairing_code = None;
+        (g.router.on_pairing, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(target_uuid).unwrap_or_default();
@@ -126,7 +124,7 @@ fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, e
 /// 内部：SPAKE2 Prover → 发送 → 接收 PAIRING_RESP → 完成密钥协商 → 发送 ACCEPT → 等待 ACK → 回调
 /// Rust 内部自动从 device_ips 映射表解析目标 IP，调用方只需传入 UUID
 #[no_mangle]
-pub extern "C" fn nrc_send_pairing_init(
+pub unsafe extern "C" fn nrc_send_pairing_init(
     ctx_ptr: *mut c_void,
     local_uuid: *const c_char,
     target_uuid: *const c_char,
@@ -143,25 +141,22 @@ pub extern "C" fn nrc_send_pairing_init(
     let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let (ctx_ref, target_ip) = match ctx.lock() {
-        Ok(mut guard) => {
-            guard.expected_pairing_code = Some(code.clone());
-            let (session, spake2_pub) = spake2::generate_prover_session(&code);
-            guard.spake2_prover = Some(session);
-            let msg = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
+    let (ctx_ref, target_ip) = {
+        let guard = ctx.get_mut().unwrap();
+        guard.expected_pairing_code = Some(code.clone());
+        let (session, spake2_pub) = spake2::generate_prover_session(&code);
+        guard.spake2_prover = Some(session);
+        let msg = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
 
-            let target = guard
-                .device_ips
-                .lock()
-                .ok()
-                .and_then(|ips| ips.get(&tu).cloned())
-                .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
-                .unwrap_or_default();
+        let target = guard
+            .device_ips
+            .lock()
+            .ok()
+            .and_then(|ips| ips.get(&tu).cloned())
+            .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+            .unwrap_or_default();
 
-            drop(guard);
-            (msg, target)
-        }
-        Err(_) => return -1,
+        (msg, target)
     };
 
     if target_ip.is_empty() {
@@ -218,13 +213,13 @@ pub extern "C" fn nrc_send_pairing_init(
 
     super::processing::process_line(ctx, &resp);
 
-    let (prover_session, peer_lt_pub, peer_spake2_pub) = match ctx.lock() {
-        Ok(mut g) => (
+    let (prover_session, peer_lt_pub, peer_spake2_pub) = {
+        let g = ctx.get_mut().unwrap();
+        (
             g.spake2_prover.take(),
             g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
             g.pairing_ctx.as_ref().map(|c| c.peer_spake2_pub.clone()),
-        ),
-        Err(_) => (None, None, None),
+        )
     };
 
     if let (Some(session), Some(lt_pub), Some(spake2_pub)) =
@@ -235,7 +230,8 @@ pub extern "C" fn nrc_send_pairing_init(
                 log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
                 let aes_key = hkdf::derive_session_key(&shared_secret);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                if let Ok(mut guard) = ctx.lock() {
+                {
+                    let guard = ctx.get_mut().unwrap();
                     guard.crypto.device_keys.insert(
                         tu.clone(),
                         crate::crypto::DeviceKeyEntry {
@@ -249,10 +245,13 @@ pub extern "C" fn nrc_send_pairing_init(
                     guard.pairing_ctx = None;
                     guard.expected_pairing_code = None;
                 }
-                let local_pub_b64 = match ctx.lock() {
-                    Ok(g) => g.crypto.local_pub_key_b64.clone().unwrap_or_default(),
-                    Err(_) => String::new(),
-                };
+                let local_pub_b64 = ctx
+                    .get_mut()
+                    .unwrap()
+                    .crypto
+                    .local_pub_key_b64
+                    .clone()
+                    .unwrap_or_default();
                 let accept_line =
                     codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
                 let data = format!("{}\n", accept_line);
@@ -309,7 +308,7 @@ pub extern "C" fn nrc_send_pairing_init(
 /// uuid 为接收方（本机）身份标识，用于编码到消息中
 /// 会话通过 pairing_ctx.peer_uuid 查找
 #[no_mangle]
-pub extern "C" fn nrc_send_pairing_resp(
+pub unsafe extern "C" fn nrc_send_pairing_resp(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     lt_pub: *const c_char,
@@ -325,17 +324,14 @@ pub extern "C" fn nrc_send_pairing_resp(
     let d = unsafe { from_cstr(device_type).to_string() };
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let target_uuid = match ctx.lock() {
-        Ok(guard) => match guard.pairing_ctx.as_ref() {
+    let target_uuid = {
+        let guard = ctx.get_mut().unwrap();
+        match guard.pairing_ctx.as_ref() {
             Some(c) => Some(c.peer_uuid.clone()),
             None => {
                 log::error!("发送 PAIRING_RESP: 无配对上下文");
                 None
             }
-        },
-        Err(_) => {
-            log::error!("发送 PAIRING_RESP: 加锁失败");
-            None
         }
     };
     let target_uuid = match target_uuid {
@@ -343,14 +339,11 @@ pub extern "C" fn nrc_send_pairing_resp(
         None => return -1,
     };
 
-    let msg = match ctx.lock() {
-        Ok(mut guard) => {
-            let (session, spake2_pub) = spake2::generate_verifier_session(&code);
-            guard.spake2_verifier = Some(session);
-            let msg = codec::encode_pairing_resp(&u, &spake2_pub, &l, &i, battery, &d);
-            msg
-        }
-        Err(_) => return -1,
+    let msg = {
+        let guard = ctx.get_mut().unwrap();
+        let (session, spake2_pub) = spake2::generate_verifier_session(&code);
+        guard.spake2_verifier = Some(session);
+        codec::encode_pairing_resp(&u, &spake2_pub, &l, &i, battery, &d)
     };
 
     with_ctx(ctx_ptr, |ctx| {
@@ -360,7 +353,7 @@ pub extern "C" fn nrc_send_pairing_resp(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_send_accept(
+pub unsafe extern "C" fn nrc_send_accept(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     lt_pub_key: *const c_char,
@@ -378,7 +371,7 @@ pub extern "C" fn nrc_send_accept(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_char) {
+pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_char) {
     let u = unsafe { from_cstr(uuid).to_string() };
     with_ctx(ctx_ptr, |ctx| {
         do_send(ctx, &u, &codec::encode_reject(&u));
@@ -425,7 +418,7 @@ pub extern "C" fn nrc_send_discovery(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_send_data_message(
+pub unsafe extern "C" fn nrc_send_data_message(
     ctx_ptr: *mut c_void,
     header: *const c_char,
     local_uuid: *const c_char,
@@ -453,7 +446,7 @@ pub extern "C" fn nrc_send_data_message(
 const BROADCAST_INTERVAL_MS: u64 = 2000;
 
 #[no_mangle]
-pub extern "C" fn nrc_periodic_broadcast(
+pub unsafe extern "C" fn nrc_periodic_broadcast(
     ctx_ptr: *mut c_void,
     action: i32,
     uuid: *const c_char,
@@ -468,10 +461,7 @@ pub extern "C" fn nrc_periodic_broadcast(
 
     match action {
         0 => {
-            let mut guard = match ctx.lock() {
-                Ok(g) => g,
-                Err(_) => return -1,
-            };
+            let guard = ctx.get_mut().unwrap();
             if let Some(handle) = guard.broadcast_handle.take() {
                 handle.running.store(false, Ordering::Relaxed);
             }
@@ -486,10 +476,7 @@ pub extern "C" fn nrc_periodic_broadcast(
             let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
             let d = unsafe { from_cstr(device_type).to_string() };
 
-            let mut guard = match ctx.lock() {
-                Ok(g) => g,
-                Err(_) => return -1,
-            };
+            let guard = ctx.get_mut().unwrap();
             guard.broadcast_info = Some(BroadcastInfo {
                 uuid: u,
                 name_b64: n_b64,
@@ -514,10 +501,7 @@ pub extern "C" fn nrc_periodic_broadcast(
 
                     let msg = {
                         let ctx = unsafe { &mut *(ctx_usize as *mut SafeContext) };
-                        let guard = match ctx.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
+                        let guard = ctx.get_mut().unwrap();
                         match &guard.broadcast_info {
                             Some(i) => codec::encode_udp_broadcast(
                                 &i.uuid,
@@ -527,7 +511,6 @@ pub extern "C" fn nrc_periodic_broadcast(
                                 &i.device_type,
                             ),
                             None => {
-                                drop(guard);
                                 thread::sleep(Duration::from_millis(500));
                                 continue;
                             }
@@ -548,10 +531,7 @@ pub extern "C" fn nrc_periodic_broadcast(
             }
         }
         2 => {
-            let mut guard = match ctx.lock() {
-                Ok(g) => g,
-                Err(_) => return -1,
-            };
+            let guard = ctx.get_mut().unwrap();
             if let Some(ref mut info) = guard.broadcast_info {
                 if !uuid.is_null() {
                     info.uuid = unsafe { from_cstr(uuid).to_string() };
@@ -604,28 +584,27 @@ pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
 /// 验证配对码：比对存储的配对码且检查是否过期
 /// 返回 0 表示验证通过，-1 表示不匹配，-2 表示已过期
 #[no_mangle]
-pub extern "C" fn nrc_validate_pairing_code(ctx_ptr: *mut c_void, code: *const c_char) -> i32 {
+pub unsafe extern "C" fn nrc_validate_pairing_code(
+    ctx_ptr: *mut c_void,
+    code: *const c_char,
+) -> i32 {
     if ctx_ptr.is_null() || code.is_null() {
         return -1;
     }
     let input = unsafe { from_cstr(code) };
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    match ctx.lock() {
-        Ok(guard) => {
-            let stored = match &guard.pairing_code {
-                Some(c) => c.clone(),
-                None => return -1,
-            };
-            if stored != input {
-                return -1;
-            }
-            if let Some(expiry) = guard.pairing_code_expiry {
-                if std::time::Instant::now() > expiry {
-                    return -2;
-                }
-            }
-            0
-        }
-        Err(_) => -1,
+    let guard = ctx.get_mut().unwrap();
+    let stored = match &guard.pairing_code {
+        Some(c) => c.clone(),
+        None => return -1,
+    };
+    if stored != input {
+        return -1;
     }
+    if let Some(expiry) = guard.pairing_code_expiry {
+        if std::time::Instant::now() > expiry {
+            return -2;
+        }
+    }
+    0
 }

@@ -6,7 +6,7 @@ use sha2::Digest;
 use super::common::{from_cstr, to_cstr};
 
 #[no_mangle]
-pub extern "C" fn nrc_compute_dedup_key(
+pub unsafe extern "C" fn nrc_compute_dedup_key(
     device_uuid: *const c_char,
     data: *const c_char,
 ) -> *mut c_char {
@@ -80,7 +80,7 @@ pub(crate) fn compute_feature_id_impl(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_compute_feature_id(
+pub unsafe extern "C" fn nrc_compute_feature_id(
     super_pkg: *const c_char,
     param_v2_raw: *const c_char,
     title: *const c_char,
@@ -92,12 +92,12 @@ pub extern "C" fn nrc_compute_feature_id(
     let t = unsafe { from_cstr(title) };
     let tx = unsafe { from_cstr(text) };
     let iid = unsafe { from_cstr(instance_id) };
-    let result = compute_feature_id_impl(&pkg, &param, &t, &tx, &iid);
+    let result = compute_feature_id_impl(pkg, param, t, tx, iid);
     to_cstr(&result)
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_compute_feature_id_simple(
+pub unsafe extern "C" fn nrc_compute_feature_id_simple(
     package_name: *const c_char,
     title: *const c_char,
     text: *const c_char,
@@ -124,7 +124,7 @@ pub extern "C" fn nrc_compute_feature_id_simple(
 /// action=0 时返回 1=应发送, 0=重复
 /// action=1/2/3 时返回 0=成功, -1=失败
 #[no_mangle]
-pub extern "C" fn nrc_dedup(
+pub unsafe extern "C" fn nrc_dedup(
     ctx_ptr: *mut c_void,
     action: i32,
     dedup_key: *const c_char,
@@ -140,10 +140,7 @@ pub extern "C" fn nrc_dedup(
         ""
     };
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
+    let guard = ctx.get_mut().unwrap();
 
     match action {
         0 => {
@@ -219,14 +216,14 @@ fn combined_similarity_impl(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_text_similarity(a: *const c_char, b: *const c_char) -> f64 {
+pub unsafe extern "C" fn nrc_text_similarity(a: *const c_char, b: *const c_char) -> f64 {
     let a_str = unsafe { from_cstr(a) };
     let b_str = unsafe { from_cstr(b) };
     text_similarity_impl(a_str, b_str)
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_should_deduplicate(
+pub unsafe extern "C" fn nrc_should_deduplicate(
     new_title: *const c_char,
     new_text: *const c_char,
     old_title: *const c_char,
@@ -276,14 +273,16 @@ fn derive_ftp_credentials_impl(shared_secret_b64: &str) -> String {
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_derive_ftp_credentials(shared_secret_b64: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn nrc_derive_ftp_credentials(
+    shared_secret_b64: *const c_char,
+) -> *mut c_char {
     let secret = unsafe { from_cstr(shared_secret_b64) };
     let result = derive_ftp_credentials_impl(secret);
     to_cstr(&result)
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_derive_password_hash(password: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn nrc_derive_password_hash(password: *const c_char) -> *mut c_char {
     let pw = unsafe { from_cstr(password) };
     let hash = md5::compute(pw.as_bytes());
     let b64 = base64::engine::general_purpose::STANDARD.encode(hash.0);
@@ -327,7 +326,7 @@ mod tests {
         let title = to_cstr("Hello");
         let text = to_cstr("World");
         let iid = to_cstr("inst-123");
-        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
+        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
         let s = unsafe { from_cstr(result).to_string() };
         assert!(!s.is_empty());
         assert_eq!(s.len(), 40);
@@ -340,7 +339,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
+        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -352,7 +351,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
+        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -364,7 +363,7 @@ mod tests {
         let title = to_cstr("");
         let text = to_cstr("");
         let iid = to_cstr("");
-        let result = nrc_compute_feature_id(pkg, param, title, text, iid);
+        let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
     }
@@ -373,12 +372,12 @@ mod tests {
     fn test_text_similarity() {
         let a = to_cstr("hello world");
         let b = to_cstr("hello world");
-        let result = nrc_text_similarity(a, b);
+        let result = unsafe { nrc_text_similarity(a, b) };
         assert_eq!(result, 1.0);
 
         let c = to_cstr("hello");
         let d = to_cstr("world");
-        let result2 = nrc_text_similarity(c, d);
+        let result2 = unsafe { nrc_text_similarity(c, d) };
         assert!(result2 < 1.0);
     }
 
@@ -388,21 +387,21 @@ mod tests {
         let ntx = to_cstr("World");
         let ot = to_cstr("Hello");
         let otx = to_cstr("World");
-        let result = nrc_should_deduplicate(nt, ntx, ot, otx);
+        let result = unsafe { nrc_should_deduplicate(nt, ntx, ot, otx) };
         assert_eq!(result, 1);
 
         let nt2 = to_cstr("Completely different title");
         let ntx2 = to_cstr("Completely different text body that is very long");
         let ot2 = to_cstr("Something else entirely");
         let otx2 = to_cstr("Another message that shares no words with the other");
-        let result2 = nrc_should_deduplicate(nt2, ntx2, ot2, otx2);
+        let result2 = unsafe { nrc_should_deduplicate(nt2, ntx2, ot2, otx2) };
         assert_eq!(result2, 0);
     }
 
     #[test]
     fn test_derive_ftp_credentials() {
         let secret = to_cstr("dGVzdHNlY3JldA==");
-        let result = nrc_derive_ftp_credentials(secret);
+        let result = unsafe { nrc_derive_ftp_credentials(secret) };
         let s = unsafe { from_cstr(result).to_string() };
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(v["username"].as_str().unwrap().starts_with("ftp_"));
@@ -412,7 +411,7 @@ mod tests {
     #[test]
     fn test_derive_password_hash() {
         let pw = to_cstr("mypassword");
-        let result = nrc_derive_password_hash(pw);
+        let result = unsafe { nrc_derive_password_hash(pw) };
         let s = unsafe { from_cstr(result).to_string() };
         assert!(!s.is_empty());
     }

@@ -70,6 +70,12 @@ impl AudioStats {
     }
 }
 
+impl Default for AudioStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn is_silent_frame(pcm: &[i16], threshold: i16) -> bool {
     pcm.iter().all(|&s| s.abs() <= threshold)
 }
@@ -124,6 +130,12 @@ impl AudioStreamState {
             pcm_queue: Arc::new(Mutex::new(VecDeque::new())),
             pcm_buffer: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+}
+
+impl Default for AudioStreamState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -650,7 +662,7 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
             break;
         }
 
-        match socket.send_to(&rtp_buf, &peer_addr) {
+        match socket.send_to(&rtp_buf, peer_addr) {
             Ok(n) => {
                 state.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                 state
