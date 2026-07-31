@@ -26,11 +26,17 @@ impl OpusDecoder {
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<i16>, ruopus::packet::PacketError> {
         let output_len = (self.frame_size * self.channels) as usize;
         if data.is_empty() {
-            self.pcm_i16_buffer.iter_mut().take(output_len).for_each(|s| *s = 0);
+            self.pcm_i16_buffer
+                .iter_mut()
+                .take(output_len)
+                .for_each(|s| *s = 0);
             return Ok(self.pcm_i16_buffer[..output_len].to_vec());
         }
 
         let pcm_f32 = self.inner.decode_packet(data)?;
+        if pcm_f32.len() > self.pcm_i16_buffer.len() {
+            self.pcm_i16_buffer.resize(pcm_f32.len(), 0);
+        }
         let out = &mut self.pcm_i16_buffer[..pcm_f32.len()];
         for (i, &s) in pcm_f32.iter().enumerate() {
             out[i] = (s * 32768.0) as i16;
@@ -40,9 +46,12 @@ impl OpusDecoder {
 
     #[inline]
     pub fn decode_loss(&mut self) -> Result<Vec<i16>, ruopus::packet::PacketError> {
-        let frame_samples = self.frame_size as usize * self.channels as usize;
+        let frame_size = self.frame_size as usize;
 
-        let pcm_f32 = self.inner.decode_lost(frame_samples);
+        let pcm_f32 = self.inner.decode_lost(frame_size);
+        if pcm_f32.len() > self.pcm_i16_buffer.len() {
+            self.pcm_i16_buffer.resize(pcm_f32.len(), 0);
+        }
         let out = &mut self.pcm_i16_buffer[..pcm_f32.len()];
         for (i, &s) in pcm_f32.iter().enumerate() {
             out[i] = (s * 32768.0) as i16;
