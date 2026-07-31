@@ -270,7 +270,7 @@ fn handle_connection(
                 return;
             }
 
-            log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
+            ///log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
 
             {
                 let mut state = state.lock().unwrap();
@@ -337,7 +337,7 @@ fn handle_connection(
         state.sessions.remove(&uuid);
     }
 
-    log::info!("TCP连接已断开 uuid={}", uuid);
+    ///log::info!("TCP连接已断开 uuid={}", uuid);
 
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
