@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::SafeContext;
 use crate::sender_queue::{SendItem, SenderQueue};
+use crate::SafeContext;
 
 const SI_ACK_TIMEOUT_MS: u64 = 4000;
 const SI_HEARTBEAT_MS: u64 = 30_000;
@@ -136,8 +136,7 @@ impl StateMerge {
                 // 无变化，跳过
                 return true;
             }
-            let old_val: Value =
-                serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
+            let old_val: Value = serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
             let delta = diff_island(&old_val, &full);
             if delta_is_empty(&delta) {
                 return true;
@@ -215,8 +214,12 @@ impl StateMerge {
         if is_end {
             self.receivers.remove(&key);
         } else {
-            self.receivers
-                .insert(key.clone(), ReceiverState { last_full: new_full.clone() });
+            self.receivers.insert(
+                key.clone(),
+                ReceiverState {
+                    last_full: new_full.clone(),
+                },
+            );
         }
         Some((feature_id, new_full, is_end))
     }
@@ -252,8 +255,7 @@ impl StateMerge {
                 elapsed >= SI_HEARTBEAT_MS || ack_timeout
             };
             if need {
-                let full_val: Value =
-                    serde_json::from_str(&s.last_full).unwrap_or(Value::Null);
+                let full_val: Value = serde_json::from_str(&s.last_full).unwrap_or(Value::Null);
                 let hash = sha256_hex(&s.last_full);
                 let payload = build_full_wire(&full_val, &s.feature_id, &hash, false);
                 let header = if s.is_media {
@@ -290,7 +292,11 @@ fn build_full_wire(full: &Value, feature_id: &str, hash: &str, is_end: bool) -> 
         let is_media = feature_id == MEDIA_KEY;
         m.insert(
             "type".into(),
-            json!(if is_media { "MEDIA_PLAY" } else { "SUPERISLAND" }),
+            json!(if is_media {
+                "MEDIA_PLAY"
+            } else {
+                "SUPERISLAND"
+            }),
         );
         m.insert("featureKeyValue".into(), json!(feature_id));
         m.insert("hash".into(), json!(hash));
@@ -432,7 +438,12 @@ fn merge_island(base: &Value, changes: &Value) -> String {
 
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
 /// 并在需要时回 ACK。返回 true 表示该消息已被引擎消费（无需再走通用 on_data）。
-pub fn handle_state_message(ctx: &mut SafeContext, uuid: &str, is_media: bool, plaintext: &str) -> bool {
+pub fn handle_state_message(
+    ctx: &mut SafeContext,
+    uuid: &str,
+    is_media: bool,
+    plaintext: &str,
+) -> bool {
     let v: Value = match serde_json::from_str(plaintext) {
         Ok(v) => v,
         Err(_) => return false,
@@ -474,8 +485,8 @@ pub fn handle_state_message(ctx: &mut SafeContext, uuid: &str, is_media: bool, p
     };
     if let Some(cb_fn) = cb {
         let uuid_c = CString::new(uuid).unwrap_or_default();
-        let mt_c = CString::new(if is_media { "MEDIAPLAY" } else { "SUPERISLAND" })
-            .unwrap_or_default();
+        let mt_c =
+            CString::new(if is_media { "MEDIAPLAY" } else { "SUPERISLAND" }).unwrap_or_default();
         let wire_c = CString::new(wire).unwrap_or_default();
         cb_fn(uuid_c.as_ptr(), mt_c.as_ptr(), wire_c.as_ptr(), ud);
     }
@@ -564,7 +575,13 @@ mod tests {
         let full1 = si_full("t1", "c1");
         let merged1 = {
             let mut r = StateMerge::new();
-            let (_, f, _) = r.merge_incoming("devA", false, &build_full_wire(&serde_json::from_str(&full1).unwrap(), "fid", "h1", false)).unwrap();
+            let (_, f, _) = r
+                .merge_incoming(
+                    "devA",
+                    false,
+                    &build_full_wire(&serde_json::from_str(&full1).unwrap(), "fid", "h1", false),
+                )
+                .unwrap();
             f
         };
         assert_eq!(merged1, full1);
@@ -572,7 +589,8 @@ mod tests {
 
     #[test]
     fn test_delta_merge_updates_fields() {
-        let full_a = json!({"device":"self","title":"a","text":"x","param_v2_raw":"","pics":{"k":"v"}});
+        let full_a =
+            json!({"device":"self","title":"a","text":"x","param_v2_raw":"","pics":{"k":"v"}});
         let full_b = json!({"device":"self","title":"b","text":"x","param_v2_raw":"","pics":{"k":"v","k2":"v2"}});
         let delta = diff_island(&full_a, &full_b);
         let merged = merge_island(&full_a, &delta);

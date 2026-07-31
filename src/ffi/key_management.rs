@@ -24,11 +24,8 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
     }
     with_ctx(ctx_ptr, |ctx| {
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
-        ctx.crypto.set_device_key(
-            uuid.to_string(),
-            String::new(),
-            b64,
-        );
+        ctx.crypto
+            .set_device_key(uuid.to_string(), String::new(), b64);
         0
     })
 }
@@ -115,7 +112,9 @@ pub unsafe extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_c
                 let mut device_keys = data.devices;
                 for (_uuid, entry) in device_keys.iter_mut() {
                     if entry.aes_key_bytes.is_none() {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64) {
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64)
+                        {
                             if bytes.len() == 32 {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&bytes);

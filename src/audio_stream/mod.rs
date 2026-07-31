@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::raw::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -322,7 +322,15 @@ fn start_read_thread(state: &mut AudioStreamState) {
         }
 
         log::info!("音频流: 播放线程已启动");
-        playback_loop(active, on_data, ud_ptr, sample_rate, channels, pcm_queue, playback_stats);
+        playback_loop(
+            active,
+            on_data,
+            ud_ptr,
+            sample_rate,
+            channels,
+            pcm_queue,
+            playback_stats,
+        );
         log::info!("音频流: 播放线程已结束");
     });
     state.playback_handle = Some(playback_handle);
@@ -429,7 +437,9 @@ fn read_loop(
                                 }
                             };
 
-                            stats.opus_bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            stats
+                                .opus_bytes_received
+                                .fetch_add(data.len() as u64, Ordering::Relaxed);
 
                             {
                                 let mut queue_guard = pcm_queue.lock();
@@ -565,7 +575,10 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
 
         state.stats.sent_frames.fetch_add(1, Ordering::Relaxed);
         if is_silent_frame(&frame_data, 50) {
-            state.stats.sent_silence_frames.fetch_add(1, Ordering::Relaxed);
+            state
+                .stats
+                .sent_silence_frames
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         let mut encoder_guard = match state.encoder.try_lock() {
@@ -606,7 +619,9 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         );
 
         let seq = state.rtp_seq.fetch_add(1, Ordering::SeqCst);
-        let ts = state.rtp_ts.fetch_add(encoder.frame_size() as u32, Ordering::SeqCst);
+        let ts = state
+            .rtp_ts
+            .fetch_add(encoder.frame_size() as u32, Ordering::SeqCst);
         let ssrc = state.ssrc;
 
         let opus_len = opus_data.len() as u64;
@@ -638,8 +653,14 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
         match socket.send_to(&rtp_buf, &peer_addr) {
             Ok(n) => {
                 state.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                state.stats.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                state.stats.opus_bytes_sent.fetch_add(opus_len, Ordering::Relaxed);
+                state
+                    .stats
+                    .bytes_sent
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                state
+                    .stats
+                    .opus_bytes_sent
+                    .fetch_add(opus_len, Ordering::Relaxed);
             }
             Err(e) => {
                 log::warn!("音频流: UDP 发送失败: {e}");

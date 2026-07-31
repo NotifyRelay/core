@@ -56,12 +56,7 @@ impl CryptoState {
     }
 
     /// 存储设备密钥并预解码 AES key
-    pub fn set_device_key(
-        &mut self,
-        uuid: String,
-        remote_pub_key: String,
-        aes_key_b64: String,
-    ) {
+    pub fn set_device_key(&mut self, uuid: String, remote_pub_key: String, aes_key_b64: String) {
         let aes_key_bytes = base64::engine::general_purpose::STANDARD
             .decode(&aes_key_b64)
             .ok()

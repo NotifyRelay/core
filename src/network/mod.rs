@@ -136,9 +136,7 @@ pub fn start_tcp_server(
     let pool_size = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let pool = Arc::new(
-        ThreadPool::new(pool_size.max(2)),
-    );
+    let pool = Arc::new(ThreadPool::new(pool_size.max(2)));
 
     let state_clone = state.clone();
     let pool_clone = pool.clone();
@@ -158,7 +156,11 @@ pub fn start_tcp_server(
         );
     });
 
-    log::info!("TCP 服务器已启动，监听端口 {}，线程池大小 {}", port, pool_size);
+    log::info!(
+        "TCP 服务器已启动，监听端口 {}，线程池大小 {}",
+        port,
+        pool_size
+    );
     Ok(())
 }
 
@@ -271,7 +273,6 @@ fn handle_connection(
             }
 
             ///log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
-
             {
                 let mut state = state.lock().unwrap();
                 state.sessions.insert(
@@ -338,7 +339,6 @@ fn handle_connection(
     }
 
     ///log::info!("TCP连接已断开 uuid={}", uuid);
-
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
     }
