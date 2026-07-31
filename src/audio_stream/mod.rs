@@ -155,6 +155,10 @@ pub(crate) fn start_sender(
         log::warn!("音频流: 设置 SO_REUSEADDR 失败: {e}");
     }
 
+    if let Err(e) = socket.set_send_buffer_size(256 * 1024) {
+        log::warn!("音频流: 设置 SO_SNDBUF 失败: {e}");
+    }
+
     let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let sock_addr: socket2::SockAddr = addr.into();
     if let Err(e) = socket.bind(&sock_addr) {
@@ -220,6 +224,10 @@ pub(crate) fn start_receiver(
 
     if let Err(e) = socket.set_reuse_address(true) {
         log::warn!("音频流: 设置 SO_REUSEADDR 失败: {e}");
+    }
+
+    if let Err(e) = socket.set_recv_buffer_size(256 * 1024) {
+        log::warn!("音频流: 设置 SO_RCVBUF 失败: {e}");
     }
 
     let sock_addr: socket2::SockAddr = addr.into();
@@ -444,8 +452,8 @@ fn read_loop(
                 continue;
             }
             Err(e) => {
-                log::error!("音频流: UDP 接收失败: {e}");
-                break;
+                log::warn!("音频流: UDP 接收临时错误: {e}，继续监听");
+                continue;
             }
         }
     }
