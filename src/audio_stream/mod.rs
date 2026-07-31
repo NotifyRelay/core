@@ -26,6 +26,11 @@ pub struct AudioStats {
     pub bytes_received: AtomicU64,
     pub opus_bytes_sent: AtomicU64,
     pub opus_bytes_received: AtomicU64,
+    pub sent_frames: AtomicU64,
+    pub sent_silence_frames: AtomicU64,
+    pub recv_played_frames: AtomicU64,
+    pub recv_silence_frames: AtomicU64,
+    pub no_data_ms: AtomicU64,
     pub start_time: parking_lot::Mutex<Instant>,
 }
 
@@ -39,6 +44,11 @@ impl AudioStats {
             bytes_received: AtomicU64::new(0),
             opus_bytes_sent: AtomicU64::new(0),
             opus_bytes_received: AtomicU64::new(0),
+            sent_frames: AtomicU64::new(0),
+            sent_silence_frames: AtomicU64::new(0),
+            recv_played_frames: AtomicU64::new(0),
+            recv_silence_frames: AtomicU64::new(0),
+            no_data_ms: AtomicU64::new(0),
             start_time: parking_lot::Mutex::new(Instant::now()),
         }
     }
@@ -51,8 +61,17 @@ impl AudioStats {
         self.bytes_received.store(0, Ordering::Relaxed);
         self.opus_bytes_sent.store(0, Ordering::Relaxed);
         self.opus_bytes_received.store(0, Ordering::Relaxed);
+        self.sent_frames.store(0, Ordering::Relaxed);
+        self.sent_silence_frames.store(0, Ordering::Relaxed);
+        self.recv_played_frames.store(0, Ordering::Relaxed);
+        self.recv_silence_frames.store(0, Ordering::Relaxed);
+        self.no_data_ms.store(0, Ordering::Relaxed);
         *self.start_time.lock() = Instant::now();
     }
+}
+
+fn is_silent_frame(pcm: &[i16], threshold: i16) -> bool {
+    pcm.iter().all(|&s| s.abs() <= threshold)
 }
 
 pub struct AudioStreamState {
@@ -261,6 +280,7 @@ fn start_read_thread(state: &mut AudioStreamState) {
 
     let active_clone = Arc::clone(&active);
     let pcm_queue_clone = Arc::clone(&pcm_queue);
+    let playback_stats = Arc::clone(&state.stats);
     let handle = thread::spawn(move || {
         log::info!("音频流: 读取线程已启动");
         read_loop(
@@ -294,7 +314,7 @@ fn start_read_thread(state: &mut AudioStreamState) {
         }
 
         log::info!("音频流: 播放线程已启动");
-        playback_loop(active, on_data, ud_ptr, sample_rate, channels, pcm_queue);
+        playback_loop(active, on_data, ud_ptr, sample_rate, channels, pcm_queue, playback_stats);
         log::info!("音频流: 播放线程已结束");
     });
     state.playback_handle = Some(playback_handle);
@@ -440,6 +460,7 @@ fn playback_loop(
     sample_rate: i32,
     channels: i32,
     pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
+    stats: Arc<AudioStats>,
 ) {
     let frame_samples = (sample_rate * 20) / 1000;
     let frame_duration_us = (frame_samples as u64 * 1_000_000) / sample_rate as u64;
@@ -458,6 +479,10 @@ fn playback_loop(
 
         match pcm {
             Some(data) => {
+                stats.recv_played_frames.fetch_add(1, Ordering::Relaxed);
+                if is_silent_frame(&data, 50) {
+                    stats.recv_silence_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 if let Some(cb) = on_data {
                     let pcm_bytes = unsafe {
                         std::slice::from_raw_parts(
@@ -490,6 +515,7 @@ fn playback_loop(
                 }
             }
             None => {
+                stats.no_data_ms.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -528,6 +554,11 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     while buffer_guard.len() >= frame_samples {
         let frame_data = buffer_guard.drain(..frame_samples).collect::<Vec<_>>();
         drop(buffer_guard);
+
+        state.stats.sent_frames.fetch_add(1, Ordering::Relaxed);
+        if is_silent_frame(&frame_data, 50) {
+            state.stats.sent_silence_frames.fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut encoder_guard = match state.encoder.try_lock() {
             Some(g) => g,
@@ -685,6 +716,36 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
         frame_size,
         elapsed,
     );
+
+    let sent_frames = state.stats.sent_frames.load(Ordering::Relaxed);
+    let sent_silence_frames = state.stats.sent_silence_frames.load(Ordering::Relaxed);
+    let recv_played_frames = state.stats.recv_played_frames.load(Ordering::Relaxed);
+    let recv_silence_frames = state.stats.recv_silence_frames.load(Ordering::Relaxed);
+    let no_data_ms = state.stats.no_data_ms.load(Ordering::Relaxed);
+
+    if state.encoder.lock().is_some() && sent_frames > 0 {
+        log::info!(
+            "音频流: 发送端无声占比 {:.2}% (静默 {} / 总帧 {})",
+            sent_silence_frames as f64 / sent_frames as f64 * 100.0,
+            sent_silence_frames,
+            sent_frames
+        );
+    }
+    if state.decoder.lock().is_some() && recv_played_frames > 0 {
+        let no_data_pct = if elapsed > 0.0 {
+            no_data_ms as f64 / (elapsed * 1000.0) * 100.0
+        } else {
+            0.0
+        };
+        log::info!(
+            "音频流: 接收端无声占比 {:.2}% (静默 {} / 播放 {}), 无数据时段 {} ms (占 {:.2}%)",
+            recv_silence_frames as f64 / recv_played_frames as f64 * 100.0,
+            recv_silence_frames,
+            recv_played_frames,
+            no_data_ms,
+            no_data_pct
+        );
+    }
 
     state.remote_uuid.clear();
     state.peer_ip.clear();
