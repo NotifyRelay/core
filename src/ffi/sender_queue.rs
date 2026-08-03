@@ -5,6 +5,9 @@ use crate::SafeContext;
 
 use super::common::from_cstr;
 
+/// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
+const SENT_DEDUP_TTL_MS: i64 = 3000;
+
 /// 创建发送队列
 #[no_mangle]
 pub extern "C" fn nrc_create_sender_queue(ctx_ptr: *mut c_void) -> i64 {
@@ -48,6 +51,18 @@ pub unsafe extern "C" fn nrc_enqueue_message(
     let hdr = unsafe { from_cstr(header) };
     let text = unsafe { from_cstr(plaintext) };
     let dk = unsafe { from_cstr(dedup_key) };
+
+    // 发送去重 TTL（与原平台端实现一致：3000ms）
+    if !dk.is_empty() {
+        let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+        let dedup_ok = ctx
+            .get_mut()
+            .map(|g| g.dedup.check_and_pend(&dk, SENT_DEDUP_TTL_MS))
+            .unwrap_or(false);
+        if !dedup_ok {
+            return;
+        }
+    }
 
     queue.enqueue(SendItem {
         device_uuid: uuid.to_string(),
