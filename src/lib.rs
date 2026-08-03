@@ -2,6 +2,7 @@
 
 pub mod audio_codec;
 pub mod audio_stream;
+mod clipboard;
 mod crypto;
 mod dedup;
 pub mod diff;
@@ -36,6 +37,7 @@ pub struct CoreContext {
     pub network: network::NetworkState,
     pub mdns: mdns::MdnsState,
     pub dedup: dedup::DedupState,
+    pub clipboard: clipboard::ClipboardState,
     pub filter: ffi::filter::FilterState,
     pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
     pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
@@ -86,6 +88,7 @@ impl CoreContext {
             network: network::NetworkState::new(),
             mdns: mdns::MdnsState::new(),
             dedup: dedup::DedupState::new(),
+            clipboard: clipboard::ClipboardState::new(),
             filter: ffi::filter::FilterState::new(),
             device_ips: Mutex::new(HashMap::new()),
             spake2_prover: None,

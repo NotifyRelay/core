@@ -1,5 +1,6 @@
 pub mod audio_stream;
 pub mod callbacks;
+pub mod clipboard;
 pub mod common;
 pub mod discovery;
 pub mod ecdh;
@@ -19,6 +20,7 @@ pub mod utils;
 
 pub use audio_stream::*;
 pub use callbacks::*;
+pub use clipboard::*;
 pub use common::*;
 pub use discovery::*;
 pub use ecdh::*;

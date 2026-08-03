@@ -389,6 +389,11 @@ impl SenderQueue {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
+
+    /// 当前待发送项数量（供状态查询与测试使用）
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().map(|g| g.items.len()).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
