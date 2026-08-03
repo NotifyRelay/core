@@ -1,3 +1,4 @@
+pub mod app_sync;
 pub mod audio_stream;
 pub mod callbacks;
 pub mod clipboard;
@@ -18,6 +19,7 @@ pub mod sender_queue;
 pub mod state_merge;
 pub mod utils;
 
+pub use app_sync::*;
 pub use audio_stream::*;
 pub use callbacks::*;
 pub use clipboard::*;
