@@ -2,27 +2,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::network;
 use crate::protocol::codec;
 use crate::SafeContext;
 
-/// 发现的设备信息
-#[derive(Debug, Clone)]
-pub struct DiscoveredDevice {
-    pub uuid: String,
-    pub name: String,
-    pub ip: String,
-    pub port: u16,
-    pub battery: i32,
-    pub device_type: String,
-    pub last_seen: Instant,
-}
-
 pub struct DiscoveryState {
-    /// 已发现的设备
-    pub devices: Arc<Mutex<HashMap<String, DiscoveredDevice>>>,
     /// 发现扫描线程
     scanner_running: Arc<AtomicBool>,
     /// 已知设备列表（用于自动连接已配对设备）
@@ -32,44 +18,9 @@ pub struct DiscoveryState {
 impl DiscoveryState {
     pub fn new() -> Self {
         Self {
-            devices: Arc::new(Mutex::new(HashMap::new())),
             scanner_running: Arc::new(AtomicBool::new(false)),
             known_devices: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// 添加/更新发现的设备
-    pub fn record_device(
-        &self,
-        uuid: &str,
-        name: &str,
-        ip: &str,
-        port: u16,
-        battery: i32,
-        device_type: &str,
-    ) {
-        if let Ok(mut guard) = self.devices.lock() {
-            guard.insert(
-                uuid.to_string(),
-                DiscoveredDevice {
-                    uuid: uuid.to_string(),
-                    name: name.to_string(),
-                    ip: ip.to_string(),
-                    port,
-                    battery,
-                    device_type: device_type.to_string(),
-                    last_seen: Instant::now(),
-                },
-            );
-        }
-    }
-
-    /// 获取发现的设备列表
-    pub fn get_devices(&self) -> Vec<DiscoveredDevice> {
-        self.devices
-            .lock()
-            .map(|guard| guard.values().cloned().collect())
-            .unwrap_or_default()
     }
 
     /// 添加已知设备（已配对的，用于自动重连发现）

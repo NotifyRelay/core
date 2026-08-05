@@ -469,7 +469,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             0
         }
         1 => {
-            if uuid.is_null() || name.is_null() || device_type.is_null() || battery < 0 {
+            if uuid.is_null() || name.is_null() || device_type.is_null() || battery.abs() > 100 {
                 return -1;
             }
             let u = unsafe { from_cstr(uuid).to_string() };

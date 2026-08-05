@@ -57,8 +57,7 @@ pub struct CoreContext {
     /// UUID → IP 映射（从 UDP 心跳源地址、TCP 连接等收集）
     pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
-    pub heartbeat_handle: i64,
-    /// 统一心跳调度器句柄（Android 用；PC 仍使用 per-device nrc_start_heartbeat_sender）
+    /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳，AUTO 模式）
     pub heartbeat_scheduler: i64,
     /// 调度器持有的每设备 HeartbeatHandle（跨轮次持久，由调度线程维护）
     pub heartbeat_scheduler_handles: HashMap<String, heartbeat::HeartbeatHandle>,
@@ -110,7 +109,6 @@ impl CoreContext {
             pairing_code_expiry: None,
             broadcast_info: None,
             broadcast_handle: None,
-            heartbeat_handle: 0,
             heartbeat_scheduler: 0,
             heartbeat_scheduler_handles: HashMap::new(),
             offline_detector_handle: 0,

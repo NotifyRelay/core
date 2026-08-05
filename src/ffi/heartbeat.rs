@@ -2,97 +2,10 @@ use std::os::raw::{c_char, c_void};
 
 use base64::Engine;
 
-use crate::heartbeat::{self, HeartbeatHandle};
+use crate::heartbeat;
 use crate::SafeContext;
 
 use super::common::from_cstr;
-
-/// 启动心跳发送器
-/// mode: 0=UDP, 1=TCP, 2=Auto
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_heartbeat_sender(
-    ctx_ptr: *mut c_void,
-    uuid: *const c_char,
-    name: *const c_char,
-    battery: i32,
-    device_type: *const c_char,
-    ip: *const c_char,
-    interval_ms: u64,
-    mode: i32,
-) -> i64 {
-    if ctx_ptr.is_null() {
-        return -1;
-    }
-    let u = from_cstr(uuid);
-    let n = from_cstr(name);
-    let d = from_cstr(device_type);
-    let ip_str = from_cstr(ip);
-
-    match HeartbeatHandle::start(
-        ctx_ptr as usize,
-        u,
-        n,
-        battery,
-        d,
-        ip_str,
-        interval_ms,
-        mode,
-    ) {
-        Ok(handle) => {
-            let ctx = &mut *(ctx_ptr as *mut SafeContext);
-            {
-                let guard = ctx.get_mut().unwrap();
-                let name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
-                guard.broadcast_info = Some(crate::BroadcastInfo {
-                    uuid: u.to_string(),
-                    name_b64,
-                    battery,
-                    device_type: d.to_string(),
-                });
-                let handle_box = Box::new(handle);
-                let ptr = Box::into_raw(handle_box) as i64;
-                guard.heartbeat_handle = ptr;
-                ptr
-            }
-        }
-        Err(_) => -1,
-    }
-}
-
-/// 更新心跳发送器参数
-#[no_mangle]
-pub unsafe extern "C" fn nrc_update_heartbeat_params(
-    ctx_ptr: *mut c_void,
-    handle_ptr: i64,
-    uuid: *const c_char,
-    name: *const c_char,
-    battery: i32,
-    device_type: *const c_char,
-) {
-    if ctx_ptr.is_null() || handle_ptr == 0 {
-        return;
-    }
-    let handle = &*(handle_ptr as *const HeartbeatHandle);
-    let u = from_cstr(uuid);
-    let n = from_cstr(name);
-    let d = from_cstr(device_type);
-    handle.update(u, n, battery, d);
-}
-
-/// 停止心跳发送器
-#[no_mangle]
-pub unsafe extern "C" fn nrc_stop_heartbeat_sender(ctx_ptr: *mut c_void, handle_ptr: i64) {
-    if ctx_ptr.is_null() || handle_ptr == 0 {
-        return;
-    }
-    let handle = Box::from_raw(handle_ptr as *mut HeartbeatHandle);
-    handle.stop();
-    let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    {
-        let guard = ctx.get_mut().unwrap();
-        guard.heartbeat_handle = 0;
-    }
-}
 
 /// 启动离线检测
 /// timeout_sec: 超时秒数（默认 30）
