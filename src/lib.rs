@@ -6,6 +6,7 @@ pub mod audio_stream;
 mod clipboard;
 mod crypto;
 mod dedup;
+pub mod device_registry;
 pub mod diff;
 mod discovery;
 pub mod ffi;
@@ -41,6 +42,8 @@ pub struct CoreContext {
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
     pub filter: ffi::filter::FilterState,
+    /// 设备运行时状态统一注册表
+    pub registry: device_registry::DeviceRegistry,
     pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
     pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
     pub pairing_ctx: Option<PairingContext>,
@@ -55,6 +58,10 @@ pub struct CoreContext {
     pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
     pub heartbeat_handle: i64,
+    /// 统一心跳调度器句柄（Android 用；PC 仍使用 per-device nrc_start_heartbeat_sender）
+    pub heartbeat_scheduler: i64,
+    /// 调度器持有的每设备 HeartbeatHandle（跨轮次持久，由调度线程维护）
+    pub heartbeat_scheduler_handles: HashMap<String, heartbeat::HeartbeatHandle>,
     pub offline_detector_handle: i64,
     pub sender_queue: i64,
     pub reconnect_state: i64,
@@ -93,6 +100,7 @@ impl CoreContext {
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),
             filter: ffi::filter::FilterState::new(),
+            registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
             spake2_prover: None,
             spake2_verifier: None,
@@ -103,6 +111,8 @@ impl CoreContext {
             broadcast_info: None,
             broadcast_handle: None,
             heartbeat_handle: 0,
+            heartbeat_scheduler: 0,
+            heartbeat_scheduler_handles: HashMap::new(),
             offline_detector_handle: 0,
             sender_queue: 0,
             reconnect_state: 0,

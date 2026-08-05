@@ -75,7 +75,7 @@ impl MdnsState {
 
     pub fn start_browser(
         &mut self,
-        _ctx_ptr: usize,
+        ctx_ptr: usize,
         on_discovered_cb: crate::router::OnMdnsDiscoveredCb,
         user_data: *mut std::os::raw::c_void,
     ) -> Result<(), String> {
@@ -135,6 +135,16 @@ impl MdnsState {
 
                                 let mdns_port = info.get_port();
                                 let dt = device_type;
+
+                                // mDNS 发现：登记设备状态（电量未知 -1，刷新 last_seen）
+                                if ctx_ptr != 0 {
+                                    if let Ok(ctx) =
+                                        unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) }
+                                            .get_mut()
+                                    {
+                                        ctx.registry.upsert(&uuid, &name, &ip, mdns_port, -1, &dt);
+                                    }
+                                }
 
                                 if let Some(cb) = on_discovered_cb {
                                     let uuid_c = std::ffi::CString::new(uuid).unwrap_or_default();

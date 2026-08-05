@@ -38,6 +38,7 @@ pub unsafe extern "C" fn nrc_remove_device(
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
         ctx.crypto.device_keys.remove(uuid);
+        ctx.registry.remove(uuid);
         0
     })
 }

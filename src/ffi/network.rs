@@ -40,6 +40,7 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
             if let Ok(mut ips) = guard.device_ips.lock() {
                 ips.insert(uuid.clone(), ip.clone());
             }
+            guard.registry.mark_connected(&uuid, &ip);
         }
         if let Some(cb) = on_connected {
             if let (Ok(uuid_c), Ok(ip_c)) = (CString::new(uuid.as_str()), CString::new(ip.as_str()))
@@ -51,7 +52,12 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     }) as Arc<dyn Fn(String, String) + Send + Sync>);
 
     let on_disconnected_cb = on_disconnected.map(|cb| {
+        let ctx_usize = ctx_ptr as usize;
         Arc::new(move |uuid: String| {
+            // TCP 断开：登记断开状态（设备可能仍经 UDP 心跳在线）
+            if let Ok(guard) = unsafe { &*(ctx_usize as *mut crate::SafeContext) }.lock() {
+                guard.registry.mark_disconnected(&uuid);
+            }
             if let Ok(uuid_c) = CString::new(uuid.as_str()) {
                 let ud = user_data_usize as *mut c_void;
                 cb(uuid_c.as_ptr(), ud);
@@ -119,10 +125,15 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
                 )
                 .unwrap_or(name_b64);
                 let src_ip_clone = src_ip.clone();
-                if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+                if let Ok(mut guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
                     if let Ok(mut ips) = guard.device_ips.lock() {
                         ips.insert(uuid.clone(), src_ip_clone);
                     }
+                    // UDP 心跳：记录 last_seen 并登记状态
+                    guard.heartbeat.record(&uuid);
+                    guard
+                        .registry
+                        .upsert(&uuid, &name, &src_ip, port, battery, &device_type);
                 }
                 if let Some(cb) = udp_on_heartbeat {
                     if let (Ok(uuid_c), Ok(name_c), Ok(dt_c), Ok(ip_c)) = (
@@ -232,10 +243,15 @@ pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
             )
             .unwrap_or(name_b64);
             let src_ip_clone = src_ip.clone();
-            if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+            if let Ok(mut guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
                 if let Ok(mut ips) = guard.device_ips.lock() {
                     ips.insert(uuid.clone(), src_ip_clone);
                 }
+                // UDP 心跳：记录 last_seen 并登记状态
+                guard.heartbeat.record(&uuid);
+                guard
+                    .registry
+                    .upsert(&uuid, &name, &src_ip, port, battery, &device_type);
             }
             if let Some(cb) = restart_udp_on_heartbeat {
                 if let (Ok(uuid_c), Ok(name_c), Ok(dt_c), Ok(ip_c)) = (
@@ -468,11 +484,22 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
                         )
                         .unwrap_or(name_b64);
                         let src_ip_clone = src_ip.clone();
-                        if let Ok(guard) = unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock()
+                        if let Ok(mut guard) =
+                            unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock()
                         {
                             if let Ok(mut ips) = guard.device_ips.lock() {
                                 ips.insert(uuid.clone(), src_ip_clone);
                             }
+                            // UDP 心跳：记录 last_seen 并登记状态
+                            guard.heartbeat.record(&uuid);
+                            guard.registry.upsert(
+                                &uuid,
+                                &name,
+                                &src_ip,
+                                port,
+                                battery,
+                                &device_type,
+                            );
                         }
                         if let (Ok(uuid_c), Ok(name_c), Ok(dt_c), Ok(ip_c)) = (
                             std::ffi::CString::new(uuid.as_str()),

@@ -85,6 +85,29 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         }
                     }
                 }
+                {
+                    let guard = ctx.get_mut().unwrap();
+                    // 握手：登记设备身份（不刷新 last_seen），IP 优先用报文携带值
+                    let ip_from_ips = guard
+                        .device_ips
+                        .lock()
+                        .ok()
+                        .and_then(|ips| ips.get(uuid_str.as_str()).cloned())
+                        .unwrap_or_default();
+                    let ip = if f.ip.is_empty() {
+                        ip_from_ips.as_str()
+                    } else {
+                        f.ip
+                    };
+                    guard.registry.upsert_no_seen(
+                        &uuid_str,
+                        "",
+                        ip,
+                        codec::DEFAULT_TCP_PORT,
+                        f.battery,
+                        f.device_type,
+                    );
+                }
                 let data = serde_json::json!({
                     "uuid": f.uuid,
                     "pub_key": f.pub_key,
@@ -257,6 +280,24 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         .unwrap_or_default(),
                 )
                 .unwrap_or(f.name.to_string());
+                {
+                    let guard = ctx.get_mut().unwrap();
+                    // IP 从 device_ips 取（TCP 连接来源 IP）
+                    let ip = guard
+                        .device_ips
+                        .lock()
+                        .ok()
+                        .and_then(|ips| ips.get(f.uuid).cloned())
+                        .unwrap_or_default();
+                    guard.registry.upsert(
+                        f.uuid,
+                        &name_decoded,
+                        &ip,
+                        f.port,
+                        f.battery,
+                        f.device_type,
+                    );
+                }
                 let data = serde_json::json!({
                     "uuid": f.uuid,
                     "name": name_decoded,

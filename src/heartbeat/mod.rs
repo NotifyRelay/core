@@ -271,6 +271,7 @@ pub fn start_offline_detector(
                 {
                     let guard = ctx.get_mut().unwrap();
                     guard.heartbeat.remove(uuid);
+                    guard.registry.mark_disconnected(uuid);
                     if let Ok(mut tcp) = guard.network.tcp.lock() {
                         tcp.remove_session(uuid);
                     }
@@ -282,4 +283,126 @@ pub fn start_offline_detector(
         .map_err(|e| format!("启动离线检测线程失败: {}", e))?;
 
     Ok(running)
+}
+
+/// 统一心跳调度器
+///
+/// 单线程管理每个已知设备的 HeartbeatHandle：
+/// - 每轮扫描 known_devices（平台只喂过 uuid+ip）：无 handle 且已配对 → 启动 AUTO 心跳（复用现有回退逻辑）
+/// - 设备从 known_devices 移除 → 停止并移除 handle
+/// - 本机参数（broadcast_info）变化 → 遍历 handle 调用现有 update()
+pub struct HeartbeatScheduler {
+    running: Arc<AtomicBool>,
+}
+
+impl HeartbeatScheduler {
+    pub fn start(ctx_ptr: usize, interval_ms: u64) -> Result<Self, String> {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+
+        thread::Builder::new()
+            .name("heartbeat-scheduler".to_string())
+            .spawn(move || loop {
+                if !r.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // 每轮工作在一个块内完成，避免长期持有 ctx 锁（MutexGuard 临时量随块结束释放）
+                {
+                    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                    let guard = match ctx.get_mut() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+
+                    // 本机身份参数来自 broadcast_info（由 FFI 写入）
+                    let (local_uuid, local_name_b64, local_battery, local_device_type) = guard
+                        .broadcast_info
+                        .as_ref()
+                        .map(|b| {
+                            (
+                                b.uuid.clone(),
+                                b.name_b64.clone(),
+                                b.battery,
+                                b.device_type.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let local_name = if local_name_b64.is_empty() {
+                        String::new()
+                    } else {
+                        String::from_utf8(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(&local_name_b64)
+                                .unwrap_or_default(),
+                        )
+                        .unwrap_or(local_name_b64)
+                    };
+
+                    let known_devices = guard.discovery.get_known_devices();
+                    let paired: Vec<String> = guard.crypto.device_keys.keys().cloned().collect();
+
+                    // 已配对设备的 handle 注册表（uuid -> HeartbeatHandle，跨轮次持久）
+                    let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
+
+                    // 1. 移除已不在 known_devices 的 handle
+                    let stale: Vec<String> = handles.keys().cloned().collect();
+                    for s in stale {
+                        if !known_devices.contains_key(&s) {
+                            if let Some(h) = handles.remove(&s) {
+                                h.stop();
+                            }
+                        }
+                    }
+
+                    // 2. 为已配对且无 handle 的已知设备启动心跳（AUTO 模式，复用现有回退逻辑）
+                    for (uuid, ip) in &known_devices {
+                        if handles.contains_key(uuid) {
+                            continue;
+                        }
+                        if !paired.contains(uuid) {
+                            continue;
+                        }
+                        if local_uuid.is_empty() {
+                            break;
+                        }
+                        match HeartbeatHandle::start(
+                            ctx_ptr,
+                            uuid,
+                            &local_name,
+                            local_battery,
+                            &local_device_type,
+                            ip,
+                            interval_ms,
+                            HEARTBEAT_MODE_AUTO,
+                        ) {
+                            Ok(h) => {
+                                log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);
+                                handles.insert(uuid.clone(), h);
+                            }
+                            Err(e) => {
+                                log::warn!("心跳调度器: 启动心跳失败 uuid={} err={}", uuid, e);
+                            }
+                        }
+                    }
+
+                    // 3. 本机参数变化 → 更新全部 handle（复用现有 update）
+                    for h in handles.values() {
+                        h.update(&local_uuid, &local_name, local_battery, &local_device_type);
+                    }
+
+                    // 4. 将 handle 表存回调度器共享状态
+                    guard.heartbeat_scheduler_handles = handles;
+                }
+
+                thread::sleep(Duration::from_millis(interval_ms.min(2000)));
+            })
+            .map_err(|e| format!("启动心跳调度线程失败: {}", e))?;
+
+        Ok(Self { running })
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
