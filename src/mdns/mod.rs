@@ -8,10 +8,23 @@ use base64::Engine;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 const MDNS_SERVICE_TYPE: &str = "_notifyrelay._tcp.local.";
+
+/// 广告参数（保存用于电量变化时重建广告）
+#[derive(Clone)]
+struct AdvertiseParams {
+    uuid: String,
+    name: String,
+    port: u16,
+    pubkey: String,
+    device_type: String,
+    battery: i32,
+}
+
 pub struct MdnsState {
     daemon: Option<ServiceDaemon>,
     browse_handle: Option<thread::JoinHandle<()>>,
     browse_running: Option<Arc<AtomicBool>>,
+    advertise_params: Option<AdvertiseParams>,
 }
 
 impl MdnsState {
@@ -20,6 +33,7 @@ impl MdnsState {
             daemon: None,
             browse_handle: None,
             browse_running: None,
+            advertise_params: None,
         }
     }
 
@@ -34,11 +48,63 @@ impl MdnsState {
         port: u16,
         pubkey: &str,
         device_type: &str,
+        battery: i32,
     ) -> Result<(), String> {
         if self.daemon.is_some() {
             return Ok(());
         }
+        self.advertise_params = Some(AdvertiseParams {
+            uuid: uuid.to_string(),
+            name: name.to_string(),
+            port,
+            pubkey: pubkey.to_string(),
+            device_type: device_type.to_string(),
+            battery,
+        });
+        self.start_advertiser_inner(uuid, name, port, pubkey, device_type, battery)
+    }
 
+    /// 更新广告携带的电量（未知值跳过；电量相同跳过；否则重建广告使 TXT 生效）
+    pub fn update_battery(&mut self, battery: i32) {
+        if battery.abs() > 100 {
+            return;
+        }
+        let Some(params) = self.advertise_params.as_ref() else {
+            return;
+        };
+        if params.battery == battery {
+            return;
+        }
+        let params = params.clone();
+        if let Some(daemon) = self.daemon.take() {
+            drop(daemon);
+        }
+        match self.start_advertiser_inner(
+            &params.uuid,
+            &params.name,
+            params.port,
+            &params.pubkey,
+            &params.device_type,
+            battery,
+        ) {
+            Ok(_) => {
+                if let Some(p) = self.advertise_params.as_mut() {
+                    p.battery = battery;
+                }
+            }
+            Err(e) => log::error!("更新 mDNS 广告电量失败: {}", e),
+        }
+    }
+
+    fn start_advertiser_inner(
+        &mut self,
+        uuid: &str,
+        name: &str,
+        port: u16,
+        pubkey: &str,
+        device_type: &str,
+        battery: i32,
+    ) -> Result<(), String> {
         let daemon =
             ServiceDaemon::new().map_err(|e| format!("创建 mDNS 服务守护进程失败: {}", e))?;
 
@@ -48,6 +114,7 @@ impl MdnsState {
         properties.insert("name".to_string(), name_b64);
         properties.insert("pubkey".to_string(), pubkey.to_string());
         properties.insert("device_type".to_string(), device_type.to_string());
+        properties.insert("battery".to_string(), battery.to_string());
 
         let service_info = ServiceInfo::new(
             MDNS_SERVICE_TYPE,
@@ -135,14 +202,19 @@ impl MdnsState {
 
                                 let mdns_port = info.get_port();
                                 let dt = device_type;
+                                let battery = info
+                                    .get_property_val_str("battery")
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                    .unwrap_or(crate::device_registry::BATTERY_UNKNOWN);
 
-                                // mDNS 发现：登记设备状态（电量未知 -1，刷新 last_seen）
+                                // mDNS 发现：登记设备状态（广告 TXT 携带电量，缺失时为未知 -101）
                                 if ctx_ptr != 0 {
                                     if let Ok(ctx) =
                                         unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) }
                                             .get_mut()
                                     {
-                                        ctx.registry.upsert(&uuid, &name, &ip, mdns_port, -1, &dt);
+                                        ctx.registry
+                                            .upsert(&uuid, &name, &ip, mdns_port, battery, &dt);
                                     }
                                 }
 
@@ -156,6 +228,7 @@ impl MdnsState {
                                         name_c.as_ptr(),
                                         ip_c.as_ptr(),
                                         mdns_port,
+                                        battery,
                                         dt_c.as_ptr(),
                                         user_data_ptr,
                                     );

@@ -10,6 +10,9 @@ pub fn now_sec() -> i64 {
         .as_secs() as i64
 }
 
+/// 未知电量约定值：超出 [-100,100] 区间的值均视为未知
+pub const BATTERY_UNKNOWN: i32 = -101;
+
 /// 注册设备状态（平台端可读快照，不含 displayName 等 UI 元数据）
 #[derive(Debug, Clone)]
 pub struct RegisteredDevice {
@@ -57,7 +60,7 @@ impl DeviceRegistry {
                     name: String::new(),
                     ip: String::new(),
                     port: 0,
-                    battery: -1,
+                    battery: BATTERY_UNKNOWN,
                     device_type: String::new(),
                     last_seen: 0,
                     connected: false,
@@ -71,7 +74,10 @@ impl DeviceRegistry {
             if port > 0 {
                 entry.port = port;
             }
-            entry.battery = battery;
+            // 未知电量（超出 [-100,100]）不覆盖已有值
+            if battery.abs() <= 100 {
+                entry.battery = battery;
+            }
             if !device_type.is_empty() {
                 entry.device_type = device_type.to_string();
             }
@@ -100,7 +106,7 @@ impl DeviceRegistry {
                     name: String::new(),
                     ip: String::new(),
                     port: 0,
-                    battery: -1,
+                    battery: BATTERY_UNKNOWN,
                     device_type: String::new(),
                     last_seen: 0,
                     connected: false,
@@ -114,7 +120,10 @@ impl DeviceRegistry {
             if port > 0 {
                 entry.port = port;
             }
-            entry.battery = battery;
+            // 未知电量（超出 [-100,100]）不覆盖已有值
+            if battery.abs() <= 100 {
+                entry.battery = battery;
+            }
             if !device_type.is_empty() {
                 entry.device_type = device_type.to_string();
             }
@@ -131,7 +140,7 @@ impl DeviceRegistry {
                     name: String::new(),
                     ip: String::new(),
                     port: 0,
-                    battery: -1,
+                    battery: BATTERY_UNKNOWN,
                     device_type: String::new(),
                     last_seen: now_sec(),
                     connected: false,

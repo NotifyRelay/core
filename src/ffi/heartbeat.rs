@@ -213,13 +213,15 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
         if !n.is_empty() {
             b.name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
         }
-        if battery != -1 {
+        if battery.abs() <= 100 {
             b.battery = battery;
         }
         if !d.is_empty() {
             b.device_type = d;
         }
     }
+    // 本机电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
+    guard.mdns.update_battery(battery);
 }
 
 /// 停止统一心跳调度器（停止线程并停止全部调度器维护的心跳）

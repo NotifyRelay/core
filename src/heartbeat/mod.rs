@@ -221,8 +221,8 @@ impl HeartbeatHandle {
                 *n = b64;
             }
         }
-        // 负数表示放电（有效状态），-1 表示未知才不覆盖
-        if battery != -1 {
+        // 负数表示放电（有效状态），超出 [-100,100]（-101）表示未知才不覆盖
+        if battery.abs() <= 100 {
             self.params.battery.store(battery, Ordering::Relaxed);
         }
         if !device_type.is_empty() {

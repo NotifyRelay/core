@@ -34,7 +34,15 @@ pub type OnHeartbeatUdpCb = Option<
 >;
 
 pub type OnMdnsDiscoveredCb = Option<
-    extern "C" fn(*const c_char, *const c_char, *const c_char, u16, *const c_char, *mut c_void),
+    extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        u16,
+        i32, // battery（正=充电，负=放电，-101=未知）
+        *const c_char,
+        *mut c_void,
+    ),
 >;
 
 pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;

@@ -10,6 +10,7 @@ pub unsafe extern "C" fn nrc_start_mdns_advertiser(
     port: u16,
     pubkey: *const c_char,
     device_type: *const c_char,
+    battery: i32,
 ) -> i32 {
     if ctx_ptr.is_null()
         || uuid.is_null()
@@ -27,7 +28,7 @@ pub unsafe extern "C" fn nrc_start_mdns_advertiser(
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
     let guard = ctx.get_mut().unwrap();
 
-    match guard.mdns.start_advertiser(&u, &n, port, &pk, &dt) {
+    match guard.mdns.start_advertiser(&u, &n, port, &pk, &dt, battery) {
         Ok(_) => 0,
         Err(e) => {
             log::error!("启动 mDNS 广告失败: {}", e);
