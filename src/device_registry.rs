@@ -121,7 +121,7 @@ impl DeviceRegistry {
         }
     }
 
-    /// TCP 连接建立
+    /// TCP 连接建立（同时刷新 last_seen：TCP 建立即视为在线，无需等待首次心跳）
     pub fn mark_connected(&self, uuid: &str, ip: &str) {
         if let Ok(mut guard) = self.devices.lock() {
             let entry = guard
@@ -140,6 +140,7 @@ impl DeviceRegistry {
                 entry.ip = ip.to_string();
             }
             entry.connected = true;
+            entry.last_seen = now_sec();
         }
     }
 

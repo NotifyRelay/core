@@ -5,8 +5,10 @@ use super::common::{to_cstr, with_ctx};
 
 /// 获取设备状态快照（JSON 数组）
 /// 每项: {uuid, name, ip, port, battery, deviceType, lastSeen, connected, paired, online}
-/// online = connected || (now - lastSeen <= 已配对 ? authed_timeout_ms : unauthed_timeout_ms)
-/// 在线判定归 Rust；displayName 等 UI 元数据由平台端用 uuid 与 Room 匹配
+/// online = now - lastSeen <= 已配对 ? authed_timeout_ms : unauthed_timeout_ms
+/// 在线判定完全基于 lastSeen 时效（mark_connected 已刷新 lastSeen），
+/// 避免 TCP 半开连接（对端断网无 FIN/RST）导致 connected 粘滞而永远在线；
+/// connected 仅作快照展示字段。在线判定归 Rust；displayName 等 UI 元数据由平台端用 uuid 与 Room 匹配
 #[no_mangle]
 pub unsafe extern "C" fn nrc_get_device_list(
     ctx_ptr: *mut c_void,
@@ -59,9 +61,8 @@ pub unsafe extern "C" fn nrc_get_device_list(
                 } else {
                     unauthed_timeout_ms
                 };
-                let online = d.connected
-                    || (threshold > 0
-                        && now.saturating_sub(d.last_seen).saturating_mul(1000) <= threshold);
+                let online = threshold > 0
+                    && now.saturating_sub(d.last_seen).saturating_mul(1000) <= threshold;
                 serde_json::json!({
                     "uuid": d.uuid,
                     "name": d.name,

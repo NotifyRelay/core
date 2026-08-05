@@ -95,8 +95,9 @@ pub unsafe extern "C" fn nrc_stop_heartbeat_sender(ctx_ptr: *mut c_void, handle_
 }
 
 /// 启动离线检测
-/// timeout_sec: 超时秒数（默认 12）
-/// check_interval_ms: 检查间隔（默认 5000）
+/// timeout_sec: 超时秒数（默认 30）
+/// check_interval_ms: 检查间隔（默认 3000）
+/// 注意参数顺序与平台端声明一致：timeout_sec 在前，check_interval_ms 在后
 #[no_mangle]
 pub unsafe extern "C" fn nrc_start_offline_detector(
     ctx_ptr: *mut c_void,
@@ -212,7 +213,7 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
         if !n.is_empty() {
             b.name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
         }
-        if battery >= 0 {
+        if battery != -1 {
             b.battery = battery;
         }
         if !d.is_empty() {
