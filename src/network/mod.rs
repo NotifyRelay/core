@@ -293,7 +293,6 @@ fn handle_connection(
                 .map(|s| s.local_uuid.clone())
                 .unwrap_or_default();
             if !local_uuid.is_empty() && uuid == local_uuid {
-                log::debug!("拒绝本机自身连接: uuid={}, ip={}", uuid, ip);
                 return;
             }
 

@@ -73,7 +73,6 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     .map(|b| b.uuid == uuid_str)
                     .unwrap_or(false);
                 if is_self {
-                    log::debug!("处理消息: 忽略本机握手 uuid={}", uuid_str);
                     return 0;
                 }
                 let peer_pub_str = f.pub_key.to_string();
