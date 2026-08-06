@@ -115,6 +115,7 @@ impl NetworkState {
 pub fn start_tcp_server(
     state: Arc<Mutex<TcpServerState>>,
     port: u16,
+    local_uuid: String,
     on_device_connected: Option<ConnectedCallback>,
     on_device_disconnected: Option<DisconnectedCallback>,
     on_message_received: Option<MessageCallback>,
@@ -149,6 +150,7 @@ pub fn start_tcp_server(
         accept_loop(
             state_clone,
             pool_clone,
+            local_uuid,
             on_connected,
             on_disconnected,
             on_message,
@@ -184,6 +186,7 @@ pub fn stop_tcp_server(state: Arc<Mutex<TcpServerState>>) -> Result<(), String> 
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
     pool: Arc<ThreadPool>,
+    local_uuid: String,
     on_connected: Option<ConnectedCallback>,
     on_disconnected: Option<DisconnectedCallback>,
     on_message: Option<MessageCallback>,
@@ -207,6 +210,7 @@ fn accept_loop(
         match incoming {
             Some((stream, addr)) => {
                 let state_clone = state.clone();
+                let local_uuid = local_uuid.clone();
                 let on_connected = on_connected.clone();
                 let on_disconnected = on_disconnected.clone();
                 let on_message = on_message.clone();
@@ -217,6 +221,7 @@ fn accept_loop(
                         stream,
                         addr,
                         state_clone,
+                        &local_uuid,
                         on_connected,
                         on_disconnected,
                         on_message,
@@ -236,6 +241,7 @@ fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     state: Arc<Mutex<TcpServerState>>,
+    local_uuid: &str,
     on_connected: Option<ConnectedCallback>,
     on_disconnected: Option<DisconnectedCallback>,
     on_message: Option<MessageCallback>,
@@ -269,6 +275,12 @@ fn handle_connection(
 
             if uuid.is_empty() {
                 log::warn!("无法从消息中提取 UUID: {}", &line[..line.len().min(80)]);
+                return;
+            }
+
+            // 拒绝本机发起的自我连接（如已知设备中残留本机条目导致的重连循环）
+            if !local_uuid.is_empty() && uuid == local_uuid {
+                log::debug!("拒绝本机自身连接: uuid={}, ip={}", uuid, ip);
                 return;
             }
 
@@ -579,7 +591,7 @@ mod tests {
         let state = Arc::new(Mutex::new(TcpServerState::new()));
         let port = 12345;
 
-        let result = start_tcp_server(state.clone(), port, None, None, None, None);
+        let result = start_tcp_server(state.clone(), port, String::new(), None, None, None, None);
         assert!(result.is_ok());
 
         {

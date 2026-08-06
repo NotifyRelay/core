@@ -364,6 +364,10 @@ impl HeartbeatScheduler {
                         if !paired.contains(uuid) {
                             continue;
                         }
+                        // 跳过本机自身（known_devices 中不应存在本机，防御历史残留）
+                        if !local_uuid.is_empty() && *uuid == local_uuid {
+                            continue;
+                        }
                         if local_uuid.is_empty() {
                             break;
                         }

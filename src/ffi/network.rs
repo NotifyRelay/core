@@ -29,6 +29,12 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
 
     // 获取网络状态
     let network_state = guard.network.tcp.clone();
+    // 本机 uuid（用于 TCP 层拒绝自我连接）
+    let local_uuid = guard
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid.clone())
+        .unwrap_or_default();
 
     // 创建回调包装器
     let user_data_usize = user_data as usize;
@@ -86,6 +92,7 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
     match crate::network::start_tcp_server(
         network_state.clone(),
         port,
+        local_uuid,
         on_connected_cb,
         on_disconnected_cb,
         on_message_cb,
