@@ -188,7 +188,9 @@ impl ReconnectState {
                                 .as_ref()
                                 .map(|i| i.device_type.clone())
                                 .unwrap_or_default();
-                            codec::encode_handshake(&local_uuid, &local_pub, &ip, -1, &dt)
+                            let local_ip =
+                                crate::ffi::utils::get_local_ip_impl().unwrap_or_default();
+                            codec::encode_handshake(&local_uuid, &local_pub, &local_ip, -1, &dt)
                         };
 
                         let _ = crate::network::oneshot_send_receive(
