@@ -186,6 +186,24 @@ impl MdnsState {
                                     continue;
                                 }
 
+                                // 过滤本机自身广告（同机浏览器会收到本机广播的回环），
+                                // 防止本机被登记为远程设备导致自我连接/自我发送循环
+                                if ctx_ptr != 0 {
+                                    if let Ok(ctx) =
+                                        unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) }
+                                            .get_mut()
+                                    {
+                                        let local_uuid = ctx
+                                            .broadcast_info
+                                            .as_ref()
+                                            .map(|b| b.uuid.clone())
+                                            .unwrap_or_default();
+                                        if !local_uuid.is_empty() && uuid == local_uuid {
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 let name = String::from_utf8(
                                     base64::engine::general_purpose::STANDARD
                                         .decode(&name_b64)
