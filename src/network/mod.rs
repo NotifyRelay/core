@@ -39,6 +39,8 @@ pub struct TcpServerState {
     pub running: bool,
     pub port: u16,
     pub udp_handle: Option<UdpListenerHandle>,
+    /// 本机 uuid（运行期动态更新，用于 TCP 层拒绝自我连接）
+    pub local_uuid: String,
 }
 
 impl TcpServerState {
@@ -49,6 +51,7 @@ impl TcpServerState {
             running: false,
             port: 0,
             udp_handle: None,
+            local_uuid: String::new(),
         }
     }
 
@@ -132,6 +135,9 @@ pub fn start_tcp_server(
         state.listener = Some(listener);
         state.running = true;
         state.port = port;
+        if !local_uuid.is_empty() {
+            state.local_uuid = local_uuid;
+        }
     }
 
     let pool_size = std::thread::available_parallelism()
@@ -150,7 +156,6 @@ pub fn start_tcp_server(
         accept_loop(
             state_clone,
             pool_clone,
-            local_uuid,
             on_connected,
             on_disconnected,
             on_message,
@@ -164,6 +169,13 @@ pub fn start_tcp_server(
         pool_size
     );
     Ok(())
+}
+
+/// 更新本机 uuid（运行期由 FFI 层同步，保证 TCP 层自我连接拒绝始终有效）
+pub fn set_local_uuid(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
+    if let Ok(mut state) = state.lock() {
+        state.local_uuid = uuid.to_string();
+    }
 }
 
 /// 停止 TCP 服务器
@@ -186,7 +198,6 @@ pub fn stop_tcp_server(state: Arc<Mutex<TcpServerState>>) -> Result<(), String> 
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
     pool: Arc<ThreadPool>,
-    local_uuid: String,
     on_connected: Option<ConnectedCallback>,
     on_disconnected: Option<DisconnectedCallback>,
     on_message: Option<MessageCallback>,
@@ -210,7 +221,6 @@ fn accept_loop(
         match incoming {
             Some((stream, addr)) => {
                 let state_clone = state.clone();
-                let local_uuid = local_uuid.clone();
                 let on_connected = on_connected.clone();
                 let on_disconnected = on_disconnected.clone();
                 let on_message = on_message.clone();
@@ -221,7 +231,6 @@ fn accept_loop(
                         stream,
                         addr,
                         state_clone,
-                        &local_uuid,
                         on_connected,
                         on_disconnected,
                         on_message,
@@ -241,7 +250,6 @@ fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     state: Arc<Mutex<TcpServerState>>,
-    local_uuid: &str,
     on_connected: Option<ConnectedCallback>,
     on_disconnected: Option<DisconnectedCallback>,
     on_message: Option<MessageCallback>,
@@ -279,6 +287,11 @@ fn handle_connection(
             }
 
             // 拒绝本机发起的自我连接（如已知设备中残留本机条目导致的重连循环）
+            // 本机 uuid 动态从 state 读取（运行期由 FFI 层同步，避免启动顺序导致为空）
+            let local_uuid = state
+                .lock()
+                .map(|s| s.local_uuid.clone())
+                .unwrap_or_default();
             if !local_uuid.is_empty() && uuid == local_uuid {
                 log::debug!("拒绝本机自身连接: uuid={}, ip={}", uuid, ip);
                 return;

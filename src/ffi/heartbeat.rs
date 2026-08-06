@@ -86,12 +86,15 @@ pub unsafe extern "C" fn nrc_start_heartbeat_scheduler(
             h.stop();
         }
     }
+    let local_uuid = u.clone();
     guard.broadcast_info = Some(crate::BroadcastInfo {
         uuid: u,
         name_b64,
         battery,
         device_type: d,
     });
+    // 同步本机 uuid 到 TCP 层状态（防御平台端 StartTcpServer 早于本函数调用的情况）
+    crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
 
     match crate::heartbeat::HeartbeatScheduler::start(ctx_ptr as usize, interval_ms) {
         Ok(scheduler) => {

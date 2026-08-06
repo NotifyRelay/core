@@ -477,12 +477,15 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             let d = unsafe { from_cstr(device_type).to_string() };
 
             let guard = ctx.get_mut().unwrap();
+            let local_uuid = u.clone();
             guard.broadcast_info = Some(BroadcastInfo {
                 uuid: u,
                 name_b64: n_b64,
                 battery,
                 device_type: d,
             });
+            // 同步本机 uuid 到 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
+            crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
 
             if guard.broadcast_handle.is_some() {
                 return 0;
