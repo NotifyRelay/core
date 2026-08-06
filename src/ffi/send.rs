@@ -355,18 +355,31 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
 #[no_mangle]
 pub unsafe extern "C" fn nrc_send_accept(
     ctx_ptr: *mut c_void,
-    uuid: *const c_char,
+    target_uuid: *const c_char,
     lt_pub_key: *const c_char,
     ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) {
-    let u = unsafe { from_cstr(uuid).to_string() };
+    let t = unsafe { from_cstr(target_uuid).to_string() };
     let l = unsafe { from_cstr(lt_pub_key).to_string() };
     let i = unsafe { from_cstr(ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
     with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &u, &codec::encode_accept(&u, &l, &i, battery, &d));
+        let local_uuid = ctx
+            .broadcast_info
+            .as_ref()
+            .map(|info| info.uuid.clone())
+            .unwrap_or_default();
+        if local_uuid.is_empty() {
+            log::warn!("nrc_send_accept: 本机 uuid 未设置（broadcast_info 为空），跳过发送 ACCEPT");
+            return;
+        }
+        do_send(
+            ctx,
+            &t,
+            &codec::encode_accept(&local_uuid, &l, &i, battery, &d),
+        );
     });
 }
 
