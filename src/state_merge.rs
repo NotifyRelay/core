@@ -39,7 +39,8 @@ struct SenderState {
     last_hash: String,
     pending_ack: Option<(String, Instant)>,
     force_full_next: bool,
-    last_full_resend: Instant,
+    /// 上次主动推送（含 is_query 推送）时间；心跳查询间隔据此跳过活跃会话
+    last_push: Instant,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,8 @@ impl StateMerge {
 
     /// 平台传入全量状态（canonical 内容对象，包含 device 字段）。
     /// 引擎计算差异并据此入队 FULL / DELTA，或跳过无变化的包。
+    /// `is_query` 表示本次推送是查询回调（`OnStateQueryCb` 返回 2 后）触发的响应推送，
+    /// 与主动推送同样更新 `last_push`，仅用于心跳查询间隔判断。
     pub fn push_state(
         &mut self,
         queue: &SenderQueue,
@@ -87,6 +90,7 @@ impl StateMerge {
         is_media: bool,
         full_json: &str,
         is_end: bool,
+        is_query: bool,
     ) -> bool {
         let full: Value = match serde_json::from_str(full_json) {
             Ok(v) => v,
@@ -104,6 +108,14 @@ impl StateMerge {
         let canonical = serde_json::to_string(&full).unwrap_or_default();
         let hash = sha256_hex(&canonical);
         let now = Instant::now();
+        if is_query {
+            log::debug!(
+                "[state_merge] 查询响应推送 uuid={} fid={} is_media={}",
+                remote_uuid,
+                feature_id,
+                is_media
+            );
+        }
 
         let mut session = self
             .senders
@@ -117,19 +129,13 @@ impl StateMerge {
                 last_hash: String::new(),
                 pending_ack: None,
                 force_full_next: true,
-                last_full_resend: now - Duration::from_secs(7200),
+                last_push: now,
             });
 
         let first = session.last_full.is_empty();
         let force = session.force_full_next;
-        let heartbeat_elapsed = now.duration_since(session.last_full_resend).as_millis() as u64
-            >= if is_media {
-                MEDIA_HEARTBEAT_MS
-            } else {
-                SI_HEARTBEAT_MS
-            };
 
-        let payload = if first || force || heartbeat_elapsed {
+        let payload = if first || force || is_end {
             build_full_wire(&full, &feature_id, &hash, is_end)
         } else {
             if session.last_full == canonical {
@@ -162,7 +168,7 @@ impl StateMerge {
         session.last_full = canonical;
         session.last_hash = hash.clone();
         session.force_full_next = false;
-        session.last_full_resend = now;
+        session.last_push = now;
         if is_media {
             session.pending_ack = None;
         } else {
@@ -236,50 +242,65 @@ impl StateMerge {
         }
     }
 
-    /// 定时器：对活跃会话按心跳间隔重发全量；超级岛 ACK 超时则强制下次全量。
-    pub fn heartbeat_tick(&mut self, queue: &SenderQueue, now: Instant) {
-        let mut to_send: Vec<(String, String, String)> = Vec::new();
+    /// 定时器（心跳线程每秒调用，锁内）：不再重发全量包，改为收集需要查询的会话。
+    /// - 主动推送间隔内（now - last_push < interval）的会话跳过查询；
+    /// - 超级岛 ACK 超时仅标记 `force_full_next`，等待下次变更/推送时全量重发。
+    ///
+    /// 返回待查询的 (device_uuid, feature_id, is_media) 快照，回调必须在锁外调用。
+    pub fn heartbeat_tick(&mut self, now: Instant) -> Vec<(String, String, bool)> {
+        let mut to_query: Vec<(String, String, bool)> = Vec::new();
         for s in self.senders.values_mut() {
             if s.last_full.is_empty() {
                 continue;
             }
-            let elapsed = now.duration_since(s.last_full_resend).as_millis() as u64;
-            let need = if s.is_media {
-                elapsed >= MEDIA_HEARTBEAT_MS
-            } else {
-                let ack_timeout = s
-                    .pending_ack
-                    .as_ref()
-                    .map(|(_, t)| now.duration_since(*t).as_millis() as u64 >= SI_ACK_TIMEOUT_MS)
-                    .unwrap_or(false);
-                elapsed >= SI_HEARTBEAT_MS || ack_timeout
-            };
-            if need {
-                let full_val: Value = serde_json::from_str(&s.last_full).unwrap_or(Value::Null);
-                let hash = sha256_hex(&s.last_full);
-                let payload = build_full_wire(&full_val, &s.feature_id, &hash, false);
-                let header = if s.is_media {
-                    "DATA_MEDIAPLAY"
-                } else {
-                    "DATA_SUPERISLAND"
-                };
-                to_send.push((s.device_uuid.clone(), header.to_string(), payload));
-                s.last_full_resend = now;
-                if !s.is_media {
+            if let Some((_, ack_time)) = &s.pending_ack {
+                if now.duration_since(*ack_time).as_millis() as u64 >= SI_ACK_TIMEOUT_MS {
+                    s.force_full_next = true;
                     s.pending_ack = None;
+                    log::warn!(
+                        "[state_merge] ACK 超时,标记下次全量重发 uuid={} fid={}",
+                        s.device_uuid,
+                        s.feature_id
+                    );
                 }
             }
-        }
-        for (remote, header, payload) in to_send {
-            let item = SendItem {
-                device_uuid: remote,
-                header,
-                plaintext: payload,
-                dedup_key: None,
-                retries_left: 0,
-                coalesce_key: None,
+            let interval = if s.is_media {
+                MEDIA_HEARTBEAT_MS
+            } else {
+                SI_HEARTBEAT_MS
             };
-            queue.enqueue(item);
+            let elapsed = now.duration_since(s.last_push).as_millis() as u64;
+            if elapsed < interval {
+                continue;
+            }
+            to_query.push((s.device_uuid.clone(), s.feature_id.clone(), s.is_media));
+        }
+        to_query
+    }
+
+    /// 处理查询回调结果（锁内）：
+    /// - 0 = 平台上不存在 → 仅移除会话，不发任何包（接收端靠超时自然消失）
+    /// - 1 = 存在无变更 → 保活（重置 last_push，延长查询间隔）
+    /// - 2 = 存在有变更 → 平台已/将调用 push(is_query=1)，引擎无需动作
+    pub fn apply_query_results(&mut self, results: Vec<(String, String, i32)>) {
+        for (device_uuid, feature_id, code) in results {
+            let key = Self::key(&device_uuid, &feature_id);
+            match code {
+                0 => {
+                    log::warn!(
+                        "[state_merge] 查询到会话不存在,移除 uuid={} fid={}",
+                        device_uuid,
+                        feature_id
+                    );
+                    self.senders.remove(&key);
+                }
+                1 => {
+                    if let Some(s) = self.senders.get_mut(&key) {
+                        s.last_push = Instant::now();
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -518,21 +539,41 @@ pub fn handle_state_message(
 }
 
 /// 启动后台心跳线程（在 nrc_init 中调用一次）。
+/// 每秒 tick：锁内收集待查询会话快照 → 释放锁 → 调用平台查询回调（返回状态码）
+/// → 重新加锁处理结果。回调必须在锁外执行，因为平台回调内可能直接调 `nrc_push_*`。
 pub fn start_heartbeat_thread(ctx_ptr: usize) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        let mut guard = match ctx.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
         let now = Instant::now();
-        let sq = guard.sender_queue;
-        if sq == 0 {
+        let (cb, user_data, queries) = {
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            (
+                guard.router.on_state_query,
+                guard.router.user_data,
+                guard.state_merge.heartbeat_tick(now),
+            )
+        };
+        if queries.is_empty() {
             continue;
         }
-        let q = unsafe { &*(sq as *mut SenderQueue) };
-        guard.state_merge.heartbeat_tick(q, now);
+        let Some(cb_fn) = cb else {
+            // 平台未注册查询回调：跳过查询（会话保持，仅靠正常 is_end 结束）
+            continue;
+        };
+        let mut results: Vec<(String, String, i32)> = Vec::with_capacity(queries.len());
+        for (device_uuid, feature_id, is_media) in queries {
+            let uuid_c = CString::new(device_uuid.clone()).unwrap_or_default();
+            let fid_c = CString::new(feature_id.clone()).unwrap_or_default();
+            let code = cb_fn(uuid_c.as_ptr(), fid_c.as_ptr(), is_media as i32, user_data);
+            results.push((device_uuid, feature_id, code));
+        }
+        if let Ok(mut guard) = ctx.lock() {
+            guard.state_merge.apply_query_results(results);
+        }
     });
 }
 
@@ -565,9 +606,9 @@ mod tests {
         let q = SenderQueue::new();
         let mut sm = StateMerge::new();
         // 首次推送应为 FULL
-        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false));
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         // 相同内容跳过
-        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false));
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         // 变化产生 delta（通过队列内容判断）
         // 这里只验证 merge 往返：模拟接收端
         let full1 = si_full("t1", "c1");
@@ -595,5 +636,48 @@ mod tests {
         let merged_v: Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(merged_v["title"], json!("b"));
         assert_eq!(merged_v["pics"]["k2"], json!("v2"));
+    }
+
+    #[test]
+    fn test_heartbeat_query_and_removal() {
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        // 主动推送后心跳查询应跳过（活跃推送无查询开销）
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        assert!(sm.heartbeat_tick(Instant::now()).is_empty());
+        // 超过查询间隔后收集快照
+        let later = Instant::now() + Duration::from_secs(31);
+        let queries = sm.heartbeat_tick(later);
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].0, "devA");
+        assert!(!queries[0].1.is_empty());
+        // 查询不存在 → 仅移除会话，不再查询（不发任何包）
+        sm.apply_query_results(vec![(queries[0].0.clone(), queries[0].1.clone(), 0)]);
+        assert!(sm.heartbeat_tick(later + Duration::from_secs(1)).is_empty());
+        // 会话移除后再次推送会重新创建
+        assert!(sm.push_state(&q, "devA", false, &si_full("t2", "c2"), false, false));
+        let queries2 = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
+        assert_eq!(queries2.len(), 1);
+        // 存在无变更 → 保活，间隔内不再查询
+        sm.apply_query_results(vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
+        assert!(sm
+            .heartbeat_tick(Instant::now() + Duration::from_secs(29))
+            .is_empty());
+        // 存在有变更（2）→ 引擎等待平台随后的 push，不主动动作
+        let queries3 = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
+        assert_eq!(queries3.len(), 1);
+        sm.apply_query_results(vec![(queries3[0].0.clone(), queries3[0].1.clone(), 2)]);
+    }
+
+    #[test]
+    fn test_is_end_removes_session() {
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        // 正常结束包照常发送并移除会话
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), true, false));
+        assert!(sm
+            .heartbeat_tick(Instant::now() + Duration::from_secs(31))
+            .is_empty());
     }
 }

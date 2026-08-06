@@ -17,6 +17,16 @@ pub extern "C" fn nrc_set_on_data_cb(ctx_ptr: *mut c_void, cb: crate::router::On
 }
 
 #[no_mangle]
+pub extern "C" fn nrc_set_on_state_query_cb(
+    ctx_ptr: *mut c_void,
+    cb: crate::router::OnStateQueryCb,
+) {
+    with_ctx(ctx_ptr, |ctx| {
+        ctx.router.on_state_query = cb;
+    });
+}
+
+#[no_mangle]
 pub extern "C" fn nrc_set_on_heartbeat_udp_cb(
     ctx_ptr: *mut c_void,
     cb: crate::router::OnHeartbeatUdpCb,

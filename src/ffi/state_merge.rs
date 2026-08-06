@@ -20,8 +20,17 @@ pub extern "C" fn nrc_push_superisland_state(
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
+    is_query: i32,
 ) -> i32 {
-    push_state_impl(ctx_ptr, queue_ptr, device_uuid, full_json, is_end, false)
+    push_state_impl(
+        ctx_ptr,
+        queue_ptr,
+        device_uuid,
+        full_json,
+        is_end,
+        is_query,
+        false,
+    )
 }
 
 #[no_mangle]
@@ -31,8 +40,17 @@ pub extern "C" fn nrc_push_media_state(
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
+    is_query: i32,
 ) -> i32 {
-    push_state_impl(ctx_ptr, queue_ptr, device_uuid, full_json, is_end, true)
+    push_state_impl(
+        ctx_ptr,
+        queue_ptr,
+        device_uuid,
+        full_json,
+        is_end,
+        is_query,
+        true,
+    )
 }
 
 fn push_state_impl(
@@ -41,6 +59,7 @@ fn push_state_impl(
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
+    is_query: i32,
     is_media: bool,
 ) -> i32 {
     if ctx_ptr.is_null() || queue_ptr.is_null() || device_uuid.is_null() || full_json.is_null() {
@@ -55,7 +74,7 @@ fn push_state_impl(
     };
     if guard
         .state_merge
-        .push_state(queue, uuid, is_media, full, is_end != 0)
+        .push_state(queue, uuid, is_media, full, is_end != 0, is_query != 0)
     {
         0
     } else {

@@ -45,6 +45,14 @@ pub type OnMdnsDiscoveredCb = Option<
     ),
 >;
 
+/// 状态查询回调（心跳线程锁外调用）：
+/// 参数为 (device_uuid, feature_id, is_media, user_data)，返回状态码：
+/// 0 = 该会话在平台上不存在（引擎应移除会话，不发任何包）
+/// 1 = 存在且无变更（引擎保活）
+/// 2 = 存在且有变更（平台会随后通过 `nrc_push_*`(is_query=1) 推送新状态）
+pub type OnStateQueryCb =
+    Option<extern "C" fn(*const c_char, *const c_char, i32, *mut c_void) -> i32>;
+
 pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
 pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
@@ -55,6 +63,7 @@ pub struct Router {
     pub user_data: *mut c_void,
     pub on_pairing: OnPairingCb,
     pub on_data: OnDataCb,
+    pub on_state_query: OnStateQueryCb,
 
     pub on_heartbeat_udp: OnHeartbeatUdpCb,
     pub on_mdns_discovered: OnMdnsDiscoveredCb,
@@ -70,6 +79,7 @@ impl Router {
             user_data: std::ptr::null_mut(),
             on_pairing: None,
             on_data: None,
+            on_state_query: None,
             on_heartbeat_udp: None,
             on_mdns_discovered: None,
             on_device_timeout: None,
