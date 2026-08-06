@@ -69,6 +69,20 @@ impl DiscoveryState {
                         .unwrap_or_default();
 
                     for (uuid, ip) in known_list {
+                        // 跳过本机自身（已知设备中不应包含本机）
+                        let is_self = {
+                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                            ctx.get_mut()
+                                .unwrap()
+                                .broadcast_info
+                                .as_ref()
+                                .map(|b| b.uuid == uuid)
+                                .unwrap_or(false)
+                        };
+                        if is_self {
+                            continue;
+                        }
+
                         // 检查是否已连接
                         let connected = {
                             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };

@@ -64,6 +64,18 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         ProtocolHeader::Handshake => {
             if let Some(f) = codec::decode_handshake(line_str) {
                 let uuid_str = f.uuid.to_string();
+                // 忽略本机发起的握手（如重连线程误连本机 IP 导致的自我握手），避免登记本机设备
+                let is_self = ctx
+                    .get_mut()
+                    .unwrap()
+                    .broadcast_info
+                    .as_ref()
+                    .map(|b| b.uuid == uuid_str)
+                    .unwrap_or(false);
+                if is_self {
+                    log::debug!("处理消息: 忽略本机握手 uuid={}", uuid_str);
+                    return 0;
+                }
                 let peer_pub_str = f.pub_key.to_string();
                 if let Some(ref key) = {
                     let guard = ctx.get_mut().unwrap();

@@ -106,6 +106,22 @@ impl ReconnectState {
                         let uuids: Vec<String> = guard.targets.keys().cloned().collect();
 
                         for uuid in &uuids {
+                            // 跳过本机自身（重连目标中不应包含本机）
+                            let is_self = {
+                                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                                ctx.get_mut()
+                                    .unwrap()
+                                    .broadcast_info
+                                    .as_ref()
+                                    .map(|b| b.uuid == *uuid)
+                                    .unwrap_or(false)
+                            };
+                            if is_self {
+                                guard.attempt_counts.remove(uuid);
+                                to_remove.push(uuid.clone());
+                                continue;
+                            }
+
                             let connected = {
                                 let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
                                 ctx.get_mut()

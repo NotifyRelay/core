@@ -31,6 +31,17 @@ pub unsafe extern "C" fn nrc_reconnect_add_target(
     }
     let u = unsafe { from_cstr(uuid) };
     let i = unsafe { from_cstr(ip) };
+    // 忽略本机自身，避免自我重连
+    let is_self = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+        .get_mut()
+        .unwrap()
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid == u)
+        .unwrap_or(false);
+    if is_self {
+        return;
+    }
     let state = unsafe { &*(state_ptr as *const ReconnectState) };
     state.add_target(u, i);
 }

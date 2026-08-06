@@ -12,6 +12,15 @@ pub unsafe extern "C" fn nrc_add_known_device(
     let u = from_cstr(uuid).to_string();
     let i = from_cstr(ip).to_string();
     with_ctx(ctx_ptr, |ctx| {
+        // 忽略本机自身，避免自我扫描连接
+        let is_self = ctx
+            .broadcast_info
+            .as_ref()
+            .map(|b| b.uuid == u)
+            .unwrap_or(false);
+        if is_self {
+            return;
+        }
         ctx.discovery.add_known_device(&u, &i);
     });
 }
