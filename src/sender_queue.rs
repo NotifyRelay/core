@@ -394,6 +394,19 @@ impl SenderQueue {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().map(|g| g.items.len()).unwrap_or(0)
     }
+
+    /// 测试辅助：清空队列并返回全部明文（仅测试用）
+    #[cfg(test)]
+    pub fn test_drain_plaintexts(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|mut g| {
+                let texts = g.items.iter().map(|i| i.plaintext.clone()).collect();
+                g.items.clear();
+                texts
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

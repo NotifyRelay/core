@@ -80,7 +80,7 @@ impl StateMerge {
     }
 
     /// 平台传入全量状态（canonical 内容对象，包含 device 字段）。
-    /// 引擎计算差异并据此入队 FULL / DELTA，或跳过无变化的包。
+    /// 引擎计算差异并据此入队 FULL / DELTA；无变化时发送空 DELTA 保活（接收端刷新时间戳）。
     /// `is_query` 表示本次推送是查询回调（`OnStateQueryCb` 返回 2 后）触发的响应推送，
     /// 与主动推送同样更新 `last_push`，仅用于心跳查询间隔判断。
     pub fn push_state(
@@ -138,15 +138,14 @@ impl StateMerge {
         let payload = if first || force || is_end {
             build_full_wire(&full, &feature_id, &hash, is_end)
         } else {
-            if session.last_full == canonical {
-                // 无变化，跳过
-                return true;
-            }
-            let old_val: Value = serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
-            let delta = diff_island(&old_val, &full);
-            if delta_is_empty(&delta) {
-                return true;
-            }
+            // 无变化时发送空差量保活包：接收端据此刷新时间戳，避免卡片超时消失
+            let delta = if session.last_full == canonical {
+                json!({})
+            } else {
+                let old_val: Value =
+                    serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
+                diff_island(&old_val, &full)
+            };
             build_delta_wire(&delta, &feature_id, &hash)
         };
 
@@ -396,18 +395,6 @@ fn diff_island(old: &Value, new: &Value) -> Value {
     json!(changes)
 }
 
-fn delta_is_empty(changes: &Value) -> bool {
-    if let Some(obj) = changes.as_object() {
-        obj.get("title").is_none()
-            && obj.get("text").is_none()
-            && obj.get("param_v2_raw").is_none()
-            && obj.get("pics").is_none()
-            && obj.get("pics_removed").is_none()
-    } else {
-        true
-    }
-}
-
 /// 把 delta 的 changes 合并进 base（上次全量），产出新的全量。
 fn merge_island(base: &Value, changes: &Value) -> String {
     let mut merged = base.clone();
@@ -607,8 +594,12 @@ mod tests {
         let mut sm = StateMerge::new();
         // 首次推送应为 FULL
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
-        // 相同内容跳过
+        // 相同内容 → 发送空差量保活包（不跳过），接收端据此刷新时间戳
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 2);
+        assert!(items[1].contains("\"type\":\"delta\""));
+        assert!(items[1].contains("\"changes\":{}"));
         // 变化产生 delta（通过队列内容判断）
         // 这里只验证 merge 往返：模拟接收端
         let full1 = si_full("t1", "c1");
