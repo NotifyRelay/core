@@ -373,7 +373,7 @@ impl HeartbeatScheduler {
                         }
                         match HeartbeatHandle::start(
                             ctx_ptr,
-                            uuid,
+                            &local_uuid,
                             &local_name,
                             local_battery,
                             &local_device_type,
