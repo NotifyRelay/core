@@ -125,6 +125,17 @@ pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
                   battery: i32,
                   device_type: String,
                   src_ip: String| {
+                // 忽略本机自身发出的 UDP 广播（广播会回环被自己接收）
+                if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+                    if guard
+                        .broadcast_info
+                        .as_ref()
+                        .map(|b| b.uuid == uuid)
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                }
                 let name = String::from_utf8(
                     base64::engine::general_purpose::STANDARD
                         .decode(&name_b64)
@@ -243,6 +254,17 @@ pub extern "C" fn nrc_restart_udp_listener(ctx_ptr: *mut c_void) -> i32 {
               battery: i32,
               device_type: String,
               src_ip: String| {
+            // 忽略本机自身发出的 UDP 广播（广播会回环被自己接收）
+            if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
+                if guard
+                    .broadcast_info
+                    .as_ref()
+                    .map(|b| b.uuid == uuid)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
             let name = String::from_utf8(
                 base64::engine::general_purpose::STANDARD
                     .decode(&name_b64)
@@ -484,6 +506,18 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
                           battery: i32,
                           device_type: String,
                           src_ip: String| {
+                        // 忽略本机自身发出的 UDP 广播（广播会回环被自己接收）
+                        if let Ok(guard) = unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock()
+                        {
+                            if guard
+                                .broadcast_info
+                                .as_ref()
+                                .map(|b| b.uuid == uuid)
+                                .unwrap_or(false)
+                            {
+                                return;
+                            }
+                        }
                         let name = String::from_utf8(
                             base64::engine::general_purpose::STANDARD
                                 .decode(&name_b64)
