@@ -223,55 +223,6 @@ pub unsafe extern "C" fn nrc_remove_device_session(
     0
 }
 
-/// Oneshot TCP 发送+接收（新版：统一超时，返回状态码）
-/// 返回 0=成功(响应已通过 process_line 处理), -1=失败
-#[no_mangle]
-pub unsafe extern "C" fn nrc_oneshot_send_receive(
-    ctx_ptr: *mut c_void,
-    ip: *const c_char,
-    port: u16,
-    payload: *const c_char,
-    timeout_ms: u32,
-) -> i32 {
-    if ctx_ptr.is_null() || ip.is_null() || payload.is_null() {
-        return -1;
-    }
-    let ip_str = unsafe { from_cstr(ip) };
-    let payload_str = unsafe { from_cstr(payload) };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-
-    match crate::network::oneshot_send_receive(payload_str, ip_str, port, timeout_ms) {
-        Some(response) => {
-            // 内部处理响应（触发回调）
-            super::processing::process_line(ctx, &response);
-            0
-        }
-        None => -1,
-    }
-}
-
-/// Oneshot TCP 发送（不等待响应）
-/// 返回 1=成功, 0=失败
-#[no_mangle]
-pub unsafe extern "C" fn nrc_oneshot_send_only(
-    ctx_ptr: *mut c_void,
-    ip: *const c_char,
-    port: u16,
-    payload: *const c_char,
-    timeout_ms: u32,
-) -> i32 {
-    if ctx_ptr.is_null() || ip.is_null() || payload.is_null() {
-        return 0;
-    }
-    let ip_str = unsafe { from_cstr(ip) };
-    let payload_str = unsafe { from_cstr(payload) };
-    if crate::network::oneshot_send_only(payload_str, ip_str, port, timeout_ms) {
-        1
-    } else {
-        0
-    }
-}
-
 /// 网络变化通知
 /// 平台端在网络状态变化（WiFi 切换、网络恢复等）时调用此函数
 /// local_ip: 新的本机 IP 地址（可为空，core 会自动获取）

@@ -173,19 +173,6 @@ pub unsafe extern "C" fn nrc_check_filter_mode(
     check_filter_impl(ctx_ptr, mapped_package, title, text)
 }
 
-/// 过滤通知（返回 1=通过, 0=被过滤）
-/// 支持通过 title/text 关键词匹配过滤条目
-#[no_mangle]
-#[deprecated(note = "请使用 nrc_check_filter_mode，后续版本将合并为一个统一的过滤检查函数")]
-pub unsafe extern "C" fn nrc_filter_notification(
-    ctx_ptr: *mut crate::SafeContext,
-    package_name: *const c_char,
-    title: *const c_char,
-    text: *const c_char,
-) -> i32 {
-    check_filter_impl(ctx_ptr, package_name, title, text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
