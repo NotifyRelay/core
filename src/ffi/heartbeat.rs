@@ -35,25 +35,6 @@ pub unsafe extern "C" fn nrc_start_offline_detector(
     }
 }
 
-/// 停止离线检测
-#[no_mangle]
-pub unsafe extern "C" fn nrc_stop_offline_detector(ctx_ptr: *mut c_void) {
-    if ctx_ptr.is_null() {
-        return;
-    }
-    let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    {
-        let guard = ctx.get_mut().unwrap();
-        if guard.offline_detector_handle != 0 {
-            let boxed = Box::from_raw(
-                guard.offline_detector_handle as *mut std::sync::Arc<std::sync::atomic::AtomicBool>,
-            );
-            boxed.store(false, std::sync::atomic::Ordering::Relaxed);
-            guard.offline_detector_handle = 0;
-        }
-    }
-}
-
 /// 启动统一心跳调度器
 /// 内部扫描 known_devices：为已配对设备自动启动/停止每设备心跳（AUTO 模式，复用现有回退逻辑）
 /// 本机身份参数（uuid/name/battery/device_type）写入 broadcast_info
@@ -138,23 +119,4 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
     }
     // 本机电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
     guard.mdns.update_battery(battery);
-}
-
-/// 停止统一心跳调度器（停止线程并停止全部调度器维护的心跳）
-#[no_mangle]
-pub unsafe extern "C" fn nrc_stop_heartbeat_scheduler(ctx_ptr: *mut c_void) {
-    if ctx_ptr.is_null() {
-        return;
-    }
-    let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    let guard = ctx.get_mut().unwrap();
-    if guard.heartbeat_scheduler != 0 {
-        let boxed =
-            Box::from_raw(guard.heartbeat_scheduler as *mut crate::heartbeat::HeartbeatScheduler);
-        boxed.stop();
-        guard.heartbeat_scheduler = 0;
-    }
-    for (_, h) in guard.heartbeat_scheduler_handles.drain() {
-        h.stop();
-    }
 }

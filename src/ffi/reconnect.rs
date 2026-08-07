@@ -76,17 +76,3 @@ pub extern "C" fn nrc_reconnect_start(
     state.configure(interval_secs, max_retries);
     state.start(ctx_ptr as usize);
 }
-
-/// 停止重连检测
-#[no_mangle]
-pub extern "C" fn nrc_reconnect_stop(ctx_ptr: *mut c_void, state_ptr: i64) {
-    if ctx_ptr.is_null() || state_ptr == 0 {
-        return;
-    }
-    let state = unsafe { Box::from_raw(state_ptr as *mut ReconnectState) };
-    state.stop();
-    unsafe { &mut *(ctx_ptr as *mut SafeContext) }
-        .get_mut()
-        .unwrap()
-        .reconnect_state = 0;
-}

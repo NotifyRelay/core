@@ -41,11 +41,3 @@ pub unsafe extern "C" fn nrc_start_known_device_scanner(ctx_ptr: *mut c_void) {
         ctx.discovery.start_known_device_scanner(ctx_ptr as usize);
     });
 }
-
-/// 停止已知设备自动扫描
-#[no_mangle]
-pub unsafe extern "C" fn nrc_stop_known_device_scanner(ctx_ptr: *mut c_void) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.discovery.stop_scanner();
-    });
-}

@@ -96,29 +96,6 @@ pub unsafe extern "C" fn nrc_compute_feature_id(
     to_cstr(&result)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn nrc_compute_feature_id_simple(
-    package_name: *const c_char,
-    title: *const c_char,
-    text: *const c_char,
-) -> *mut c_char {
-    let pkg = unsafe { from_cstr(package_name) };
-    let t = unsafe { from_cstr(title) };
-    let tx = unsafe { from_cstr(text) };
-    let mut parts: Vec<&str> = Vec::new();
-    if !pkg.is_empty() {
-        parts.push(pkg);
-    }
-    if !t.is_empty() {
-        parts.push(t);
-    }
-    if !tx.is_empty() {
-        parts.push(tx);
-    }
-    let feature = parts.join("|");
-    to_cstr(&feature)
-}
-
 /// 统一去重接口
 /// action: 0=check_and_pend, 1=mark_sent, 2=clear_pending, 3=cleanup
 /// action=0 时返回 1=应发送, 0=重复
@@ -213,13 +190,6 @@ fn combined_similarity_impl(
     let title_sim = text_similarity_impl(new_title, old_title);
     let text_sim = text_similarity_impl(new_text, old_text);
     (title_sim + text_sim) / 2.0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn nrc_text_similarity(a: *const c_char, b: *const c_char) -> f64 {
-    let a_str = unsafe { from_cstr(a) };
-    let b_str = unsafe { from_cstr(b) };
-    text_similarity_impl(a_str, b_str)
 }
 
 #[no_mangle]
@@ -366,19 +336,6 @@ mod tests {
         let result = unsafe { nrc_compute_feature_id(pkg, param, title, text, iid) };
         let s = unsafe { from_cstr(result).to_string() };
         assert_eq!(s.len(), 40);
-    }
-
-    #[test]
-    fn test_text_similarity() {
-        let a = to_cstr("hello world");
-        let b = to_cstr("hello world");
-        let result = unsafe { nrc_text_similarity(a, b) };
-        assert_eq!(result, 1.0);
-
-        let c = to_cstr("hello");
-        let d = to_cstr("world");
-        let result2 = unsafe { nrc_text_similarity(c, d) };
-        assert!(result2 < 1.0);
     }
 
     #[test]

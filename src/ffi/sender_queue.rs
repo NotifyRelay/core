@@ -77,17 +77,3 @@ pub unsafe extern "C" fn nrc_enqueue_message(
         coalesce_key: None,
     });
 }
-
-/// 停止发送队列
-#[no_mangle]
-pub extern "C" fn nrc_stop_sender_queue(ctx_ptr: *mut c_void, queue_ptr: i64) {
-    if ctx_ptr.is_null() || queue_ptr == 0 {
-        return;
-    }
-    let queue = unsafe { Box::from_raw(queue_ptr as *mut SenderQueue) };
-    queue.stop();
-    unsafe { &mut *(ctx_ptr as *mut SafeContext) }
-        .get_mut()
-        .unwrap()
-        .sender_queue = 0;
-}

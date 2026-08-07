@@ -137,8 +137,4 @@ impl DiscoveryState {
             })
             .expect("启动发现扫描线程失败");
     }
-
-    pub fn stop_scanner(&self) {
-        self.scanner_running.store(false, Ordering::Relaxed);
-    }
 }

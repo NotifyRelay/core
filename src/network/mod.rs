@@ -178,22 +178,6 @@ pub fn set_local_uuid(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
     }
 }
 
-/// 停止 TCP 服务器
-pub fn stop_tcp_server(state: Arc<Mutex<TcpServerState>>) -> Result<(), String> {
-    let mut state = state.lock().map_err(|e| format!("加锁失败: {}", e))?;
-    state.running = false;
-    // 停止 UDP 监听
-    if let Some(handle) = state.udp_handle.take() {
-        if let Ok(mut running) = handle.running.lock() {
-            *running = false;
-        }
-    }
-    state.listener = None;
-    state.sessions.clear();
-    log::info!("TCP 服务器已停止");
-    Ok(())
-}
-
 /// 接受连接循环
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
@@ -365,29 +349,6 @@ fn handle_connection(
     //log::info!("TCP连接已断开 uuid={}", uuid);
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
-    }
-}
-
-/// 广播消息（FFI 用）
-pub fn broadcast_message(state: Arc<Mutex<TcpServerState>>, message: &str) {
-    if let Ok(mut state) = state.lock() {
-        state.broadcast(message);
-    }
-}
-
-/// 获取在线设备数量（FFI 用）
-pub fn get_connected_count(state: Arc<Mutex<TcpServerState>>) -> i32 {
-    match state.lock() {
-        Ok(state) => state.connected_count(),
-        Err(_) => 0,
-    }
-}
-
-/// 检查设备是否连接（FFI 用）
-pub fn is_device_connected(state: Arc<Mutex<TcpServerState>>, uuid: &str) -> bool {
-    match state.lock() {
-        Ok(state) => state.is_connected(uuid),
-        Err(_) => false,
     }
 }
 
@@ -599,53 +560,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tcp_server_start_stop() {
-        let state = Arc::new(Mutex::new(TcpServerState::new()));
-        let port = 12345;
-
-        let result = start_tcp_server(state.clone(), port, String::new(), None, None, None, None);
-        assert!(result.is_ok());
-
-        {
-            let state = state.lock().unwrap();
-            assert!(state.running);
-            assert_eq!(state.port, port);
-        }
-
-        let result = stop_tcp_server(state.clone());
-        assert!(result.is_ok());
-
-        {
-            let state = state.lock().unwrap();
-            assert!(!state.running);
-        }
-    }
-
-    #[test]
     fn test_send_to_device_not_connected() {
         let mut state = TcpServerState::new();
         let result = state.send_to_device("test-uuid", "test message");
         assert!(!result);
-    }
-
-    #[test]
-    fn test_broadcast_message_empty() {
-        let state = Arc::new(Mutex::new(TcpServerState::new()));
-        broadcast_message(state.clone(), "test broadcast");
-    }
-
-    #[test]
-    fn test_get_connected_count_empty() {
-        let state = Arc::new(Mutex::new(TcpServerState::new()));
-        let count = get_connected_count(state.clone());
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_is_device_connected_false() {
-        let state = Arc::new(Mutex::new(TcpServerState::new()));
-        let connected = is_device_connected(state.clone(), "test-uuid");
-        assert!(!connected);
     }
 
     #[test]

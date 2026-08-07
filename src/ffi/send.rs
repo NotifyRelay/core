@@ -11,8 +11,8 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::{
-    crypto::aes, crypto::hkdf, crypto::spake2, protocol::codec, BroadcastHandle, BroadcastInfo,
-    CoreContext, SafeContext,
+    crypto::hkdf, crypto::spake2, protocol::codec, BroadcastHandle, BroadcastInfo, CoreContext,
+    SafeContext,
 };
 
 use super::common::{encode_name_b64, from_cstr, with_ctx};
@@ -391,71 +391,6 @@ pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_ch
     });
 }
 
-fn send_udp_broadcast_impl(
-    uuid: *const c_char,
-    name: *const c_char,
-    port: u16,
-    battery: i32,
-    device_type: *const c_char,
-) {
-    let u = unsafe { from_cstr(uuid).to_string() };
-    let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
-    let d = unsafe { from_cstr(device_type).to_string() };
-    crate::network::send_udp_broadcast(&codec::encode_udp_broadcast(&u, &n_b64, port, battery, &d))
-        .ok();
-}
-
-#[no_mangle]
-pub extern "C" fn nrc_send_heartbeat_udp(
-    _ctx_ptr: *mut c_void,
-    uuid: *const c_char,
-    name: *const c_char,
-    port: u16,
-    battery: i32,
-    device_type: *const c_char,
-) {
-    send_udp_broadcast_impl(uuid, name, port, battery, device_type);
-}
-
-#[no_mangle]
-#[deprecated(note = "请使用 nrc_send_heartbeat_udp，后续版本将合并为一个统一的 UDP 广播发送函数")]
-pub extern "C" fn nrc_send_discovery(
-    _ctx_ptr: *mut c_void,
-    uuid: *const c_char,
-    name: *const c_char,
-    port: u16,
-    battery: i32,
-    device_type: *const c_char,
-) {
-    send_udp_broadcast_impl(uuid, name, port, battery, device_type);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn nrc_send_data_message(
-    ctx_ptr: *mut c_void,
-    header: *const c_char,
-    local_uuid: *const c_char,
-    local_pub_key: *const c_char,
-    remote_uuid: *const c_char,
-    plaintext: *const c_char,
-) {
-    let hdr = unsafe { from_cstr(header).to_string() };
-    let uuid = unsafe { from_cstr(local_uuid).to_string() };
-    let pub_key = unsafe { from_cstr(local_pub_key).to_string() };
-    let remote = unsafe { from_cstr(remote_uuid).to_string() };
-    let text = unsafe { from_cstr(plaintext).to_string() };
-    with_ctx(ctx_ptr, |ctx| {
-        let key_arr = match ctx.crypto.get_aes_key(&remote) {
-            Some(k) => k,
-            None => return,
-        };
-        if let Ok(encrypted) = aes::encrypt(&key_arr, text.as_bytes()) {
-            let msg = codec::encode_data_message(&hdr, &uuid, &pub_key, &encrypted);
-            do_send(ctx, &uuid, &msg);
-        }
-    });
-}
-
 const BROADCAST_INTERVAL_MS: u64 = 2000;
 
 #[no_mangle]
@@ -595,32 +530,4 @@ pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
         ctx.pairing_code = None;
         ctx.pairing_code_expiry = None;
     });
-}
-
-/// 验证配对码：比对存储的配对码且检查是否过期
-/// 返回 0 表示验证通过，-1 表示不匹配，-2 表示已过期
-#[no_mangle]
-pub unsafe extern "C" fn nrc_validate_pairing_code(
-    ctx_ptr: *mut c_void,
-    code: *const c_char,
-) -> i32 {
-    if ctx_ptr.is_null() || code.is_null() {
-        return -1;
-    }
-    let input = unsafe { from_cstr(code) };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    let guard = ctx.get_mut().unwrap();
-    let stored = match &guard.pairing_code {
-        Some(c) => c.clone(),
-        None => return -1,
-    };
-    if stored != input {
-        return -1;
-    }
-    if let Some(expiry) = guard.pairing_code_expiry {
-        if std::time::Instant::now() > expiry {
-            return -2;
-        }
-    }
-    0
 }

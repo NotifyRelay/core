@@ -1,6 +1,4 @@
 use std::ffi::CString;
-use std::os::raw::c_char;
-use std::os::raw::c_void;
 
 use base64::Engine;
 
@@ -10,7 +8,6 @@ use crate::{
     SafeContext,
 };
 
-use super::common::from_cstr;
 use super::send::do_send;
 
 fn fire_pairing_cb(
@@ -477,15 +474,4 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
             -1
         }
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn nrc_process_line(ctx_ptr: *mut c_void, line: *const c_char) -> i32 {
-    if ctx_ptr.is_null() || line.is_null() {
-        log::error!("处理消息: 空指针");
-        return -1;
-    }
-    let line_str = unsafe { from_cstr(line) };
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    process_line(ctx, line_str)
 }

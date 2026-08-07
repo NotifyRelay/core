@@ -82,10 +82,3 @@ pub extern "C" fn nrc_set_on_mdns_discovered_cb(
         ctx.router.on_mdns_discovered = cb;
     });
 }
-
-#[no_mangle]
-pub extern "C" fn nrc_set_user_data(ctx_ptr: *mut c_void, user_data: *mut c_void) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.router.user_data = user_data;
-    });
-}

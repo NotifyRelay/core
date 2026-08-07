@@ -65,22 +65,6 @@ pub unsafe extern "C" fn nrc_export_device_key(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_export_local_keypair(ctx_ptr: *mut c_void) -> *mut c_char {
-    with_ctx(ctx_ptr, |ctx| {
-        let local_priv_pem = ctx
-            .crypto
-            .local_key
-            .as_ref()
-            .and_then(|k| ecdh::secret_to_pem(k).ok());
-        let json = serde_json::json!({
-            "private_key_pem": local_priv_pem,
-            "public_key_b64": ctx.crypto.local_pub_key_b64,
-        });
-        to_cstr(&json.to_string())
-    })
-}
-
-#[no_mangle]
 pub extern "C" fn nrc_export_state(ctx_ptr: *mut c_void) -> *mut c_char {
     with_ctx(ctx_ptr, |ctx| {
         let local_priv_pem = ctx
