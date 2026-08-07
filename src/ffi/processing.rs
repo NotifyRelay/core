@@ -80,23 +80,29 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     .crypto
                     .device_keys
                     .contains_key(&uuid_str);
-                if let Some(ref key) = {
-                    let guard = ctx.get_mut().unwrap();
-                    guard.crypto.local_key.clone()
-                } {
-                    if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
-                        let aes_key = hkdf::derive_session_key(&shared);
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                        {
-                            let guard = ctx.get_mut().unwrap();
-                            guard.crypto.device_keys.insert(
-                                uuid_str.clone(),
-                                crate::crypto::DeviceKeyEntry {
-                                    remote_pub_key: peer_pub_str.clone(),
-                                    aes_key_b64: b64,
-                                    aes_key_bytes: Some(aes_key),
-                                },
-                            );
+                // 仅对已配对设备刷新会话密钥；未配对设备不登记密钥，
+                // 避免拒绝/黑名单设备凭首次握手残留的 key 在下次握手被自动 ACCEPT，
+                // 新设备密钥由 ACCEPT/SPAKE2 流程或平台侧派生建立
+                if already_paired {
+                    if let Some(ref key) = {
+                        let guard = ctx.get_mut().unwrap();
+                        guard.crypto.local_key.clone()
+                    } {
+                        if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
+                            let aes_key = hkdf::derive_session_key(&shared);
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(aes_key);
+                            {
+                                let guard = ctx.get_mut().unwrap();
+                                guard.crypto.device_keys.insert(
+                                    uuid_str.clone(),
+                                    crate::crypto::DeviceKeyEntry {
+                                        remote_pub_key: peer_pub_str.clone(),
+                                        aes_key_b64: b64,
+                                        aes_key_bytes: Some(aes_key),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -237,7 +243,9 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     )
                 };
                 let mut success = false;
+                let mut pairing_flow = false;
                 if let (Some(session), Some(spake2_pub)) = (verifier_session, peer_spake2_pub) {
+                    pairing_flow = true;
                     match spake2::verifier_complete(session, &spake2_pub) {
                         Ok(shared_secret) => {
                             let aes_key = hkdf::derive_session_key(&shared_secret);
@@ -271,46 +279,53 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                 }
                             }
                             // 自动延迟 3s 发送应用列表请求（下沉自平台 DelayedRequestAppList）
-                            let ctx_ptr = ctx as *mut SafeContext as usize;
-                            let _ = std::thread::Builder::new()
-                                .name("auto-applist".to_string())
-                                .spawn(move || {
-                                    std::thread::sleep(std::time::Duration::from_secs(3));
-                                    let ctx =
-                                        unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                                    if let Ok(g) = ctx.get_mut() {
-                                        if g.sender_queue != 0 {
-                                            let q = unsafe {
-                                                &*(g.sender_queue
-                                                    as *const crate::sender_queue::SenderQueue)
-                                            };
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs() as i64)
-                                                .unwrap_or(0);
-                                            let payload =
-                                                crate::app_sync::build_applist_request(
-                                                    "user",
-                                                    now,
-                                                );
-                                            q.enqueue(crate::sender_queue::SendItem {
-                                                device_uuid: target_uuid.clone(),
-                                                header: "DATA_APP_LIST_REQUEST".to_string(),
-                                                plaintext: payload,
-                                                dedup_key: None,
-                                                retries_left: 0,
-                                                coalesce_key: None,
-                                            });
+                            // 互斥标志防止短时间多次配对时线程堆叠
+                            let delay_pending = {
+                                let g = ctx.get_mut().unwrap();
+                                g.applist_delay_pending.clone()
+                            };
+                            if !delay_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                let ctx_ptr = ctx as *mut SafeContext as usize;
+                                let _ = std::thread::Builder::new()
+                                    .name("auto-applist".to_string())
+                                    .spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(3));
+                                        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                                        if let Ok(g) = ctx.get_mut() {
+                                            if g.sender_queue != 0 {
+                                                let q = unsafe {
+                                                    &*(g.sender_queue
+                                                        as *const crate::sender_queue::SenderQueue)
+                                                };
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs() as i64)
+                                                    .unwrap_or(0);
+                                                let payload =
+                                                    crate::app_sync::build_applist_request(
+                                                        "user",
+                                                        now,
+                                                    );
+                                                q.enqueue(crate::sender_queue::SendItem {
+                                                    device_uuid: target_uuid.clone(),
+                                                    header: "DATA_APP_LIST_REQUEST".to_string(),
+                                                    plaintext: payload,
+                                                    dedup_key: None,
+                                                    retries_left: 0,
+                                                    coalesce_key: None,
+                                                });
+                                            }
                                         }
-                                    }
-                                });
+                                        delay_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    });
+                            }
                         }
                         Err(e) => {
                             log::error!("处理消息: SPAKE2 verifier 完成失败: {}", e);
                         }
                     }
                 } else {
-                    log::warn!("处理消息: ACCEPT 时 SPAKE2 会话或参数缺失");
+                    log::warn!("处理消息: ACCEPT 时 SPAKE2 会话或参数缺失(已配对设备重连场景，跳过)");
                 }
                 let data = serde_json::json!({
                     "uuid": f.uuid,
@@ -321,7 +336,11 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 })
                 .to_string();
                 fire_pairing_cb(ctx, &uuid, "ACCEPT", &data, f.battery, f.lt_pub_key);
-                fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
+                // 仅配对流程发送 RESULT 结果；已配对设备重连的 ACCEPT 由 ACCEPT 回调处理，
+                // 不再误报 success=false（避免平台侧将成功的重连判为配对失败）
+                if pairing_flow {
+                    fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
+                }
                 {
                     let ack = codec::encode_ack(&uuid);
                     let guard = ctx.get_mut().unwrap();

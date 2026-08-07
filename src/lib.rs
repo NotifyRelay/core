@@ -66,6 +66,8 @@ pub struct CoreContext {
     pub reconnect_state: i64,
     /// 超级岛 / 媒体 状态合并引擎（diff/merge/ACK/心跳全部在此闭环）
     pub state_merge: state_merge::StateMerge,
+    /// 配对成功后延迟应用列表请求互斥标志（防止多次配对时线程堆叠）
+    pub applist_delay_pending: Arc<AtomicBool>,
 }
 
 pub struct PairingContext {
@@ -115,6 +117,7 @@ impl CoreContext {
             sender_queue: 0,
             reconnect_state: 0,
             state_merge: state_merge::StateMerge::new(),
+            applist_delay_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 }
