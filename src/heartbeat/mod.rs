@@ -10,6 +10,9 @@ use crate::network;
 use crate::protocol::codec;
 use crate::SafeContext;
 
+/// 心跳指数退避上限（毫秒）：离线设备退避到该间隔后不再增加（约 1 分钟）
+const MAX_HEARTBEAT_INTERVAL_MS: u64 = 60_000;
+
 pub struct HeartbeatState {
     pub last_seen: HashMap<String, i64>,
 }
@@ -113,6 +116,7 @@ impl HeartbeatHandle {
             .name("heartbeat-sender".to_string())
             .spawn(move || {
                 let mut consecutive_failures = 0;
+                let mut next_interval_ms = interval_ms;
                 let mut current_mode = if mode == HEARTBEAT_MODE_AUTO {
                     HEARTBEAT_MODE_TCP
                 } else {
@@ -173,8 +177,12 @@ impl HeartbeatHandle {
 
                     if sent {
                         consecutive_failures = 0;
+                        next_interval_ms = interval_ms;
                     } else {
                         consecutive_failures += 1;
+                        // 离线设备指数退避：2s → 4s → 8s → 16s → 32s → 60s 封顶，
+                        // 对端恢复连接后下一次发送成功即恢复基础间隔
+                        next_interval_ms = (next_interval_ms * 2).min(MAX_HEARTBEAT_INTERVAL_MS);
                     }
 
                     // Auto 模式逻辑
@@ -200,7 +208,7 @@ impl HeartbeatHandle {
                         current_mode = mode_now;
                     }
 
-                    thread::sleep(Duration::from_millis(interval_ms));
+                    thread::sleep(Duration::from_millis(next_interval_ms));
                 }
             })
             .map_err(|e| format!("启动心跳发送线程失败: {}", e))?;

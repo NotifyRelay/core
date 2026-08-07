@@ -154,7 +154,11 @@ impl ReconnectState {
                                 .get(uuid)
                                 .and_then(|t| t.last_attempt)
                                 .map(|t| {
-                                    now.duration_since(t).as_secs() >= guard.retry_interval_secs
+                                    // 指数退避：间隔 = retry_interval * 2^attempt，上限 60s
+                                    let backoff = (guard.retry_interval_secs
+                                        << count.min(4))
+                                        .min(60);
+                                    now.duration_since(t).as_secs() >= backoff
                                 })
                                 .unwrap_or(true);
 
@@ -229,7 +233,12 @@ impl ReconnectState {
                         }
                     }
 
-                    thread::sleep(Duration::from_secs(2));
+                    // 无重连目标时降频到 30s，有目标时 10s（实际重连间隔由上面的指数退避控制）
+                    let idle = inner
+                        .lock()
+                        .map(|g| g.targets.is_empty())
+                        .unwrap_or(true);
+                    thread::sleep(Duration::from_secs(if idle { 30 } else { 10 }));
                 }
             })
             .expect("启动重连线程失败");

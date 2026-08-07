@@ -71,6 +71,9 @@ impl DiscoveryState {
                         .map(|g| g.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                         .unwrap_or_default();
 
+                    // 是否存在未连接（需扫描握手）的设备：有则保持短周期，无则降频
+                    let mut has_offline = false;
+
                     for (uuid, ip) in known_list {
                         // 跳过本机自身（已知设备中不应包含本机）
                         let is_self = {
@@ -99,6 +102,7 @@ impl DiscoveryState {
                         if connected {
                             continue;
                         }
+                        has_offline = true;
 
                         // 尝试握手建立连接（携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示）
                         let (local_uuid, local_pub, local_battery, local_ip) = {
@@ -144,7 +148,8 @@ impl DiscoveryState {
                         }
                     }
 
-                    thread::sleep(Duration::from_secs(5));
+                    // 有待连接设备时保持 5s 周期（及时感知设备上线），全部在线/无设备时降频到 15s
+                    thread::sleep(Duration::from_secs(if has_offline { 5 } else { 15 }));
                 }
             })
             .expect("启动发现扫描线程失败");
