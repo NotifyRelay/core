@@ -66,17 +66,13 @@ impl StateMerge {
     }
 
     fn compute_feature_id(full: &Value) -> String {
-        let pkg = full
-            .get("packageName")
+        // 平台端必须注入稳定的 featureIdOverride（sbn.key），内容变化不再产生新会话；
+        // 缺失时返回空串，不做内容哈希兜底
+        full.get("featureIdOverride")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let param = full
-            .get("param_v2_raw")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let title = full.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let text = full.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        crate::ffi::utils::compute_feature_id_impl(pkg, param, title, text, "")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// 平台传入全量状态（canonical 内容对象，包含 device 字段）。
@@ -583,6 +579,7 @@ mod tests {
             "title": title,
             "text": text,
             "param_v2_raw": "",
+            "featureIdOverride": "test-sbn-key",
             "pics": {},
         })
         .to_string()
