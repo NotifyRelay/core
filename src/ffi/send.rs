@@ -531,3 +531,91 @@ pub extern "C" fn nrc_clear_pairing_code(ctx_ptr: *mut c_void) {
         ctx.pairing_code_expiry = None;
     });
 }
+
+/// 高层连接接口：对已配对设备发起 HANDSHAKE 并等待对端 ACCEPT/REJECT。
+/// 内部按「最多 3 次、每次 5s 超时、间隔 1s」重试（与平台端原有握手重试策略一致），
+/// 通过 oneshot 新连接同步读取响应，无需平台端维护 deferred 等待器。
+/// 返回 0 表示收到 ACCEPT（连接成功），-1 表示被拒绝或重试耗尽。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_connect_device(
+    ctx_ptr: *mut c_void,
+    uuid: *const c_char,
+    target_ip: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+) -> i32 {
+    const MAX_RETRIES: u32 = 3;
+    const TIMEOUT_MS: u32 = 5000;
+    const RETRY_DELAY_MS: u64 = 1000;
+    const PORT: u16 = crate::protocol::codec::DEFAULT_TCP_PORT;
+
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+    let tu = unsafe { from_cstr(uuid).to_string() };
+    let ti = unsafe { from_cstr(target_ip).to_string() };
+    let dt = unsafe { from_cstr(device_type).to_string() };
+
+    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let (local_uuid, local_pub, local_ip) = {
+        let guard = ctx.get_mut().unwrap();
+        (
+            guard
+                .broadcast_info
+                .as_ref()
+                .map(|b| b.uuid.clone())
+                .unwrap_or_default(),
+            guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
+            super::utils::get_local_ip_impl().unwrap_or_default(),
+        )
+    };
+    if local_uuid.is_empty() || local_pub.is_empty() {
+        log::error!("连接设备: 本机身份未初始化 uuid={}", tu);
+        return -1;
+    }
+
+    let msg = codec::encode_handshake(&local_uuid, &local_pub, &local_ip, battery, &dt);
+
+    for attempt in 0..MAX_RETRIES {
+        let resp = crate::network::oneshot_send_receive(&msg, &ti, PORT, TIMEOUT_MS);
+        match resp {
+            Some(line) => {
+                let header = crate::protocol::header::ProtocolHeader::parse(&line);
+                if header == crate::protocol::header::ProtocolHeader::Accept {
+                    log::info!(
+                        "连接设备: 握手成功 uuid={}, 第 {} 次尝试",
+                        tu,
+                        attempt + 1
+                    );
+                    super::processing::process_line(ctx, &line);
+                    return 0;
+                }
+                if header == crate::protocol::header::ProtocolHeader::Reject {
+                    log::warn!("连接设备: 对端拒绝 uuid={}", tu);
+                    super::processing::process_line(ctx, &line);
+                    return -1;
+                }
+                log::warn!(
+                    "连接设备: 收到非预期响应({}) uuid={}, 重试",
+                    header,
+                    tu
+                );
+                super::processing::process_line(ctx, &line);
+            }
+            None => {
+                log::warn!(
+                    "连接设备: 握手超时 uuid={}, 第 {}/{} 次",
+                    tu,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+            }
+        }
+        if attempt + 1 < MAX_RETRIES {
+            std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+        }
+    }
+
+    log::warn!("连接设备: 重试耗尽 uuid={}", tu);
+    -1
+}

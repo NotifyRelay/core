@@ -73,6 +73,13 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     return 0;
                 }
                 let peer_pub_str = f.pub_key.to_string();
+                // 判定是否已配对（处理前 device_keys 是否已有该设备密钥）
+                let already_paired = ctx
+                    .get_mut()
+                    .unwrap()
+                    .crypto
+                    .device_keys
+                    .contains_key(&uuid_str);
                 if let Some(ref key) = {
                     let guard = ctx.get_mut().unwrap();
                     guard.crypto.local_key.clone()
@@ -93,7 +100,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         }
                     }
                 }
-                {
+                let ip = {
                     let guard = ctx.get_mut().unwrap();
                     // 握手：登记设备身份（不刷新 last_seen），IP 优先用报文携带值
                     let ip_from_ips = guard
@@ -115,15 +122,46 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         f.battery,
                         f.device_type,
                     );
-                }
+                    ip.to_string()
+                };
                 let data = serde_json::json!({
                     "uuid": f.uuid,
                     "pub_key": f.pub_key,
                     "ip": f.ip,
                     "battery": f.battery,
                     "device_type": f.device_type,
+                    "auto_accept": already_paired,
                 })
                 .to_string();
+                if already_paired {
+                    // 已配对设备自动闭环：登记 known_device + 自动发送 ACCEPT，平台仅做持久化/通知
+                    let _ = ctx.get_mut().unwrap().discovery.add_known_device(&uuid_str, &ip);
+                    let (local_uuid, local_pub, local_battery, local_type) = {
+                        let guard = ctx.get_mut().unwrap();
+                        let bi = guard.broadcast_info.as_ref();
+                        (
+                            bi.map(|b| b.uuid.clone()).unwrap_or_default(),
+                            guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
+                            bi.map(|b| b.battery).unwrap_or(0),
+                            bi.map(|b| b.device_type.clone()).unwrap_or_default(),
+                        )
+                    };
+                    let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
+                    if !local_uuid.is_empty() && !local_pub.is_empty() {
+                        let accept = codec::encode_accept(
+                            &local_uuid,
+                            &local_pub,
+                            &local_ip,
+                            local_battery,
+                            &local_type,
+                        );
+                        do_send(&ctx.get_mut().unwrap(), &uuid_str, &accept);
+                        log::info!(
+                            "配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT",
+                            uuid_str
+                        );
+                    }
+                }
                 fire_pairing_cb(ctx, &uuid_str, "HANDSHAKE", &data, f.battery, f.pub_key);
                 0
             } else {
@@ -220,6 +258,52 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                 guard.expected_pairing_code = None;
                             }
                             success = true;
+                            // 配对成功自动闭环：登记 known_device + 记录对端 IP
+                            let peer_ip = f.ip.to_string();
+                            let target_uuid = uuid.clone();
+                            {
+                                let g = ctx.get_mut().unwrap();
+                                g.discovery.add_known_device(&target_uuid, &peer_ip);
+                                if !peer_ip.is_empty() {
+                                    if let Ok(mut ips) = g.device_ips.lock() {
+                                        ips.insert(target_uuid.clone(), peer_ip);
+                                    }
+                                }
+                            }
+                            // 自动延迟 3s 发送应用列表请求（下沉自平台 DelayedRequestAppList）
+                            let ctx_ptr = ctx as *mut SafeContext as usize;
+                            let _ = std::thread::Builder::new()
+                                .name("auto-applist".to_string())
+                                .spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                    let ctx =
+                                        unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                                    if let Ok(g) = ctx.get_mut() {
+                                        if g.sender_queue != 0 {
+                                            let q = unsafe {
+                                                &*(g.sender_queue
+                                                    as *const crate::sender_queue::SenderQueue)
+                                            };
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs() as i64)
+                                                .unwrap_or(0);
+                                            let payload =
+                                                crate::app_sync::build_applist_request(
+                                                    "user",
+                                                    now,
+                                                );
+                                            q.enqueue(crate::sender_queue::SendItem {
+                                                device_uuid: target_uuid.clone(),
+                                                header: "DATA_APP_LIST_REQUEST".to_string(),
+                                                plaintext: payload,
+                                                dedup_key: None,
+                                                retries_left: 0,
+                                                coalesce_key: None,
+                                            });
+                                        }
+                                    }
+                                });
                         }
                         Err(e) => {
                             log::error!("处理消息: SPAKE2 verifier 完成失败: {}", e);
