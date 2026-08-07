@@ -5,9 +5,8 @@ use crate::SafeContext;
 
 use super::common::from_cstr;
 
-/// 创建重连状态机
-#[no_mangle]
-pub extern "C" fn nrc_create_reconnect_state(ctx_ptr: *mut c_void) -> i64 {
+/// 创建重连状态机（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn create_reconnect_state_impl(ctx_ptr: *mut c_void) -> i64 {
     if ctx_ptr.is_null() {
         return -1;
     }
@@ -18,28 +17,30 @@ pub extern "C" fn nrc_create_reconnect_state(ctx_ptr: *mut c_void) -> i64 {
     ptr
 }
 
-/// 添加重连目标
+/// 添加重连目标（重连状态机由 nrc_start_core 统一创建，内部从 ctx 获取）
 #[no_mangle]
 pub unsafe extern "C" fn nrc_reconnect_add_target(
     ctx_ptr: *mut c_void,
-    state_ptr: i64,
     uuid: *const c_char,
     ip: *const c_char,
 ) {
-    if ctx_ptr.is_null() || state_ptr == 0 {
+    if ctx_ptr.is_null() {
         return;
     }
     let u = unsafe { from_cstr(uuid) };
     let i = unsafe { from_cstr(ip) };
     // 忽略本机自身，避免自我重连
-    let is_self = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
-        .get_mut()
-        .unwrap()
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) }.get_mut().unwrap();
+    let is_self = ctx
         .broadcast_info
         .as_ref()
         .map(|b| b.uuid == u)
         .unwrap_or(false);
     if is_self {
+        return;
+    }
+    let state_ptr = ctx.reconnect_state;
+    if state_ptr == 0 {
         return;
     }
     let state = unsafe { &*(state_ptr as *const ReconnectState) };
@@ -50,20 +51,25 @@ pub unsafe extern "C" fn nrc_reconnect_add_target(
 #[no_mangle]
 pub unsafe extern "C" fn nrc_reconnect_remove_target(
     ctx_ptr: *mut c_void,
-    state_ptr: i64,
     uuid: *const c_char,
 ) {
-    if ctx_ptr.is_null() || state_ptr == 0 {
+    if ctx_ptr.is_null() {
         return;
     }
     let u = unsafe { from_cstr(uuid) };
+    let state_ptr = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+        .get_mut()
+        .unwrap()
+        .reconnect_state;
+    if state_ptr == 0 {
+        return;
+    }
     let state = unsafe { &*(state_ptr as *const ReconnectState) };
     state.remove_target(u);
 }
 
-/// 启动重连检测
-#[no_mangle]
-pub extern "C" fn nrc_reconnect_start(
+/// 启动重连检测（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn reconnect_start_impl(
     ctx_ptr: *mut c_void,
     state_ptr: i64,
     interval_secs: u64,

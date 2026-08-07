@@ -34,9 +34,8 @@ pub unsafe extern "C" fn nrc_remove_known_device(ctx_ptr: *mut c_void, uuid: *co
     });
 }
 
-/// 启动已知设备自动扫描（网络变化后调用）
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_known_device_scanner(ctx_ptr: *mut c_void) {
+/// 启动已知设备自动扫描（网络变化后调用；内部实现，供 nrc_start_core 调用）
+pub(crate) fn start_known_device_scanner_impl(ctx_ptr: *mut c_void) {
     with_ctx(ctx_ptr, |ctx| {
         ctx.discovery.start_known_device_scanner(ctx_ptr as usize);
     });

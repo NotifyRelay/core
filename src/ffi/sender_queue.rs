@@ -8,9 +8,8 @@ use super::common::from_cstr;
 /// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
 const SENT_DEDUP_TTL_MS: i64 = 3000;
 
-/// 创建发送队列
-#[no_mangle]
-pub extern "C" fn nrc_create_sender_queue(ctx_ptr: *mut c_void) -> i64 {
+/// 创建发送队列（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn create_sender_queue_impl(ctx_ptr: *mut c_void) -> i64 {
     if ctx_ptr.is_null() {
         return -1;
     }
@@ -23,9 +22,8 @@ pub extern "C" fn nrc_create_sender_queue(ctx_ptr: *mut c_void) -> i64 {
     ptr
 }
 
-/// 启动发送队列后台工作者
-#[no_mangle]
-pub extern "C" fn nrc_start_sender_queue(ctx_ptr: *mut c_void, queue_ptr: i64) {
+/// 启动发送队列后台工作者（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_ptr: i64) {
     if ctx_ptr.is_null() || queue_ptr == 0 {
         return;
     }

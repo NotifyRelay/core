@@ -7,12 +7,11 @@ use crate::SafeContext;
 
 use super::common::from_cstr;
 
-/// 启动离线检测
+/// 启动离线检测（内部实现，供 nrc_start_core 调用）
 /// timeout_sec: 超时秒数（默认 30）
 /// check_interval_ms: 检查间隔（默认 3000）
 /// 注意参数顺序与平台端声明一致：timeout_sec 在前，check_interval_ms 在后
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_offline_detector(
+pub(crate) unsafe fn start_offline_detector_impl(
     ctx_ptr: *mut c_void,
     timeout_sec: i64,
     check_interval_ms: u64,
@@ -35,11 +34,10 @@ pub unsafe extern "C" fn nrc_start_offline_detector(
     }
 }
 
-/// 启动统一心跳调度器
+/// 启动统一心跳调度器（内部实现，供 nrc_start_core 调用）
 /// 内部扫描 known_devices：为已配对设备自动启动/停止每设备心跳（AUTO 模式，复用现有回退逻辑）
 /// 本机身份参数（uuid/name/battery/device_type）写入 broadcast_info
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_heartbeat_scheduler(
+pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     name: *const c_char,
@@ -117,6 +115,6 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
             b.device_type = d;
         }
     }
-    // 本机电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
-    guard.mdns.update_battery(battery);
+    // 本机名称/电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
+    guard.mdns.update_name_battery(&n, battery);
 }

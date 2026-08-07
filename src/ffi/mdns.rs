@@ -2,8 +2,8 @@ use std::os::raw::{c_char, c_void};
 
 use super::common::from_cstr;
 
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_mdns_advertiser(
+/// 启动 mDNS 广告（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn start_mdns_advertiser_impl(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
     name: *const c_char,
@@ -48,8 +48,8 @@ pub unsafe extern "C" fn nrc_stop_mdns_advertiser(ctx_ptr: *mut c_void) -> i32 {
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn nrc_start_mdns_discovery(ctx_ptr: *mut c_void) -> i32 {
+/// 启动 mDNS 发现（内部实现，供 nrc_start_core 调用）
+pub(crate) unsafe fn start_mdns_discovery_impl(ctx_ptr: *mut c_void) -> i32 {
     if ctx_ptr.is_null() {
         return -1;
     }

@@ -9,9 +9,8 @@ use crate::SafeContext;
 
 use super::common::from_cstr;
 
-/// 启动 TCP 服务器
-#[no_mangle]
-pub extern "C" fn nrc_start_tcp_server(ctx_ptr: *mut c_void, port: u16) -> i32 {
+/// 启动 TCP 服务器（内部实现，供 nrc_start_core 调用）
+pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
     if ctx_ptr.is_null() {
         log::error!("启动 TCP 服务器: 空指针");
         return -1;
@@ -362,4 +361,92 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
         .unwrap()
         .discovery
         .start_known_device_scanner(ctx_ptr as usize);
+}
+
+/// 高层统一启动接口：一次完成 TCP/UDP、发送队列、心跳调度、离线检测、
+/// 已知设备扫描、重连状态机、mDNS 广告与发现的启动。
+/// 返回发送队列句柄（供入队使用），失败返回 -1。
+/// 注意：本机身份（uuid/name/battery/device_type）写入 broadcast_info；
+/// pubkey 用于 mDNS 广告 TXT。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_start_core(
+    ctx_ptr: *mut c_void,
+    uuid: *const c_char,
+    name: *const c_char,
+    battery: i32,
+    device_type: *const c_char,
+    tcp_port: u16,
+    pubkey: *const c_char,
+    heartbeat_interval_ms: u64,
+    offline_timeout_sec: i64,
+    offline_check_interval_ms: u64,
+    reconnect_interval_secs: u64,
+    reconnect_max_retries: u32,
+) -> i64 {
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+
+    // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
+    if start_tcp_server_impl(ctx_ptr, tcp_port) != 0 {
+        return -1;
+    }
+
+    // 心跳调度（写入 broadcast_info + 启动调度线程）
+    let hb = super::heartbeat::start_heartbeat_scheduler_impl(
+        ctx_ptr,
+        uuid,
+        name,
+        battery,
+        device_type,
+        heartbeat_interval_ms,
+    );
+    if hb < 0 {
+        log::warn!("nrc_start_core: 心跳调度器启动失败");
+    }
+
+    // 离线检测
+    super::heartbeat::start_offline_detector_impl(ctx_ptr, offline_timeout_sec, offline_check_interval_ms);
+
+    // 发送队列
+    let queue_ptr = super::sender_queue::create_sender_queue_impl(ctx_ptr);
+    if queue_ptr < 0 {
+        return -1;
+    }
+    super::sender_queue::start_sender_queue_impl(ctx_ptr, queue_ptr);
+
+    // 已知设备扫描
+    super::discovery::start_known_device_scanner_impl(ctx_ptr);
+
+    // 重连状态机
+    let reconnect_state = super::reconnect::create_reconnect_state_impl(ctx_ptr);
+    if reconnect_state < 0 {
+        log::warn!("nrc_start_core: 重连状态机创建失败");
+    } else {
+        super::reconnect::reconnect_start_impl(
+            ctx_ptr,
+            reconnect_state,
+            reconnect_interval_secs,
+            reconnect_max_retries,
+        );
+    }
+
+    // mDNS 广告 + 发现
+    if super::mdns::start_mdns_advertiser_impl(
+        ctx_ptr,
+        uuid,
+        name,
+        tcp_port,
+        pubkey,
+        device_type,
+        battery,
+    ) != 0
+    {
+        log::warn!("nrc_start_core: mDNS 广告启动失败");
+    }
+    if super::mdns::start_mdns_discovery_impl(ctx_ptr) != 0 {
+        log::warn!("nrc_start_core: mDNS 发现启动失败");
+    }
+
+    queue_ptr
 }

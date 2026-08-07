@@ -96,6 +96,49 @@ impl MdnsState {
         }
     }
 
+    /// 更新广告携带的名称与电量（未知值跳过；未变化跳过；否则重建广告使 TXT 生效）
+    pub fn update_name_battery(&mut self, name: &str, battery: i32) {
+        let Some(params) = self.advertise_params.as_ref() else {
+            return;
+        };
+        if name.is_empty() && battery.abs() > 100 {
+            return;
+        }
+        if params.battery == battery && params.name == name {
+            return;
+        }
+        let params = params.clone();
+        let new_name = if name.is_empty() {
+            params.name.clone()
+        } else {
+            name.to_string()
+        };
+        let new_battery = if battery.abs() > 100 {
+            params.battery
+        } else {
+            battery
+        };
+        if let Some(daemon) = self.daemon.take() {
+            drop(daemon);
+        }
+        match self.start_advertiser_inner(
+            &params.uuid,
+            &new_name,
+            params.port,
+            &params.pubkey,
+            &params.device_type,
+            new_battery,
+        ) {
+            Ok(_) => {
+                if let Some(p) = self.advertise_params.as_mut() {
+                    p.name = new_name;
+                    p.battery = new_battery;
+                }
+            }
+            Err(e) => log::error!("更新 mDNS 广告名称失败: {}", e),
+        }
+    }
+
     fn start_advertiser_inner(
         &mut self,
         uuid: &str,
