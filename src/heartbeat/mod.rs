@@ -208,8 +208,8 @@ impl HeartbeatHandle {
         Ok(Self { running, params })
     }
 
-    /// 更新心跳参数（电池、名称等）
-    pub fn update(&self, uuid: &str, name: &str, battery: i32, device_type: &str) {
+    /// 更新心跳参数（电池、名称、目标 IP 等）
+    pub fn update(&self, uuid: &str, name: &str, battery: i32, device_type: &str, ip: &str) {
         if !uuid.is_empty() {
             if let Ok(mut u) = self.params.uuid.lock() {
                 *u = uuid.to_string();
@@ -228,6 +228,12 @@ impl HeartbeatHandle {
         if !device_type.is_empty() {
             if let Ok(mut d) = self.params.device_type.lock() {
                 *d = device_type.to_string();
+            }
+        }
+        // 目标 IP 实时同步（known_devices 更新后心跳发往最新地址，避免发往过期 IP）
+        if !ip.is_empty() {
+            if let Ok(mut i) = self.params.ip.lock() {
+                *i = ip.to_string();
             }
         }
     }
@@ -391,9 +397,17 @@ impl HeartbeatScheduler {
                         }
                     }
 
-                    // 3. 本机参数变化 → 更新全部 handle（复用现有 update）
-                    for h in handles.values() {
-                        h.update(&local_uuid, &local_name, local_battery, &local_device_type);
+                    // 3. 本机参数变化 → 更新全部 handle（复用现有 update；目标 IP 同步 known_devices 最新值）
+                    for (uuid, ip) in &known_devices {
+                        if let Some(h) = handles.get(uuid) {
+                            h.update(
+                                &local_uuid,
+                                &local_name,
+                                local_battery,
+                                &local_device_type,
+                                ip,
+                            );
+                        }
                     }
 
                     // 4. 将 handle 表存回调度器共享状态
