@@ -358,14 +358,22 @@ fn pics_map(v: &Value) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// 计算 island 状态差异（title/text/param_v2_raw/pics），返回 changes 对象。
+/// 计算 island 状态差异（title/text/param_v2_raw/coverUrl/isPlaying/pics），返回 changes 对象。
 fn diff_island(old: &Value, new: &Value) -> Value {
     let mut changes = Map::new();
-    for k in ["title", "text", "param_v2_raw"] {
+    for k in ["title", "text", "param_v2_raw", "coverUrl"] {
         let o = field_str(old, k);
         let n = field_str(new, k);
         if o != n {
             changes.insert(k.to_string(), json!(n.unwrap_or_default()));
+        }
+    }
+    // isPlaying 为布尔字段，单独比较：仅暂停/播放切换时生成 delta，接收端可正确合并
+    let o_play = old.get("isPlaying").and_then(|x| x.as_bool());
+    let n_play = new.get("isPlaying").and_then(|x| x.as_bool());
+    if o_play != n_play {
+        if let Some(v) = new.get("isPlaying") {
+            changes.insert("isPlaying".to_string(), v.clone());
         }
     }
     let op = pics_map(old);
@@ -395,7 +403,7 @@ fn diff_island(old: &Value, new: &Value) -> Value {
 fn merge_island(base: &Value, changes: &Value) -> String {
     let mut merged = base.clone();
     if let Value::Object(ref mut m) = merged {
-        for k in ["title", "text", "param_v2_raw"] {
+        for k in ["title", "text", "param_v2_raw", "coverUrl"] {
             if let Some(v) = changes.get(k) {
                 if v.is_string() {
                     m.insert(k.to_string(), v.clone());
@@ -404,6 +412,16 @@ fn merge_island(base: &Value, changes: &Value) -> String {
                 } else {
                     m.insert(k.to_string(), v.clone());
                 }
+            }
+        }
+        // isPlaying 布尔字段合并（与 diff_island 对应）
+        if let Some(v) = changes.get("isPlaying") {
+            if v.is_boolean() {
+                m.insert("isPlaying".to_string(), v.clone());
+            } else if v.is_null() {
+                m.remove("isPlaying");
+            } else {
+                m.insert("isPlaying".to_string(), v.clone());
             }
         }
         if let Some(pics_new) = changes.get("pics").and_then(|x| x.as_object()) {
@@ -624,6 +642,37 @@ mod tests {
         let merged_v: Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(merged_v["title"], json!("b"));
         assert_eq!(merged_v["pics"]["k2"], json!("v2"));
+    }
+
+    #[test]
+    fn test_media_fields_diff_and_merge() {
+        // 仅切换 isPlaying：FULL 之后产生非空 delta，接收端合并后状态正确
+        let full_playing =
+            json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":true});
+        let full_paused =
+            json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":false});
+        let delta = diff_island(&full_playing, &full_paused);
+        assert_ne!(delta, json!({}));
+        assert_eq!(delta["isPlaying"], json!(false));
+        let merged = merge_island(&full_playing, &delta);
+        let merged_v: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(merged_v["isPlaying"], json!(false));
+        assert_eq!(merged_v["coverUrl"], json!("url1"));
+        // 无变化时 delta 为空
+        let no_change = diff_island(&full_paused, &full_paused);
+        assert_eq!(no_change, json!({}));
+
+        // 仅更换 coverUrl：delta 非空且合并后封面正确
+        let full_new_cover =
+            json!({"device":"self","title":"t","text":"a","coverUrl":"url2","isPlaying":false});
+        let delta2 = diff_island(&full_paused, &full_new_cover);
+        assert_ne!(delta2, json!({}));
+        assert_eq!(delta2["coverUrl"], json!("url2"));
+        assert!(delta2.get("isPlaying").is_none());
+        let merged2 = merge_island(&full_paused, &delta2);
+        let merged2_v: Value = serde_json::from_str(&merged2).unwrap();
+        assert_eq!(merged2_v["coverUrl"], json!("url2"));
+        assert_eq!(merged2_v["isPlaying"], json!(false));
     }
 
     #[test]
