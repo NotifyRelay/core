@@ -425,7 +425,7 @@ pub unsafe extern "C" fn nrc_start_core(
         device_type,
         heartbeat_interval_ms,
     );
-    if hb < 0 {
+    if hb == -1 {
         log::warn!("nrc_start_core: 心跳调度器启动失败");
     }
 
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn nrc_start_core(
 
     // 发送队列
     let queue_ptr = super::sender_queue::create_sender_queue_impl(ctx_ptr);
-    if queue_ptr < 0 {
+    if queue_ptr == -1 {
         return -1;
     }
     super::sender_queue::start_sender_queue_impl(ctx_ptr, queue_ptr);
@@ -444,7 +444,7 @@ pub unsafe extern "C" fn nrc_start_core(
 
     // 重连状态机
     let reconnect_state = super::reconnect::create_reconnect_state_impl(ctx_ptr);
-    if reconnect_state < 0 {
+    if reconnect_state == -1 {
         log::warn!("nrc_start_core: 重连状态机创建失败");
     } else {
         super::reconnect::reconnect_start_impl(
