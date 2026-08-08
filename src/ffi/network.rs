@@ -403,6 +403,12 @@ pub unsafe extern "C" fn nrc_start_core(
         return -1;
     }
 
+    log::info!(
+        "nrc_start_core 启动 (git: {}, version: {})",
+        env!("NOTIFY_RELAY_GIT_HASH"),
+        env!("CARGO_PKG_VERSION")
+    );
+
     // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
     if start_tcp_server_impl(ctx_ptr, tcp_port) != 0 {
         // TCP 绑定失败不阻塞其他组件：发送队列/心跳/mDNS 照常启动，
