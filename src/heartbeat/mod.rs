@@ -79,10 +79,8 @@ pub struct HeartbeatHandle {
     params: Arc<HeartbeatSenderParams>,
 }
 
-/// 心跳发送模式
-pub const HEARTBEAT_MODE_UDP: i32 = 0;
+/// 心跳发送模式（TCP 备用：定向发送到目标设备）
 pub const HEARTBEAT_MODE_TCP: i32 = 1;
-pub const HEARTBEAT_MODE_AUTO: i32 = 2;
 
 impl HeartbeatHandle {
     /// 启动心跳发送线程
@@ -94,7 +92,7 @@ impl HeartbeatHandle {
         device_type: &str,
         ip: &str,
         interval_ms: u64,
-        mode: i32,
+        _mode: i32,
     ) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
@@ -109,20 +107,11 @@ impl HeartbeatHandle {
 
         let r = running.clone();
         let p = params.clone();
-        let mode_actual = Arc::new(AtomicI32::new(mode));
-        let m = mode_actual.clone();
 
         thread::Builder::new()
             .name("heartbeat-sender".to_string())
             .spawn(move || {
-                let mut consecutive_failures = 0;
                 let mut next_interval_ms = interval_ms;
-                let mut current_mode = if mode == HEARTBEAT_MODE_AUTO {
-                    HEARTBEAT_MODE_TCP
-                } else {
-                    mode
-                };
-                let mut since_tcp_check = 0u32;
 
                 loop {
                     if !r.load(Ordering::Relaxed) {
@@ -146,66 +135,31 @@ impl HeartbeatHandle {
                     let port = codec::DEFAULT_TCP_PORT;
 
                     if uuid.is_empty() {
-                        thread::sleep(Duration::from_millis(interval_ms));
+                        thread::sleep(Duration::from_millis(next_interval_ms));
                         continue;
                     }
 
-                    let sent = if current_mode == HEARTBEAT_MODE_TCP {
-                        let msg = codec::encode_heartbeat_tcp(
-                            &uuid,
-                            &name_b64,
-                            port,
-                            battery,
-                            &device_type,
-                        );
-                        let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                        if !ip_str.is_empty() {
-                            network::oneshot_send_only(&msg, &ip_str, port, 3000)
-                        } else {
-                            false
-                        }
+                    // TCP 备用心跳：定向发送到目标设备（广播主用模式下本线程不会被启动）
+                    let msg = codec::encode_heartbeat_tcp(
+                        &uuid,
+                        &name_b64,
+                        port,
+                        battery,
+                        &device_type,
+                    );
+                    let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    let sent = if !ip_str.is_empty() {
+                        network::oneshot_send_only(&msg, &ip_str, port, 3000)
                     } else {
-                        let msg = codec::encode_udp_broadcast(
-                            &uuid,
-                            &name_b64,
-                            port,
-                            battery,
-                            &device_type,
-                        );
-                        network::send_udp_broadcast(&msg).is_ok()
+                        false
                     };
 
                     if sent {
-                        consecutive_failures = 0;
                         next_interval_ms = interval_ms;
                     } else {
-                        consecutive_failures += 1;
                         // 离线设备指数退避：2s → 4s → 8s → 16s → 32s → 60s 封顶，
                         // 对端恢复连接后下一次发送成功即恢复基础间隔
                         next_interval_ms = (next_interval_ms * 2).min(MAX_HEARTBEAT_INTERVAL_MS);
-                    }
-
-                    // Auto 模式逻辑
-                    let mode_now = m.load(Ordering::Relaxed);
-                    if mode_now == HEARTBEAT_MODE_AUTO {
-                        if current_mode == HEARTBEAT_MODE_TCP && consecutive_failures >= 3 {
-                            log::info!(
-                                "心跳 Auto 模式: TCP 连续失败 {} 次, 回退到 UDP",
-                                consecutive_failures
-                            );
-                            current_mode = HEARTBEAT_MODE_UDP;
-                            consecutive_failures = 0;
-                            since_tcp_check = 0;
-                        } else if current_mode == HEARTBEAT_MODE_UDP && sent {
-                            since_tcp_check += 1;
-                            if since_tcp_check >= 5 {
-                                since_tcp_check = 0;
-                                current_mode = HEARTBEAT_MODE_TCP;
-                                log::info!("心跳 Auto 模式: 尝试切回 TCP");
-                            }
-                        }
-                    } else {
-                        current_mode = mode_now;
                     }
 
                     thread::sleep(Duration::from_millis(next_interval_ms));
@@ -356,9 +310,22 @@ impl HeartbeatScheduler {
 
                     let known_devices = guard.discovery.get_known_devices();
                     let paired: Vec<String> = guard.crypto.device_keys.keys().cloned().collect();
+                    // 广播主用（默认）：UDP 广播 2s 兼发现+心跳，不启动每设备心跳；
+                    // TCP 备用（锁屏/WLAN直连）：为已配对设备启动每设备 TCP 定向心跳
+                    let tcp_backup = guard.heartbeat_tcp_backup.load(Ordering::Relaxed);
 
                     // 已配对设备的 handle 注册表（uuid -> HeartbeatHandle，跨轮次持久）
                     let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
+
+                    // 0. 广播主用模式：停止全部每设备心跳（广播已承担心跳职责）
+                    if !tcp_backup {
+                        for (_, h) in handles.drain() {
+                            h.stop();
+                        }
+                        guard.heartbeat_scheduler_handles = handles;
+                        thread::sleep(Duration::from_millis(interval_ms.min(2000)));
+                        continue;
+                    }
 
                     // 1. 移除已不在 known_devices 的 handle
                     let stale: Vec<String> = handles.keys().cloned().collect();
@@ -370,7 +337,7 @@ impl HeartbeatScheduler {
                         }
                     }
 
-                    // 2. 为已配对且无 handle 的已知设备启动心跳（AUTO 模式，复用现有回退逻辑）
+                    // 2. 为已配对且无 handle 的已知设备启动心跳（TCP 定向）
                     for (uuid, ip) in &known_devices {
                         if handles.contains_key(uuid) {
                             continue;
@@ -393,7 +360,7 @@ impl HeartbeatScheduler {
                             &local_device_type,
                             ip,
                             interval_ms,
-                            HEARTBEAT_MODE_AUTO,
+                            HEARTBEAT_MODE_TCP,
                         ) {
                             Ok(h) => {
                                 log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);

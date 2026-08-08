@@ -118,3 +118,35 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
     // 本机名称/电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
     guard.mdns.update_name_battery(&n, battery);
 }
+
+/// 切换心跳模式（广播主用 / TCP 备用）
+/// enabled=1：TCP 备用（锁屏/WLAN直连），为已配对设备启动每设备 TCP 定向心跳；
+/// enabled=0：广播主用（默认），UDP 广播兼发现+心跳，停止每设备心跳
+#[no_mangle]
+pub unsafe extern "C" fn nrc_set_heartbeat_tcp_backup(
+    ctx_ptr: *mut c_void,
+    enabled: i32,
+) -> i32 {
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+    let ctx = &mut *(ctx_ptr as *mut SafeContext);
+    if let Ok(guard) = ctx.get_mut() {
+        let new_state = enabled != 0;
+        if guard.heartbeat_tcp_backup.swap(new_state, std::sync::atomic::Ordering::Relaxed)
+            != new_state
+        {
+            log::info!(
+                "心跳模式切换: {}",
+                if new_state {
+                    "TCP 备用（每设备定向心跳）"
+                } else {
+                    "广播主用（UDP 广播兼发现+心跳）"
+                }
+            );
+        }
+        0
+    } else {
+        -1
+    }
+}

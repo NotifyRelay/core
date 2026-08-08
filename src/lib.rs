@@ -57,10 +57,13 @@ pub struct CoreContext {
     /// UUID → IP 映射（从 UDP 心跳源地址、TCP 连接等收集）
     pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
-    /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳，AUTO 模式）
+    /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳）
     pub heartbeat_scheduler: i64,
     /// 调度器持有的每设备 HeartbeatHandle（跨轮次持久，由调度线程维护）
     pub heartbeat_scheduler_handles: HashMap<String, heartbeat::HeartbeatHandle>,
+    /// 心跳模式：false=广播主用（UDP 广播兼发现+心跳，不启动每设备心跳）；
+    /// true=TCP 备用（锁屏/WLAN直连 时每设备 TCP 定向心跳）
+    pub heartbeat_tcp_backup: AtomicBool,
     pub offline_detector_handle: i64,
     pub sender_queue: i64,
     pub reconnect_state: i64,
@@ -113,6 +116,7 @@ impl CoreContext {
             broadcast_handle: None,
             heartbeat_scheduler: 0,
             heartbeat_scheduler_handles: HashMap::new(),
+            heartbeat_tcp_backup: AtomicBool::new(false),
             offline_detector_handle: 0,
             sender_queue: 0,
             reconnect_state: 0,
