@@ -480,9 +480,10 @@ pub fn start_udp_listener(
                     }
                 }
                 Err(e) => {
-                    // 超时是正常的，继续循环
+                    // 超时和 EINTR(锁屏等信号中断)是正常的，继续循环
                     if e.kind() != std::io::ErrorKind::WouldBlock
                         && e.kind() != std::io::ErrorKind::TimedOut
+                        && e.kind() != std::io::ErrorKind::Interrupted
                     {
                         log::debug!("UDP 接收错误: {}", e);
                         if let Some(ref cb) = on_error {
