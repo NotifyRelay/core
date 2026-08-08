@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 
@@ -88,20 +89,35 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
         }) as Arc<dyn Fn(String) + Send + Sync>
     });
 
-    match crate::network::start_tcp_server(
-        network_state.clone(),
-        port,
-        local_uuid,
-        on_connected_cb,
-        on_disconnected_cb,
-        on_message_cb,
-        on_error_cb,
-    ) {
+    // TCP 绑定失败时自动重试（覆盖旧进程退出导致端口延迟释放等场景），间隔递增
+    let mut attempts = 0;
+    let tcp_result = loop {
+        match crate::network::start_tcp_server(
+            network_state.clone(),
+            port,
+            local_uuid.clone(),
+            on_connected_cb.clone(),
+            on_disconnected_cb.clone(),
+            on_message_cb.clone(),
+            on_error_cb.clone(),
+        ) {
+            Ok(_) => break Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 5 {
+                    break Err(e);
+                }
+                log::warn!("启动 TCP 服务器失败（第 {}/5 次）: {}", attempts, e);
+                std::thread::sleep(Duration::from_secs(attempts as u64));
+            }
+        }
+    };
+    match tcp_result {
         Ok(_) => {
             log::info!("TCP 服务器已启动，端口: {}", port);
         }
         Err(e) => {
-            log::error!("启动 TCP 服务器失败: {}", e);
+            log::error!("启动 TCP 服务器失败（已重试 5 次）: {}", e);
             return -1;
         }
     }
@@ -389,7 +405,9 @@ pub unsafe extern "C" fn nrc_start_core(
 
     // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
     if start_tcp_server_impl(ctx_ptr, tcp_port) != 0 {
-        return -1;
+        // TCP 绑定失败不阻塞其他组件：发送队列/心跳/mDNS 照常启动，
+        // 出站发送由发送队列 worker 独立负责，网络恢复后重连状态机会补建连接
+        log::warn!("nrc_start_core: TCP 服务器启动失败，继续启动其他组件");
     }
 
     // 心跳调度（写入 broadcast_info + 启动调度线程）
