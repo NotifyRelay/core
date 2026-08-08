@@ -6,15 +6,16 @@ use crate::SafeContext;
 use super::common::from_cstr;
 
 /// 创建重连状态机（内部实现，供 nrc_start_core 调用）
-pub(crate) unsafe fn create_reconnect_state_impl(ctx_ptr: *mut c_void) -> i64 {
+/// 返回句柄（正整数，0 表示失败）
+pub(crate) unsafe fn create_reconnect_state_impl(ctx_ptr: *mut c_void) -> u64 {
     if ctx_ptr.is_null() {
-        return -1;
+        return 0;
     }
     let state = Box::new(ReconnectState::new());
-    let ptr = Box::into_raw(state) as i64;
+    let handle = super::handle::put(Box::into_raw(state) as *mut c_void);
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    ctx.get_mut().unwrap().reconnect_state = ptr;
-    ptr
+    ctx.get_mut().unwrap().reconnect_state = handle;
+    handle
 }
 
 /// 添加重连目标（重连状态机由 nrc_start_core 统一创建，内部从 ctx 获取）
@@ -39,11 +40,11 @@ pub unsafe extern "C" fn nrc_reconnect_add_target(
     if is_self {
         return;
     }
-    let state_ptr = ctx.reconnect_state;
-    if state_ptr == 0 {
+    let state_handle = ctx.reconnect_state;
+    if state_handle == 0 {
         return;
     }
-    let state = unsafe { &*(state_ptr as *const ReconnectState) };
+    let state = unsafe { &*(super::handle::get(state_handle) as *const ReconnectState) };
     state.add_target(u, i);
 }
 
@@ -57,28 +58,28 @@ pub unsafe extern "C" fn nrc_reconnect_remove_target(
         return;
     }
     let u = unsafe { from_cstr(uuid) };
-    let state_ptr = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+    let state_handle = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
         .get_mut()
         .unwrap()
         .reconnect_state;
-    if state_ptr == 0 {
+    if state_handle == 0 {
         return;
     }
-    let state = unsafe { &*(state_ptr as *const ReconnectState) };
+    let state = unsafe { &*(super::handle::get(state_handle) as *const ReconnectState) };
     state.remove_target(u);
 }
 
 /// 启动重连检测（内部实现，供 nrc_start_core 调用）
 pub(crate) unsafe fn reconnect_start_impl(
     ctx_ptr: *mut c_void,
-    state_ptr: i64,
+    state_handle: u64,
     interval_secs: u64,
     max_retries: u32,
 ) {
-    if ctx_ptr.is_null() || state_ptr == 0 {
+    if ctx_ptr.is_null() || state_handle == 0 {
         return;
     }
-    let state = unsafe { &*(state_ptr as *const ReconnectState) };
+    let state = unsafe { &*(super::handle::get(state_handle) as *const ReconnectState) };
     state.configure(interval_secs, max_retries);
     state.start(ctx_ptr as usize);
 }

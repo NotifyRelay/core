@@ -11,13 +11,14 @@ use super::common::from_cstr;
 /// timeout_sec: 超时秒数（默认 30）
 /// check_interval_ms: 检查间隔（默认 3000）
 /// 注意参数顺序与平台端声明一致：timeout_sec 在前，check_interval_ms 在后
+/// 返回句柄（正整数，0 表示失败）
 pub(crate) unsafe fn start_offline_detector_impl(
     ctx_ptr: *mut c_void,
     timeout_sec: i64,
     check_interval_ms: u64,
-) -> i64 {
+) -> u64 {
     if ctx_ptr.is_null() {
-        return -1;
+        return 0;
     }
     match heartbeat::start_offline_detector(ctx_ptr as usize, check_interval_ms, timeout_sec) {
         Ok(running) => {
@@ -25,18 +26,19 @@ pub(crate) unsafe fn start_offline_detector_impl(
             {
                 let guard = ctx.get_mut().unwrap();
                 let boxed = Box::new(running);
-                let ptr = Box::into_raw(boxed) as i64;
-                guard.offline_detector_handle = ptr;
-                ptr
+                let handle = super::handle::put(Box::into_raw(boxed) as *mut c_void);
+                guard.offline_detector_handle = handle;
+                handle
             }
         }
-        Err(_) => -1,
+        Err(_) => 0,
     }
 }
 
 /// 启动统一心跳调度器（内部实现，供 nrc_start_core 调用）
 /// 内部扫描 known_devices：为已配对设备自动启动/停止每设备心跳（AUTO 模式，复用现有回退逻辑）
 /// 本机身份参数（uuid/name/battery/device_type）写入 broadcast_info
+/// 返回句柄（正整数，0 表示失败）
 pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
@@ -44,9 +46,9 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     battery: i32,
     device_type: *const c_char,
     interval_ms: u64,
-) -> i64 {
+) -> u64 {
     if ctx_ptr.is_null() {
-        return -1;
+        return 0;
     }
     let u = from_cstr(uuid).to_string();
     let n = from_cstr(name).to_string();
@@ -57,8 +59,8 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     let guard = ctx.get_mut().unwrap();
     // 重复启动时先停止旧调度器
     if guard.heartbeat_scheduler != 0 {
-        let boxed =
-            Box::from_raw(guard.heartbeat_scheduler as *mut crate::heartbeat::HeartbeatScheduler);
+        let boxed = Box::from_raw(super::handle::get(guard.heartbeat_scheduler)
+            as *mut crate::heartbeat::HeartbeatScheduler);
         boxed.stop();
         guard.heartbeat_scheduler = 0;
         for (_, h) in guard.heartbeat_scheduler_handles.drain() {
@@ -78,13 +80,13 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     match crate::heartbeat::HeartbeatScheduler::start(ctx_ptr as usize, interval_ms) {
         Ok(scheduler) => {
             let boxed = Box::new(scheduler);
-            let ptr = Box::into_raw(boxed) as i64;
-            guard.heartbeat_scheduler = ptr;
-            ptr
+            let handle = super::handle::put(Box::into_raw(boxed) as *mut c_void);
+            guard.heartbeat_scheduler = handle;
+            handle
         }
         Err(e) => {
             log::error!("启动心跳调度器失败: {}", e);
-            -1
+            0
         }
     }
 }

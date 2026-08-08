@@ -294,7 +294,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                         if let Ok(g) = ctx.get_mut() {
                                             if g.sender_queue != 0 {
                                                 let q = unsafe {
-                                                    &*(g.sender_queue
+                                                    &*(crate::ffi::handle::get(g.sender_queue)
                                                         as *const crate::sender_queue::SenderQueue)
                                                 };
                                                 let now = std::time::SystemTime::now()

@@ -516,7 +516,7 @@ pub fn handle_state_message(
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
             let g = ctx.get_mut().unwrap();
             if g.sender_queue != 0 {
-                let q = unsafe { &*(g.sender_queue as *mut SenderQueue) };
+                let q = unsafe { &*(crate::ffi::handle::get(g.sender_queue) as *mut SenderQueue) };
                 let ack = json!({
                     "type": "SI_ACK",
                     "device": uuid,

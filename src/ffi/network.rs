@@ -381,7 +381,7 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
 
 /// 高层统一启动接口：一次完成 TCP/UDP、发送队列、心跳调度、离线检测、
 /// 已知设备扫描、重连状态机、mDNS 广告与发现的启动。
-/// 返回发送队列句柄（供入队使用），失败返回 -1。
+/// 返回发送队列句柄（正整数，供入队使用），失败返回 0。
 /// 注意：本机身份（uuid/name/battery/device_type）写入 broadcast_info；
 /// pubkey 用于 mDNS 广告 TXT。
 #[no_mangle]
@@ -398,9 +398,9 @@ pub unsafe extern "C" fn nrc_start_core(
     offline_check_interval_ms: u64,
     reconnect_interval_secs: u64,
     reconnect_max_retries: u32,
-) -> i64 {
+) -> u64 {
     if ctx_ptr.is_null() {
-        return -1;
+        return 0;
     }
 
     log::info!(
@@ -425,7 +425,7 @@ pub unsafe extern "C" fn nrc_start_core(
         device_type,
         heartbeat_interval_ms,
     );
-    if hb == -1 {
+    if hb == 0 {
         log::warn!("nrc_start_core: 心跳调度器启动失败");
     }
 
@@ -433,18 +433,18 @@ pub unsafe extern "C" fn nrc_start_core(
     super::heartbeat::start_offline_detector_impl(ctx_ptr, offline_timeout_sec, offline_check_interval_ms);
 
     // 发送队列
-    let queue_ptr = super::sender_queue::create_sender_queue_impl(ctx_ptr);
-    if queue_ptr == -1 {
-        return -1;
+    let queue_handle = super::sender_queue::create_sender_queue_impl(ctx_ptr);
+    if queue_handle == 0 {
+        return 0;
     }
-    super::sender_queue::start_sender_queue_impl(ctx_ptr, queue_ptr);
+    super::sender_queue::start_sender_queue_impl(ctx_ptr, queue_handle);
 
     // 已知设备扫描
     super::discovery::start_known_device_scanner_impl(ctx_ptr);
 
     // 重连状态机
     let reconnect_state = super::reconnect::create_reconnect_state_impl(ctx_ptr);
-    if reconnect_state == -1 {
+    if reconnect_state == 0 {
         log::warn!("nrc_start_core: 重连状态机创建失败");
     } else {
         super::reconnect::reconnect_start_impl(
@@ -472,5 +472,5 @@ pub unsafe extern "C" fn nrc_start_core(
         log::warn!("nrc_start_core: mDNS 发现启动失败");
     }
 
-    queue_ptr
+    queue_handle
 }

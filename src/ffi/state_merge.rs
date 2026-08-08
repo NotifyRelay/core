@@ -16,7 +16,7 @@ use crate::SafeContext;
 #[no_mangle]
 pub extern "C" fn nrc_push_superisland_state(
     ctx_ptr: *mut c_void,
-    queue_ptr: *mut c_void,
+    queue_handle: u64,
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
@@ -24,7 +24,7 @@ pub extern "C" fn nrc_push_superisland_state(
 ) -> i32 {
     push_state_impl(
         ctx_ptr,
-        queue_ptr,
+        queue_handle,
         device_uuid,
         full_json,
         is_end,
@@ -36,7 +36,7 @@ pub extern "C" fn nrc_push_superisland_state(
 #[no_mangle]
 pub extern "C" fn nrc_push_media_state(
     ctx_ptr: *mut c_void,
-    queue_ptr: *mut c_void,
+    queue_handle: u64,
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
@@ -44,7 +44,7 @@ pub extern "C" fn nrc_push_media_state(
 ) -> i32 {
     push_state_impl(
         ctx_ptr,
-        queue_ptr,
+        queue_handle,
         device_uuid,
         full_json,
         is_end,
@@ -55,19 +55,19 @@ pub extern "C" fn nrc_push_media_state(
 
 fn push_state_impl(
     ctx_ptr: *mut c_void,
-    queue_ptr: *mut c_void,
+    queue_handle: u64,
     device_uuid: *const c_char,
     full_json: *const c_char,
     is_end: i32,
     is_query: i32,
     is_media: bool,
 ) -> i32 {
-    if ctx_ptr.is_null() || queue_ptr.is_null() || device_uuid.is_null() || full_json.is_null() {
+    if ctx_ptr.is_null() || queue_handle == 0 || device_uuid.is_null() || full_json.is_null() {
         return -1;
     }
     let uuid = unsafe { from_cstr(device_uuid) };
     let full = unsafe { from_cstr(full_json) };
-    let queue = unsafe { &*(queue_ptr as *mut SenderQueue) };
+    let queue = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
     let mut guard = match unsafe { &*(ctx_ptr as *mut SafeContext) }.lock() {
         Ok(g) => g,
         Err(_) => return -1,

@@ -7,6 +7,7 @@ pub mod device_state;
 pub mod discovery;
 pub mod ecdh;
 pub mod filter;
+pub mod handle;
 pub mod heartbeat;
 pub mod key_management;
 pub mod lifecycle;

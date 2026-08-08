@@ -9,25 +9,26 @@ use super::common::from_cstr;
 const SENT_DEDUP_TTL_MS: i64 = 3000;
 
 /// 创建发送队列（内部实现，供 nrc_start_core 调用）
-pub(crate) unsafe fn create_sender_queue_impl(ctx_ptr: *mut c_void) -> i64 {
+/// 返回句柄（正整数，0 表示失败）
+pub(crate) unsafe fn create_sender_queue_impl(ctx_ptr: *mut c_void) -> u64 {
     if ctx_ptr.is_null() {
-        return -1;
+        return 0;
     }
     let queue = Box::new(SenderQueue::new());
-    let ptr = Box::into_raw(queue) as i64;
+    let handle = super::handle::put(Box::into_raw(queue) as *mut c_void);
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    ctx.get_mut().unwrap().sender_queue = ptr;
+    ctx.get_mut().unwrap().sender_queue = handle;
 
-    ptr
+    handle
 }
 
 /// 启动发送队列后台工作者（内部实现，供 nrc_start_core 调用）
-pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_ptr: i64) {
-    if ctx_ptr.is_null() || queue_ptr == 0 {
+pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_handle: u64) {
+    if ctx_ptr.is_null() || queue_handle == 0 {
         return;
     }
-    let queue = unsafe { &*(queue_ptr as *const SenderQueue) };
+    let queue = unsafe { &*(super::handle::get(queue_handle) as *const SenderQueue) };
     queue.start_worker(ctx_ptr as usize);
 }
 
@@ -35,16 +36,16 @@ pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_ptr: i6
 #[no_mangle]
 pub unsafe extern "C" fn nrc_enqueue_message(
     ctx_ptr: *mut c_void,
-    queue_ptr: i64,
+    queue_handle: u64,
     device_uuid: *const c_char,
     header: *const c_char,
     plaintext: *const c_char,
     dedup_key: *const c_char,
 ) {
-    if ctx_ptr.is_null() || queue_ptr == 0 {
+    if ctx_ptr.is_null() || queue_handle == 0 {
         return;
     }
-    let queue = unsafe { &*(queue_ptr as *const SenderQueue) };
+    let queue = unsafe { &*(super::handle::get(queue_handle) as *const SenderQueue) };
     let uuid = unsafe { from_cstr(device_uuid) };
     let hdr = unsafe { from_cstr(header) };
     let text = unsafe { from_cstr(plaintext) };

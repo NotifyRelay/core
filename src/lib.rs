@@ -58,15 +58,15 @@ pub struct CoreContext {
     pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
     /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳）
-    pub heartbeat_scheduler: i64,
+    pub heartbeat_scheduler: u64,
     /// 调度器持有的每设备 HeartbeatHandle（跨轮次持久，由调度线程维护）
     pub heartbeat_scheduler_handles: HashMap<String, heartbeat::HeartbeatHandle>,
     /// 心跳模式：false=广播主用（UDP 广播兼发现+心跳，不启动每设备心跳）；
     /// true=TCP 备用（锁屏/WLAN直连 时每设备 TCP 定向心跳）
     pub heartbeat_tcp_backup: AtomicBool,
-    pub offline_detector_handle: i64,
-    pub sender_queue: i64,
-    pub reconnect_state: i64,
+    pub offline_detector_handle: u64,
+    pub sender_queue: u64,
+    pub reconnect_state: u64,
     /// 超级岛 / 媒体 状态合并引擎（diff/merge/ACK/心跳全部在此闭环）
     pub state_merge: state_merge::StateMerge,
     /// 配对成功后延迟应用列表请求互斥标志（防止多次配对时线程堆叠）

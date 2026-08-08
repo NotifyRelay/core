@@ -19,14 +19,14 @@ use super::common::{from_cstr, to_cstr};
 #[no_mangle]
 pub unsafe extern "C" fn nrc_clipboard_on_changed(
     ctx_ptr: *mut c_void,
-    queue_ptr: i64,
+    queue_handle: u64,
     targets_json: *const c_char,
     mime: *const c_char,
     content: *const c_char,
     now_ms: i64,
     force: i32,
 ) -> *mut c_char {
-    if ctx_ptr.is_null() || queue_ptr == 0 {
+    if ctx_ptr.is_null() || queue_handle == 0 {
         return to_cstr(r#"{"action":"skipped","reason":"invalid ctx or queue"}"#);
     }
     let targets = from_cstr(targets_json);
@@ -46,7 +46,7 @@ pub unsafe extern "C" fn nrc_clipboard_on_changed(
         Ok(g) => g,
         Err(_) => return to_cstr(r#"{"action":"skipped","reason":"lock failed"}"#),
     };
-    let queue = unsafe { &*(queue_ptr as *const SenderQueue) };
+    let queue = unsafe { &*(super::handle::get(queue_handle) as *const SenderQueue) };
     let result = crate::clipboard::on_changed(
         &mut guard.clipboard,
         queue,
@@ -105,13 +105,13 @@ mod tests {
         let ctx = crate::SafeContext::new(crate::CoreContext::new());
         let ctx_ptr = &ctx as *const crate::SafeContext as *mut std::os::raw::c_void;
         let queue = crate::sender_queue::SenderQueue::new();
-        let queue_ptr = &queue as *const _ as i64;
+        let queue_handle = crate::ffi::handle::put(&queue as *const _ as *mut std::os::raw::c_void);
 
         let targets = to_cstr_test("[]");
         let mime = to_cstr_test("text/plain");
         let content = to_cstr_test("hello");
         let result = unsafe {
-            nrc_clipboard_on_changed(ctx_ptr, queue_ptr, targets, mime, content, 1000, 0)
+            nrc_clipboard_on_changed(ctx_ptr, queue_handle, targets, mime, content, 1000, 0)
         };
         let s = unsafe { from_cstr(result).to_string() };
         assert!(s.contains("no targets"));
