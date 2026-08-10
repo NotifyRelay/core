@@ -53,8 +53,11 @@ fn test_free_string_non_null() {
 fn test_get_local_ip_returns_string() {
     let ip = ffi::utils::nrc_get_local_ip();
     let s = unsafe { read_cstr(ip) };
-    // 返回 IP 字符串或空（无网络环境），语义上必须是合法字符串
-    assert!(s.is_empty() || s.contains('.') || s.contains(':'));
+    // 真实设备上应返回可解析的局域网 IP；无网络环境允许空
+    if !s.is_empty() {
+        let is_valid = s.parse::<std::net::IpAddr>().is_ok();
+        assert!(is_valid, "应返回合法 IP 地址，实际: {}", s);
+    }
     unsafe {
         drop(CString::from_raw(ip));
     }
