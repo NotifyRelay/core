@@ -20,7 +20,9 @@ use crate::sender_queue::{SendItem, SenderQueue};
 use crate::SafeContext;
 
 const SI_ACK_TIMEOUT_MS: u64 = 4000;
-const SI_HEARTBEAT_MS: u64 = 30_000;
+// 假周期保活间隔：必须小于接收端卡片/岛超时周期（PC 普通岛 12s、Gamebar 10s），
+// 否则数据不变时远端卡片先被移除导致"突然消失"
+const SI_HEARTBEAT_MS: u64 = 8_000;
 const MEDIA_HEARTBEAT_MS: u64 = 6_000;
 const MEDIA_KEY: &str = "media_global";
 
@@ -275,9 +277,13 @@ impl StateMerge {
 
     /// 处理查询回调结果（锁内）：
     /// - 0 = 平台上不存在 → 仅移除会话，不发任何包（接收端靠超时自然消失）
-    /// - 1 = 存在无变更 → 保活（重置 last_push，延长查询间隔）
+    /// - 1 = 存在无变更 → 发送空差量保活包（接收端刷新时间戳，防止卡片/岛超时消失）
     /// - 2 = 存在有变更 → 平台已/将调用 push(is_query=1)，引擎无需动作
-    pub fn apply_query_results(&mut self, results: Vec<(String, String, i32)>) {
+    pub fn apply_query_results(
+        &mut self,
+        queue: &SenderQueue,
+        results: Vec<(String, String, i32)>,
+    ) {
         for (device_uuid, feature_id, code) in results {
             let key = Self::key(&device_uuid, &feature_id);
             match code {
@@ -291,6 +297,25 @@ impl StateMerge {
                 }
                 1 => {
                     if let Some(s) = self.senders.get_mut(&key) {
+                        // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
+                        // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
+                        // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
+                        let keepalive = build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
+                        let header = if s.is_media {
+                            "DATA_MEDIAPLAY"
+                        } else {
+                            "DATA_SUPERISLAND"
+                        };
+                        queue.enqueue(SendItem {
+                            device_uuid: s.device_uuid.clone(),
+                            header: header.to_string(),
+                            plaintext: keepalive,
+                            dedup_key: None,
+                            retries_left: 0,
+                            coalesce_key: None,
+                        });
+                        // 保活周期基于上次真实发送：入队成功才重置，
+                        // 事件推送同样会重置，避免固定周期导致的快速触发
                         s.last_push = Instant::now();
                     }
                 }
@@ -573,7 +598,11 @@ pub fn start_heartbeat_thread(ctx_ptr: usize) {
             results.push((device_uuid, feature_id, code));
         }
         if let Ok(mut guard) = ctx.lock() {
-            guard.state_merge.apply_query_results(results);
+            if guard.sender_queue != 0 {
+                let q =
+                    unsafe { &*(crate::ffi::handle::get(guard.sender_queue) as *mut SenderQueue) };
+                guard.state_merge.apply_query_results(q, results);
+            }
         }
     });
 }
@@ -689,21 +718,51 @@ mod tests {
         assert_eq!(queries[0].0, "devA");
         assert!(!queries[0].1.is_empty());
         // 查询不存在 → 仅移除会话，不再查询（不发任何包）
-        sm.apply_query_results(vec![(queries[0].0.clone(), queries[0].1.clone(), 0)]);
+        sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 0)]);
         assert!(sm.heartbeat_tick(later + Duration::from_secs(1)).is_empty());
         // 会话移除后再次推送会重新创建
         assert!(sm.push_state(&q, "devA", false, &si_full("t2", "c2"), false, false));
         let queries2 = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries2.len(), 1);
-        // 存在无变更 → 保活，间隔内不再查询
-        sm.apply_query_results(vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
+        // 存在无变更 → 保活（发送空差量包并重置 last_push），间隔内不再查询
+        sm.apply_query_results(&q, vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
         assert!(sm
-            .heartbeat_tick(Instant::now() + Duration::from_secs(29))
+            .heartbeat_tick(Instant::now() + Duration::from_secs(7))
             .is_empty());
         // 存在有变更（2）→ 引擎等待平台随后的 push，不主动动作
         let queries3 = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries3.len(), 1);
-        sm.apply_query_results(vec![(queries3[0].0.clone(), queries3[0].1.clone(), 2)]);
+        sm.apply_query_results(&q, vec![(queries3[0].0.clone(), queries3[0].1.clone(), 2)]);
+    }
+
+    #[test]
+    fn test_query_keepalive_sends_empty_delta() {
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        q.test_drain_plaintexts();
+        // 存在无变更 → 空差量保活包入队（接收端据此刷新时间戳，防"突然消失"）
+        let queries = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
+        assert_eq!(queries.len(), 1);
+        sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 1)]);
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("\"type\":\"delta\""));
+        assert!(items[0].contains("\"changes\":{}"));
+        // 保活基于上次真实发送：重置后间隔内不再查询（无快速触发）
+        assert!(sm
+            .heartbeat_tick(Instant::now() + Duration::from_secs(7))
+            .is_empty());
+        // 媒体会话同样走保活（媒体 6s 间隔）
+        let mut sm2 = StateMerge::new();
+        assert!(sm2.push_state(&q, "devA", true, &si_full("t1", "c1"), false, false));
+        q.test_drain_plaintexts();
+        let queries2 = sm2.heartbeat_tick(Instant::now() + Duration::from_secs(7));
+        assert_eq!(queries2.len(), 1);
+        sm2.apply_query_results(&q, vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
+        let items2 = q.test_drain_plaintexts();
+        assert_eq!(items2.len(), 1);
+        assert!(items2[0].contains("\"changes\":{}"));
     }
 
     #[test]
