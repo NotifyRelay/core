@@ -24,6 +24,21 @@ cargo clippy || exit 1
 echo "[githook] == cargo test --lib =="
 cargo test --lib || exit 1
 
+# tests/ 目录的 FFI 语义测试（排除依赖真实网络的 audio 集成测试），自动发现新增测试文件
+TEST_ARGS=""
+for t in tests/*.rs; do
+    [ -f "$t" ] || continue
+    name=$(basename "$t" .rs)
+    if [ "$name" != "audio" ]; then
+        TEST_ARGS="$TEST_ARGS --test $name"
+    fi
+done
+if [ -n "$TEST_ARGS" ]; then
+    echo "[githook] == cargo test$TEST_ARGS =="
+    # shellcheck disable=SC2086
+    cargo test $TEST_ARGS || exit 1
+fi
+
 echo "[githook] == cargo build --release =="
 cargo build --release || exit 1
 
