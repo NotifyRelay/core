@@ -31,7 +31,9 @@ pub unsafe extern "C" fn nrc_reconnect_add_target(
     let u = unsafe { from_cstr(uuid) };
     let i = unsafe { from_cstr(ip) };
     // 忽略本机自身，避免自我重连
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) }.get_mut().unwrap();
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) }
+        .get_mut()
+        .unwrap();
     let is_self = ctx
         .broadcast_info
         .as_ref()
@@ -50,10 +52,7 @@ pub unsafe extern "C" fn nrc_reconnect_add_target(
 
 /// 移除重连目标
 #[no_mangle]
-pub unsafe extern "C" fn nrc_reconnect_remove_target(
-    ctx_ptr: *mut c_void,
-    uuid: *const c_char,
-) {
+pub unsafe extern "C" fn nrc_reconnect_remove_target(ctx_ptr: *mut c_void, uuid: *const c_char) {
     if ctx_ptr.is_null() {
         return;
     }

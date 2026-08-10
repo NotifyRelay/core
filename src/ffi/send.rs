@@ -582,11 +582,7 @@ pub unsafe extern "C" fn nrc_connect_device(
             Some(line) => {
                 let header = crate::protocol::header::ProtocolHeader::parse(&line);
                 if header == crate::protocol::header::ProtocolHeader::Accept {
-                    log::info!(
-                        "连接设备: 握手成功 uuid={}, 第 {} 次尝试",
-                        tu,
-                        attempt + 1
-                    );
+                    log::info!("连接设备: 握手成功 uuid={}, 第 {} 次尝试", tu, attempt + 1);
                     super::processing::process_line(ctx, &line);
                     return 0;
                 }
@@ -595,11 +591,7 @@ pub unsafe extern "C" fn nrc_connect_device(
                     super::processing::process_line(ctx, &line);
                     return -1;
                 }
-                log::warn!(
-                    "连接设备: 收到非预期响应({}) uuid={}, 重试",
-                    header,
-                    tu
-                );
+                log::warn!("连接设备: 收到非预期响应({}) uuid={}, 重试", header, tu);
                 super::processing::process_line(ctx, &line);
             }
             None => {

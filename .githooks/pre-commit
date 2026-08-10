@@ -1,0 +1,31 @@
+#!/bin/sh
+# notify-relay-core 提交前检查：fmt/clippy/单测/编译（对应 submodule-modifier 流程中的代码质量检查）
+# 可用 NR_SKIP_CHECKS=1 或 git commit --no-verify 跳过（仅限紧急情况）
+
+if [ "${NR_SKIP_CHECKS:-0}" = "1" ]; then
+    echo "[githook] NR_SKIP_CHECKS=1，跳过 pre-commit 检查"
+    exit 0
+fi
+
+command -v cargo >/dev/null 2>&1 || {
+    echo "[githook] 错误: 未找到 cargo，无法执行提交前检查"
+    exit 1
+}
+
+echo "[githook] == cargo fmt --check =="
+cargo fmt --check || {
+    echo "[githook] 格式检查失败，请先运行 cargo fmt"
+    exit 1
+}
+
+echo "[githook] == cargo clippy =="
+cargo clippy || exit 1
+
+echo "[githook] == cargo test --lib =="
+cargo test --lib || exit 1
+
+echo "[githook] == cargo build --release =="
+cargo build --release || exit 1
+
+echo "[githook] 全部检查通过"
+exit 0

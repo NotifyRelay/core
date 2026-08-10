@@ -125,17 +125,16 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
 /// enabled=1：TCP 备用（锁屏/WLAN直连），为已配对设备启动每设备 TCP 定向心跳；
 /// enabled=0：广播主用（默认），UDP 广播兼发现+心跳，停止每设备心跳
 #[no_mangle]
-pub unsafe extern "C" fn nrc_set_heartbeat_tcp_backup(
-    ctx_ptr: *mut c_void,
-    enabled: i32,
-) -> i32 {
+pub unsafe extern "C" fn nrc_set_heartbeat_tcp_backup(ctx_ptr: *mut c_void, enabled: i32) -> i32 {
     if ctx_ptr.is_null() {
         return -1;
     }
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
     if let Ok(guard) = ctx.get_mut() {
         let new_state = enabled != 0;
-        if guard.heartbeat_tcp_backup.swap(new_state, std::sync::atomic::Ordering::Relaxed)
+        if guard
+            .heartbeat_tcp_backup
+            .swap(new_state, std::sync::atomic::Ordering::Relaxed)
             != new_state
         {
             log::info!(

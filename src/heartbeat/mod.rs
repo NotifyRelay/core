@@ -140,13 +140,8 @@ impl HeartbeatHandle {
                     }
 
                     // TCP 备用心跳：定向发送到目标设备（广播主用模式下本线程不会被启动）
-                    let msg = codec::encode_heartbeat_tcp(
-                        &uuid,
-                        &name_b64,
-                        port,
-                        battery,
-                        &device_type,
-                    );
+                    let msg =
+                        codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
                     let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
                     let sent = if !ip_str.is_empty() {
                         network::oneshot_send_only(&msg, &ip_str, port, 3000)

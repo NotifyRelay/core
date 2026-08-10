@@ -1,0 +1,24 @@
+#!/bin/sh
+# 仅允许推送 main 分支（submodule-modifier 规则：始终在 main 上工作，禁止功能分支）
+# 可用 NR_SKIP_CHECKS=1 或 git push --no-verify 跳过（仅限紧急情况）
+
+if [ "${NR_SKIP_CHECKS:-0}" = "1" ]; then
+    echo "[githook] NR_SKIP_CHECKS=1，跳过 pre-push 分支检查"
+    exit 0
+fi
+
+# 标准输入格式: <本地ref> <本地sha> <远端ref> <远端sha>
+while read local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+    refs/heads/*)
+        branch="${remote_ref#refs/heads/}"
+        if [ "$branch" != "main" ]; then
+            echo "[githook] 错误: 禁止推送非 main 分支 ($branch)"
+            echo "[githook] notify-relay-core 子模块始终在 main 分支上工作"
+            exit 1
+        fi
+        ;;
+    esac
+done
+
+exit 0

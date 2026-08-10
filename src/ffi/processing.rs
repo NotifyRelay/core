@@ -90,8 +90,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     } {
                         if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
                             let aes_key = hkdf::derive_session_key(&shared);
-                            let b64 =
-                                base64::engine::general_purpose::STANDARD.encode(aes_key);
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                             {
                                 let guard = ctx.get_mut().unwrap();
                                 guard.crypto.device_keys.insert(
@@ -141,7 +140,11 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 .to_string();
                 if already_paired {
                     // 已配对设备自动闭环：登记 known_device + 自动发送 ACCEPT，平台仅做持久化/通知
-                    let _ = ctx.get_mut().unwrap().discovery.add_known_device(&uuid_str, &ip);
+                    let _ = ctx
+                        .get_mut()
+                        .unwrap()
+                        .discovery
+                        .add_known_device(&uuid_str, &ip);
                     let (local_uuid, local_pub, local_battery, local_type) = {
                         let guard = ctx.get_mut().unwrap();
                         let bi = guard.broadcast_info.as_ref();
@@ -162,10 +165,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                             &local_type,
                         );
                         do_send(&ctx.get_mut().unwrap(), &uuid_str, &accept);
-                        log::info!(
-                            "配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT",
-                            uuid_str
-                        );
+                        log::info!("配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT", uuid_str);
                     }
                 }
                 fire_pairing_cb(ctx, &uuid_str, "HANDSHAKE", &data, f.battery, f.pub_key);
@@ -303,8 +303,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                                     .unwrap_or(0);
                                                 let payload =
                                                     crate::app_sync::build_applist_request(
-                                                        "user",
-                                                        now,
+                                                        "user", now,
                                                     );
                                                 q.enqueue(crate::sender_queue::SendItem {
                                                     device_uuid: target_uuid.clone(),
@@ -316,7 +315,8 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                                                 });
                                             }
                                         }
-                                        delay_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        delay_pending
+                                            .store(false, std::sync::atomic::Ordering::SeqCst);
                                     });
                             }
                         }
@@ -325,7 +325,9 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         }
                     }
                 } else {
-                    log::warn!("处理消息: ACCEPT 时 SPAKE2 会话或参数缺失(已配对设备重连场景，跳过)");
+                    log::warn!(
+                        "处理消息: ACCEPT 时 SPAKE2 会话或参数缺失(已配对设备重连场景，跳过)"
+                    );
                 }
                 let data = serde_json::json!({
                     "uuid": f.uuid,

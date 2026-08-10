@@ -430,7 +430,11 @@ pub unsafe extern "C" fn nrc_start_core(
     }
 
     // 离线检测
-    super::heartbeat::start_offline_detector_impl(ctx_ptr, offline_timeout_sec, offline_check_interval_ms);
+    super::heartbeat::start_offline_detector_impl(
+        ctx_ptr,
+        offline_timeout_sec,
+        offline_check_interval_ms,
+    );
 
     // 发送队列
     let queue_handle = super::sender_queue::create_sender_queue_impl(ctx_ptr);

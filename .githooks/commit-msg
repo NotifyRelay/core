@@ -1,0 +1,23 @@
+#!/bin/sh
+# 提交消息必须包含中文字符（submodule-modifier 规则：中文提交消息）
+# 可用 NR_SKIP_CHECKS=1 或 git commit --no-verify 跳过（仅限紧急情况）
+
+if [ "${NR_SKIP_CHECKS:-0}" = "1" ]; then
+    exit 0
+fi
+
+msg_file="$1"
+
+# 优先使用 PCRE 精确匹配 CJK 字符
+if grep -qP '[\x{4e00}-\x{9fff}]' "$msg_file" 2>/dev/null; then
+    exit 0
+fi
+
+# 兜底：grep -P 不可用时退化为检测任何非 ASCII 字节
+if LC_ALL=C grep -q '[^ -~]' "$msg_file" 2>/dev/null; then
+    exit 0
+fi
+
+echo "[githook] 错误: 提交消息必须包含中文字符"
+echo "[githook] 可用 NR_SKIP_CHECKS=1 或 git commit --no-verify 跳过"
+exit 1
