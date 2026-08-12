@@ -53,18 +53,20 @@ impl MdnsState {
         if self.daemon.is_some() {
             return Ok(());
         }
-        self.advertise_params = Some(AdvertiseParams {
+        let params = AdvertiseParams {
             uuid: uuid.to_string(),
             name: name.to_string(),
             port,
             pubkey: pubkey.to_string(),
             device_type: device_type.to_string(),
             battery,
-        });
-        self.start_advertiser_inner(uuid, name, port, pubkey, device_type, battery)
+        };
+        self.start_advertiser_inner(&params)?;
+        self.advertise_params = Some(params);
+        Ok(())
     }
 
-    /// 更新广告携带的电量（未知值跳过；电量相同跳过；否则重建广告使 TXT 生效）
+    /// 更新广告携带的电量（未知值跳过；电量相同跳过；否则重注册广告使 TXT 生效）
     pub fn update_battery(&mut self, battery: i32) {
         if battery.abs() > 100 {
             return;
@@ -76,17 +78,10 @@ impl MdnsState {
             return;
         }
         let params = params.clone();
-        if let Some(daemon) = self.daemon.take() {
-            drop(daemon);
-        }
-        match self.start_advertiser_inner(
-            &params.uuid,
-            &params.name,
-            params.port,
-            &params.pubkey,
-            &params.device_type,
+        match self.start_advertiser_inner(&AdvertiseParams {
             battery,
-        ) {
+            ..params.clone()
+        }) {
             Ok(_) => {
                 if let Some(p) = self.advertise_params.as_mut() {
                     p.battery = battery;
@@ -96,7 +91,7 @@ impl MdnsState {
         }
     }
 
-    /// 更新广告携带的名称与电量（未知值跳过；未变化跳过；否则重建广告使 TXT 生效）
+    /// 更新广告携带的名称与电量（未知值跳过；未变化跳过；否则重注册广告使 TXT 生效）
     pub fn update_name_battery(&mut self, name: &str, battery: i32) {
         let Some(params) = self.advertise_params.as_ref() else {
             return;
@@ -118,17 +113,11 @@ impl MdnsState {
         } else {
             battery
         };
-        if let Some(daemon) = self.daemon.take() {
-            drop(daemon);
-        }
-        match self.start_advertiser_inner(
-            &params.uuid,
-            &new_name,
-            params.port,
-            &params.pubkey,
-            &params.device_type,
-            new_battery,
-        ) {
+        match self.start_advertiser_inner(&AdvertiseParams {
+            name: new_name.clone(),
+            battery: new_battery,
+            ..params
+        }) {
             Ok(_) => {
                 if let Some(p) = self.advertise_params.as_mut() {
                     p.name = new_name;
@@ -139,48 +128,47 @@ impl MdnsState {
         }
     }
 
-    fn start_advertiser_inner(
-        &mut self,
-        uuid: &str,
-        name: &str,
-        port: u16,
-        pubkey: &str,
-        device_type: &str,
-        battery: i32,
-    ) -> Result<(), String> {
-        let daemon =
-            ServiceDaemon::new().map_err(|e| format!("创建 mDNS 服务守护进程失败: {}", e))?;
+    fn start_advertiser_inner(&mut self, params: &AdvertiseParams) -> Result<(), String> {
+        // 复用已有 daemon：mdns_sd 同名 register 会覆盖并重新宣告，避免每次重建泄漏线程
+        if self.daemon.is_none() {
+            let daemon =
+                ServiceDaemon::new().map_err(|e| format!("创建 mDNS 服务守护进程失败: {}", e))?;
+            self.daemon = Some(daemon);
+        }
 
-        let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode(params.name.as_bytes());
         let mut properties = HashMap::new();
-        properties.insert("uuid".to_string(), uuid.to_string());
+        properties.insert("uuid".to_string(), params.uuid.clone());
         properties.insert("name".to_string(), name_b64);
-        properties.insert("pubkey".to_string(), pubkey.to_string());
-        properties.insert("device_type".to_string(), device_type.to_string());
-        properties.insert("battery".to_string(), battery.to_string());
+        properties.insert("pubkey".to_string(), params.pubkey.clone());
+        properties.insert("device_type".to_string(), params.device_type.clone());
+        properties.insert("battery".to_string(), params.battery.to_string());
 
         let service_info = ServiceInfo::new(
             MDNS_SERVICE_TYPE,
-            uuid,
+            &params.uuid,
             "localhost.local.",
             &[] as &[std::net::IpAddr],
-            port,
+            params.port,
             properties,
         )
         .map_err(|e| format!("创建 mDNS 服务信息失败: {}", e))?;
 
-        daemon
+        self.daemon
+            .as_ref()
+            .unwrap()
             .register(service_info)
-            .map_err(|e| format!("注册 mDNS 服务失败: {}", e))?;
-
-        self.daemon = Some(daemon);
-        Ok(())
+            .map_err(|e| format!("注册 mDNS 服务失败: {}", e))
     }
 
     pub fn stop_advertiser(&mut self) {
         if let Some(daemon) = self.daemon.take() {
+            if let Ok(status_rx) = daemon.shutdown() {
+                let _ = status_rx.recv_timeout(Duration::from_secs(2));
+            }
             drop(daemon);
         }
+        self.advertise_params = None;
     }
 
     pub fn start_browser(
@@ -304,7 +292,11 @@ impl MdnsState {
                         }
                     }
                 }
-                // 浏览器退出时，丢弃 receiver 以通知守护进程停止浏览
+                // 浏览器退出时，先优雅关闭守护进程（仅 drop 无法终止 mdns_sd 内部线程），
+                // 再丢弃 receiver 以通知守护进程停止浏览
+                if let Ok(status_rx) = daemon.shutdown() {
+                    let _ = status_rx.recv_timeout(Duration::from_secs(2));
+                }
                 drop(receiver);
                 drop(daemon);
             })
