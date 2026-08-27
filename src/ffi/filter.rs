@@ -34,7 +34,7 @@ pub unsafe extern "C" fn nrc_set_filter_config(
     }
     let json_str = from_cstr(config_json);
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = ctx.get_mut().unwrap();
+    let guard = crate::ctx_mut(ctx);
 
     let config = &guard.filter.config;
     let mut cfg = match config.lock() {
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn nrc_map_local_package(
     }
     let pkg = from_cstr(remote_package);
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = ctx.get_mut().unwrap();
+    let guard = crate::ctx_mut(ctx);
     let config = match guard.filter.config.lock() {
         Ok(c) => c,
         Err(_) => return to_cstr(""),
@@ -147,7 +147,7 @@ unsafe fn check_filter_impl(
     };
     let text_str = if text.is_null() { "" } else { from_cstr(text) };
     let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = ctx.get_mut().unwrap();
+    let guard = crate::ctx_mut(ctx);
     let config = match guard.filter.config.lock() {
         Ok(c) => c,
         Err(_) => return 1,

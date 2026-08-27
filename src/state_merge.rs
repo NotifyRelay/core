@@ -507,13 +507,13 @@ pub fn handle_state_message(
             .unwrap_or("")
             .to_string();
         {
-            let g = ctx.get_mut().unwrap();
+            let g = crate::ctx_mut(ctx);
             g.state_merge.handle_ack(uuid, &fid, &hash);
         }
         return true;
     }
     let (fid, full, is_end) = {
-        let g = ctx.get_mut().unwrap();
+        let g = crate::ctx_mut(ctx);
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
             Some(r) => r,
             None => return false,
@@ -526,7 +526,7 @@ pub fn handle_state_message(
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let g = crate::ctx_mut(ctx);
         (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -539,7 +539,7 @@ pub fn handle_state_message(
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
     if !is_media && !is_end {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
-            let g = ctx.get_mut().unwrap();
+            let g = crate::ctx_mut(ctx);
             if g.sender_queue != 0 {
                 let q = unsafe { &*(crate::ffi::handle::get(g.sender_queue) as *mut SenderQueue) };
                 let ack = json!({

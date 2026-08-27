@@ -117,7 +117,7 @@ pub unsafe extern "C" fn nrc_dedup(
         ""
     };
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let guard = ctx.get_mut().unwrap();
+    let guard = crate::ctx_mut(ctx);
 
     match action {
         0 => {

@@ -247,7 +247,7 @@ impl SenderQueue {
         if send_ok {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    ctx.get_mut().unwrap().dedup.mark_sent(key);
+                    crate::ctx_mut(ctx).dedup.mark_sent(key);
                 }
             }
             // 发送成功：清除该设备的失败退避状态
@@ -306,7 +306,7 @@ impl SenderQueue {
         } else {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    ctx.get_mut().unwrap().dedup.clear_pending(key);
+                    crate::ctx_mut(ctx).dedup.clear_pending(key);
                 }
             }
             if Self::is_media_header(&item.header) && !Self::is_media_end_packet(&item.plaintext) {
@@ -328,7 +328,7 @@ impl SenderQueue {
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
         let (key_arr, local_uuid) = {
-            let guard = ctx.get_mut().unwrap();
+            let guard = crate::ctx_mut(ctx);
             let key = guard.crypto.get_aes_key(&item.device_uuid);
             let uuid = guard
                 .broadcast_info
@@ -359,7 +359,7 @@ impl SenderQueue {
 
         // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
         let ip = {
-            let guard = ctx.get_mut().unwrap();
+            let guard = crate::ctx_mut(ctx);
             guard
                 .device_ips
                 .lock()

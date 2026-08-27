@@ -94,7 +94,7 @@ pub unsafe extern "C" fn nrc_send_handshake(
 /// 发送配对结果回调并清理临时状态
 fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let g = crate::ctx_mut(ctx);
         g.spake2_prover = None;
         g.spake2_verifier = None;
         g.pairing_ctx = None;
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let (ctx_ref, target_ip) = {
-        let guard = ctx.get_mut().unwrap();
+        let guard = crate::ctx_mut(ctx);
         guard.expected_pairing_code = Some(code.clone());
         let (session, spake2_pub) = spake2::generate_prover_session(&code);
         guard.spake2_prover = Some(session);
@@ -214,7 +214,7 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
     super::processing::process_line(ctx, &resp);
 
     let (prover_session, peer_lt_pub, peer_spake2_pub) = {
-        let g = ctx.get_mut().unwrap();
+        let g = crate::ctx_mut(ctx);
         (
             g.spake2_prover.take(),
             g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
@@ -231,7 +231,7 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
                 let aes_key = hkdf::derive_session_key(&shared_secret);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                 {
-                    let guard = ctx.get_mut().unwrap();
+                    let guard = crate::ctx_mut(ctx);
                     guard.crypto.device_keys.insert(
                         tu.clone(),
                         crate::crypto::DeviceKeyEntry {
@@ -325,7 +325,7 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let target_uuid = {
-        let guard = ctx.get_mut().unwrap();
+        let guard = crate::ctx_mut(ctx);
         match guard.pairing_ctx.as_ref() {
             Some(c) => Some(c.peer_uuid.clone()),
             None => {
@@ -340,7 +340,7 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
     };
 
     let msg = {
-        let guard = ctx.get_mut().unwrap();
+        let guard = crate::ctx_mut(ctx);
         let (session, spake2_pub) = spake2::generate_verifier_session(&code);
         guard.spake2_verifier = Some(session);
         codec::encode_pairing_resp(&u, &spake2_pub, &l, &i, battery, &d)
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
 
     match action {
         0 => {
-            let guard = ctx.get_mut().unwrap();
+            let guard = crate::ctx_mut(ctx);
             if let Some(handle) = guard.broadcast_handle.take() {
                 handle.running.store(false, Ordering::Relaxed);
             }
@@ -425,7 +425,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             let n_b64 = encode_name_b64(unsafe { from_cstr(name) });
             let d = unsafe { from_cstr(device_type).to_string() };
 
-            let guard = ctx.get_mut().unwrap();
+            let guard = crate::ctx_mut(ctx);
             let local_uuid = u.clone();
             guard.broadcast_info = Some(BroadcastInfo {
                 uuid: u,
@@ -459,7 +459,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
 
                     let msg = {
                         let ctx = unsafe { &mut *(ctx_usize as *mut SafeContext) };
-                        let guard = ctx.get_mut().unwrap();
+                        let guard = crate::ctx_mut(ctx);
                         match &guard.broadcast_info {
                             Some(i) => codec::encode_udp_broadcast(
                                 &i.uuid,
@@ -489,7 +489,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             }
         }
         2 => {
-            let guard = ctx.get_mut().unwrap();
+            let guard = crate::ctx_mut(ctx);
             if let Some(ref mut info) = guard.broadcast_info {
                 if !uuid.is_null() {
                     info.uuid = unsafe { from_cstr(uuid).to_string() };
@@ -565,7 +565,7 @@ pub unsafe extern "C" fn nrc_connect_device(
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
     let (local_uuid, local_pub, local_ip) = {
-        let guard = ctx.get_mut().unwrap();
+        let guard = crate::ctx_mut(ctx);
         (
             guard
                 .broadcast_info

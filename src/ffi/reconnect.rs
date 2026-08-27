@@ -14,7 +14,7 @@ pub(crate) unsafe fn create_reconnect_state_impl(ctx_ptr: *mut c_void) -> u64 {
     let state = Box::new(ReconnectState::new());
     let handle = super::handle::put(Box::into_raw(state) as *mut c_void);
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    ctx.get_mut().unwrap().reconnect_state = handle;
+    crate::ctx_mut(ctx).reconnect_state = handle;
     handle
 }
 

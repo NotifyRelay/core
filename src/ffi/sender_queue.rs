@@ -18,7 +18,7 @@ pub(crate) unsafe fn create_sender_queue_impl(ctx_ptr: *mut c_void) -> u64 {
     let handle = super::handle::put(Box::into_raw(queue) as *mut c_void);
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    ctx.get_mut().unwrap().sender_queue = handle;
+    crate::ctx_mut(ctx).sender_queue = handle;
 
     handle
 }
