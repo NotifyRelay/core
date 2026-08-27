@@ -63,7 +63,7 @@ impl PersistedDevice {
 
 /// 持久化管理器（core 私有单库）
 pub struct Persistence {
-    db: Connection,
+    db: std::sync::Mutex<Connection>,
 }
 
 impl Persistence {
@@ -142,7 +142,11 @@ impl Persistence {
     pub(crate) fn open_at(path: &Path) -> Result<Self, String> {
         Self::ensure_parent(path);
         match Self::open_existing_or_create(path) {
-            Ok(conn) if Self::db_is_healthy(&conn) => return Ok(Self { db: conn }),
+            Ok(conn) if Self::db_is_healthy(&conn) => {
+                return Ok(Self {
+                    db: std::sync::Mutex::new(conn),
+                })
+            }
             Ok(conn) => drop(conn),
             Err(_) => {}
         }
@@ -167,7 +171,9 @@ impl Persistence {
             Self::corrupt_backup_path(path).display(),
             saved_rows.len()
         );
-        Ok(Self { db: conn })
+        Ok(Self {
+            db: std::sync::Mutex::new(conn),
+        })
     }
 
     /// 尝试打开既有库（or 新库）并完成表结构
@@ -298,6 +304,8 @@ impl Persistence {
 
     pub fn get_local_uuid(&self) -> Option<String> {
         self.db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .query_row(
                 "SELECT value FROM app_config WHERE key = ?1",
                 [KEY_LOCAL_UUID],
@@ -312,6 +320,8 @@ impl Persistence {
             return Ok(());
         }
         self.db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(
                 "INSERT OR REPLACE INTO app_config (key, value) VALUES (?1, ?2)",
                 rusqlite::params![KEY_LOCAL_UUID, uuid],
@@ -326,6 +336,8 @@ impl Persistence {
 
     pub fn get_state_encrypted(&self) -> Option<String> {
         self.db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .query_row(
                 "SELECT value FROM app_config WHERE key = ?1",
                 [KEY_RUST_CORE_STATE],
@@ -337,6 +349,8 @@ impl Persistence {
 
     pub fn save_state_encrypted(&self, encrypted: &str) -> Result<(), String> {
         self.db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(
                 "INSERT OR REPLACE INTO app_config (key, value) VALUES (?1, ?2)",
                 rusqlite::params![KEY_RUST_CORE_STATE, encrypted],
@@ -350,8 +364,8 @@ impl Persistence {
     // ============================================================
 
     pub fn load_device_rows(&self) -> Result<Vec<PersistedDevice>, String> {
-        let mut stmt = self
-            .db
+        let db = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = db
             .prepare(
                 "SELECT uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt
                  FROM devices",
@@ -379,7 +393,7 @@ impl Persistence {
 
     /// 幂等 upsert：基础行 INSERT OR IGNORE，密钥列/元数据列分别补充
     pub fn upsert_device_row(&self, dev: &PersistedDevice, has_key: bool) -> Result<(), String> {
-        self.db
+        self.db.lock().unwrap_or_else(|p| p.into_inner())
             .execute(
                 "INSERT OR IGNORE INTO devices (uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt)
                  VALUES (?1, '', '', 0, '', '', 0, ?2, ?2)",
@@ -387,7 +401,7 @@ impl Persistence {
             )
             .map_err(|e| format!("插入设备行失败: {}", e))?;
         if has_key && !dev.shared_secret.is_empty() {
-            self.db
+            self.db.lock().unwrap_or_else(|p| p.into_inner())
                 .execute(
                     "UPDATE devices SET publicKey = ?1, sharedSecret = ?2, isAccepted = 1, updatedAt = ?3 WHERE uuid = ?4",
                     rusqlite::params![dev.public_key, dev.shared_secret, dev.updated_at, dev.uuid],
@@ -395,7 +409,7 @@ impl Persistence {
                 .map_err(|e| format!("更新设备密钥失败: {}", e))?;
         }
         if !dev.display_name.is_empty() || !dev.last_ip.is_empty() || dev.last_port > 0 {
-            self.db
+            self.db.lock().unwrap_or_else(|p| p.into_inner())
                 .execute(
                     "UPDATE devices SET displayName = ?1, lastIp = ?2, lastPort = ?3, updatedAt = ?4 WHERE uuid = ?5",
                     rusqlite::params![
@@ -413,6 +427,8 @@ impl Persistence {
 
     pub fn delete_device(&self, uuid: &str) -> Result<(), String> {
         self.db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .execute("DELETE FROM devices WHERE uuid = ?1", [uuid])
             .map_err(|e| format!("删除设备失败: {}", e))?;
         Ok(())
@@ -429,8 +445,8 @@ impl Persistence {
         rows: &[(PersistedDevice, bool)],
         tombstones: &[String],
     ) -> Result<(), String> {
-        let tx = self
-            .db
+        let mut db = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = db
             .transaction()
             .map_err(|e| format!("开启事务失败: {}", e))?;
         if let Some(u) = local_uuid {
