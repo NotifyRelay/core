@@ -137,8 +137,41 @@ impl Persistence {
     }
 
     /// 在指定路径打开库（测试/故障排查/覆盖路径用）
+    /// 损坏库自愈：quick_check 失败（或写后报 malformed/locked 的已知模式）时，
+    /// 抢救可读的设备行 → 备份原库文件 → 重建空库并回灌设备行
     pub(crate) fn open_at(path: &Path) -> Result<Self, String> {
         Self::ensure_parent(path);
+        match Self::open_existing_or_create(path) {
+            Ok(conn) if Self::db_is_healthy(&conn) => return Ok(Self { db: conn }),
+            Ok(conn) => drop(conn),
+            Err(_) => {}
+        }
+
+        // ===== 损坏库重建 =====
+        log::warn!(
+            "持久化库损坏检测（integrity_check 异常），执行自愈重建: {}",
+            path.display()
+        );
+        // 1. 抢救设备行（尽力而为）
+        let saved_rows = Self::drain_device_rows(path);
+        // 2. 备份原文件（主库 + WAL/SHM 一并改名，保留现场）
+        Self::backup_corrupt(path);
+        // 3. 重建并回灌
+        let conn = Self::open_fresh(path)?;
+        for row in &saved_rows {
+            Self::insert_row_full(&conn, row)
+                .map_err(|e| format!("回灌设备行失败 {}: {}", row.uuid, e))?;
+        }
+        log::warn!(
+            "持久化库已重建（原文件备份于 {}），已回灌 {} 台设备密钥；本机密钥对需重新生成，旧配对需重新建立",
+            Self::corrupt_backup_path(path).display(),
+            saved_rows.len()
+        );
+        Ok(Self { db: conn })
+    }
+
+    /// 尝试打开既有库（or 新库）并完成表结构
+    fn open_existing_or_create(path: &Path) -> Result<Connection, String> {
         let conn = Connection::open(path)
             .map_err(|e| format!("打开数据库失败 {}: {}", path.display(), e))?;
         conn.execute_batch(
@@ -147,7 +180,95 @@ impl Persistence {
         )
         .map_err(|e| format!("设置 WAL 模式失败: {}", e))?;
         Self::ensure_tables(&conn)?;
-        Ok(Self { db: conn })
+        Ok(conn)
+    }
+
+    /// 健康检查（损坏表/索引异常返回 false）
+    fn db_is_healthy(conn: &Connection) -> bool {
+        match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+            Ok(v) => v.eq_ignore_ascii_case("ok"),
+            Err(_) => false,
+        }
+    }
+
+    /// 尽力读取设备行（损坏表可读部分）
+    fn drain_device_rows(path: &Path) -> Vec<PersistedDevice> {
+        let Ok(conn) =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            return Vec::new();
+        };
+        conn.prepare(
+            "SELECT uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt
+             FROM devices",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            let mut rows = Vec::new();
+            let mut q = stmt.query([]).ok()?;
+            while let Some(r) = q.next().ok()? {
+                rows.push(PersistedDevice::from_row(
+                    r.get(0).ok()?,
+                    r.get(1).ok()?,
+                    r.get(2).ok()?,
+                    r.get::<_, i32>(3).ok()? != 0,
+                    r.get(4).ok()?,
+                    r.get(5).ok()?,
+                    r.get(6).ok()?,
+                    r.get(7).ok()?,
+                    r.get(8).ok()?,
+                ));
+            }
+            Some(rows)
+        })
+        .unwrap_or_default()
+    }
+
+    fn corrupt_backup_path(path: &Path) -> std::path::PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        path.with_file_name(format!(
+            "{}-corrupt-{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            ts
+        ))
+    }
+
+    fn backup_corrupt(path: &Path) {
+        let bak = Self::corrupt_backup_path(path);
+        let _ = std::fs::rename(path, &bak);
+        for suffix in ["-wal", "-shm"] {
+            let p = path.to_string_lossy().to_string() + suffix;
+            let _ = std::fs::rename(&p, bak.to_string_lossy().to_string() + suffix);
+        }
+    }
+
+    /// 全新创建库（仅 schema）
+    fn open_fresh(path: &Path) -> Result<Connection, String> {
+        Self::open_existing_or_create(path)
+    }
+
+    /// 新建库回灌：全列 INSERT（含密钥）
+    fn insert_row_full(conn: &Connection, row: &PersistedDevice) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR IGNORE INTO devices (uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                row.uuid,
+                row.public_key,
+                row.shared_secret,
+                row.is_accepted as i32,
+                row.display_name,
+                row.last_ip,
+                row.last_port as i64,
+                row.created_at,
+                row.updated_at
+            ],
+        )
+        .map_err(|e| format!("插入设备行失败: {}", e))?;
+        Ok(())
     }
 
     fn ensure_tables(conn: &Connection) -> Result<(), String> {

@@ -221,6 +221,29 @@ fn test_persistence_full_flow() {
     drop(ctx_b);
     drop(ctx_peer2);
 
+    // ===== 专项：损坏库自愈（garbage 文件 → 打开即重建）=====
+    cleanup(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::write(
+        &db,
+        b"this is not a sqlite database, corrupted garbage bytes",
+    )
+    .unwrap();
+    let ctx_c = create_ctx();
+    let uuid_c = unsafe { ffi::nrc_get_local_uuid(ctx_ptr(&ctx_c)) };
+    let uuid_c_str = unsafe { read_cstr(uuid_c) };
+    unsafe { free_str(uuid_c) };
+    assert!(
+        !uuid_c_str.is_empty(),
+        "损坏库打开后应自愈重建并可生成本机 UUID"
+    );
+    assert_eq!(ffi::nrc_ecdh_generate_keypair(ctx_ptr(&ctx_c)), 0);
+    let pub_c = ffi::nrc_ecdh_get_public_key(ctx_ptr(&ctx_c));
+    let pub_c_str = unsafe { read_cstr(pub_c) };
+    unsafe { free_str(pub_c) };
+    assert!(!pub_c_str.is_empty(), "重建库密钥对正常可使用");
+    drop(ctx_c);
+
     // 清理临时库
     cleanup(&db);
     let _ = std::fs::remove_dir_all(&dir);
