@@ -323,59 +323,70 @@ impl CoreContext {
             log::warn!("本机 UUID 不可用，暂缓持久化落盘");
             return false;
         }
-        let p = if self.persistence.is_some() {
-            self.persistence.as_ref().unwrap()
-        } else {
+        if self.persistence.is_none() {
             match persistence::Persistence::open() {
-                Ok(p) => {
-                    self.persistence = Some(p);
-                    self.persistence.as_ref().unwrap()
-                }
+                Ok(p) => self.persistence = Some(p),
                 Err(e) => {
                     log::warn!("持久化打开失败: {}", e);
                     return false;
                 }
             }
-        };
-        if !self.local_uuid.is_empty() {
-            if let Err(e) = p.save_local_uuid(&self.local_uuid) {
-                log::error!("保存本机 UUID 失败: {}", e);
-            }
         }
-        match persistence::encrypt_state(&self.crypto, &self.local_uuid) {
-            Ok(enc) => {
-                if let Err(e) = p.save_state_encrypted(&enc) {
-                    log::error!("保存密钥状态失败: {}", e);
-                }
-            }
-            Err(e) => log::error!("加密密钥状态失败: {}", e),
-        }
+        // ——只读收集（不持有持久化可变借用）——
+        let encrypted_state = persistence::encrypt_state(&self.crypto, &self.local_uuid)
+            .map(Some)
+            .unwrap_or_else(|e| {
+                log::error!("加密密钥状态失败: {}", e);
+                None
+            });
         let mut uuids: Vec<String> = self.crypto.device_keys.keys().cloned().collect();
         uuids.extend(self.persisted_devices.keys().cloned());
         uuids.sort();
         uuids.dedup();
-        for uuid in &uuids {
-            let dev = self.build_device_row(uuid);
-            let has_key = self.crypto.device_keys.contains_key(uuid);
-            if let Err(e) = p.upsert_device_row(&dev, has_key) {
-                log::error!("持久化设备行失败 {}: {}", uuid, e);
-            }
-        }
+        let rows: Vec<(persistence::PersistedDevice, bool)> = uuids
+            .iter()
+            .map(|uuid| {
+                (
+                    self.build_device_row(uuid),
+                    self.crypto.device_keys.contains_key(uuid),
+                )
+            })
+            .collect();
         // 墓碑清理：库中残留但内存已无的设备行（删除未直删成功/异常时兜底，
         // 防止重启后 load_all 把行内密钥回灌导致设备“复活”）
-        if let Ok(rows) = p.load_device_rows() {
-            for row in rows {
-                if !self.crypto.device_keys.contains_key(&row.uuid)
-                    && !self.persisted_devices.contains_key(&row.uuid)
-                {
-                    if let Err(e) = p.delete_device(&row.uuid) {
-                        log::warn!("清理残留设备行失败 {}: {}", row.uuid, e);
-                    }
-                }
+        let tombstones: Vec<String> = {
+            let p = self.persistence.as_ref().unwrap();
+            p.load_device_rows()
+                .ok()
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|row| {
+                            !self.crypto.device_keys.contains_key(&row.uuid)
+                                && !self.persisted_devices.contains_key(&row.uuid)
+                        })
+                        .map(|row| row.uuid)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // ——单事务原子写入：state 与设备行要么同时生效要么同时回滚，
+        // 避免中间态导致重启后加载旧密钥而忽略更新的设备行——
+        let p = self.persistence.as_mut().unwrap();
+        match p.flush_all(
+            Some(&self.local_uuid),
+            encrypted_state.as_deref(),
+            &rows,
+            &tombstones,
+        ) {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                true
+            }
+            Err(e) => {
+                log::error!("持久化落盘失败（保留 dirty，等待重试）: {}", e);
+                false
             }
         }
-        self.persistence_dirty = false;
-        true
     }
 }
 

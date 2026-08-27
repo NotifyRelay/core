@@ -296,6 +296,81 @@ impl Persistence {
             .map_err(|e| format!("删除设备失败: {}", e))?;
         Ok(())
     }
+
+    /// 单事务写入全部落盘内容（uuid/state/设备行/墓碑清理），失败整体回滚
+    /// 保证 state 与设备密钥行要么同时生效要么都不生效，
+    /// 避免「state 已写/行未写」或「行已写/state 未写」的中间态在重启时
+    /// 加载旧密钥而忽略更新的设备行（load_all 以 state 优先）
+    pub fn flush_all(
+        &mut self,
+        local_uuid: Option<&str>,
+        encrypted_state: Option<&str>,
+        rows: &[(PersistedDevice, bool)],
+        tombstones: &[String],
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction()
+            .map_err(|e| format!("开启事务失败: {}", e))?;
+        if let Some(u) = local_uuid {
+            if !u.is_empty() {
+                tx.execute(
+                    "INSERT OR REPLACE INTO app_config (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![KEY_LOCAL_UUID, u],
+                )
+                .map_err(|e| format!("保存本机 UUID 失败: {}", e))?;
+            }
+        }
+        if let Some(enc) = encrypted_state {
+            tx.execute(
+                "INSERT OR REPLACE INTO app_config (key, value) VALUES (?1, ?2)",
+                rusqlite::params![KEY_RUST_CORE_STATE, enc],
+            )
+            .map_err(|e| format!("保存密钥状态失败: {}", e))?;
+        }
+        for (dev, has_key) in rows {
+            Self::upsert_device_row_tx(&tx, dev, *has_key)?;
+        }
+        for uuid in tombstones {
+            tx.execute("DELETE FROM devices WHERE uuid = ?1", [uuid.as_str()])
+                .map_err(|e| format!("删除残留设备行失败 {}: {}", uuid, e))?;
+        }
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))
+    }
+
+    fn upsert_device_row_tx(
+        tx: &rusqlite::Transaction,
+        dev: &PersistedDevice,
+        has_key: bool,
+    ) -> Result<(), String> {
+        tx.execute(
+            "INSERT OR IGNORE INTO devices (uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt)
+             VALUES (?1, '', '', 0, '', '', 0, ?2, ?2)",
+            rusqlite::params![dev.uuid, dev.updated_at],
+        )
+        .map_err(|e| format!("插入设备行失败: {}", e))?;
+        if has_key && !dev.shared_secret.is_empty() {
+            tx.execute(
+                "UPDATE devices SET publicKey = ?1, sharedSecret = ?2, isAccepted = 1, updatedAt = ?3 WHERE uuid = ?4",
+                rusqlite::params![dev.public_key, dev.shared_secret, dev.updated_at, dev.uuid],
+            )
+            .map_err(|e| format!("更新设备密钥失败: {}", e))?;
+        }
+        if !dev.display_name.is_empty() || !dev.last_ip.is_empty() || dev.last_port > 0 {
+            tx.execute(
+                "UPDATE devices SET displayName = ?1, lastIp = ?2, lastPort = ?3, updatedAt = ?4 WHERE uuid = ?5",
+                rusqlite::params![
+                    dev.display_name,
+                    dev.last_ip,
+                    dev.last_port as i64,
+                    dev.updated_at,
+                    dev.uuid
+                ],
+            )
+            .map_err(|e| format!("更新设备信息失败: {}", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// 加密密钥状态 → app_config（复用现有 encrypt_local_state 原语：hkdf(uuid) 派生密钥）
