@@ -361,6 +361,19 @@ impl CoreContext {
                 log::error!("持久化设备行失败 {}: {}", uuid, e);
             }
         }
+        // 墓碑清理：库中残留但内存已无的设备行（删除未直删成功/异常时兜底，
+        // 防止重启后 load_all 把行内密钥回灌导致设备“复活”）
+        if let Ok(rows) = p.load_device_rows() {
+            for row in rows {
+                if !self.crypto.device_keys.contains_key(&row.uuid)
+                    && !self.persisted_devices.contains_key(&row.uuid)
+                {
+                    if let Err(e) = p.delete_device(&row.uuid) {
+                        log::warn!("清理残留设备行失败 {}: {}", row.uuid, e);
+                    }
+                }
+            }
+        }
         self.persistence_dirty = false;
         true
     }

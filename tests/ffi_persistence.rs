@@ -152,9 +152,8 @@ fn test_persistence_full_flow() {
     assert_eq!(unsafe { ffi::nrc_import_state(p2, cstr(&exported_str)) }, 0);
 
     // ========== 删除配对：内存/库/列表联动 ==========
+    // remove 内部立即落盘（state 重写 + 行删除），此后不调用任何接口直接重启
     assert_eq!(unsafe { ffi::nrc_remove_device(p2, cstr("peer-2")) }, 0);
-    let uuid3 = unsafe { ffi::nrc_get_local_uuid(p2) };
-    unsafe { free_str(uuid3) }; // 触发 flush（state 移除 peer-2、行删除）
     let ctx3 = create_ctx();
     let p3 = ctx_ptr(&ctx3);
     let list3 = unsafe { ffi::nrc_get_device_list(p3, 30_000, 10_000) };
@@ -164,7 +163,7 @@ fn test_persistence_full_flow() {
     let arr3 = v3.as_array().unwrap();
     assert!(
         !arr3.iter().any(|x| x["uuid"] == "peer-2"),
-        "删除配对后 peer-2 不应再出现: {}",
+        "删除配对后（立即重启）peer-2 不应再出现: {}",
         list3_json
     );
     // peer-1 名称仍在（未删除）
@@ -179,6 +178,7 @@ fn test_persistence_full_flow() {
     drop(ctx1);
     drop(ctx2);
     drop(ctx3);
+    drop(ctx4);
 
     // 清理临时库
     cleanup(&db);

@@ -51,6 +51,9 @@ pub unsafe extern "C" fn nrc_remove_device(
                 log::error!("从持久化库删除设备失败 {}: {}", uuid, e);
             }
         }
+        // 立即重写密钥状态：删除后进程被杀/重启时，旧 state 中的密钥
+        // 会把设备从库中“复活”，必须同步落盘（未激活时由下次读取前 flush 兜底）
+        let _ = ctx.flush_persistence();
         0
     })
 }
