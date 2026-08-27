@@ -413,7 +413,8 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             if let Some(handle) = guard.broadcast_handle.take() {
                 handle.running.store(false, Ordering::Relaxed);
             }
-            guard.broadcast_info = None;
+            // 注意：不清空 broadcast_info，心跳调度器/重连/发现等组件依赖它获取本机身份
+            // （锁屏切换 TCP 备用心跳时若本机信息为空，心跳调度器将停摆不工作）
             0
         }
         1 => {
