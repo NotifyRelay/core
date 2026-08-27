@@ -42,15 +42,18 @@ pub unsafe extern "C" fn nrc_remove_device(
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
         ctx.ensure_persistence_loaded();
+        // 先持久化删除：失败则保持内存状态并返回失败，避免「内存已删但库行残留」
+        // 在重启后 load_all 回灌密钥导致设备复活（墓碑删不掉的根因之一）
+        if let Some(p) = ctx.persistence.as_ref() {
+            if let Err(e) = p.delete_device(uuid) {
+                log::error!("从持久化库删除设备失败 {}: {}", uuid, e);
+                return -1;
+            }
+        }
         ctx.crypto.device_keys.remove(uuid);
         ctx.registry.remove(uuid);
         ctx.persisted_devices.remove(uuid);
         ctx.mark_persistence_dirty();
-        if let Some(p) = ctx.persistence.as_ref() {
-            if let Err(e) = p.delete_device(uuid) {
-                log::error!("从持久化库删除设备失败 {}: {}", uuid, e);
-            }
-        }
         // 立即重写密钥状态：删除后进程被杀/重启时，旧 state 中的密钥
         // 会把设备从库中“复活”，必须同步落盘（未激活时由下次读取前 flush 兜底）
         let _ = ctx.flush_persistence();
