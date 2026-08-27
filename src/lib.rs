@@ -373,28 +373,3 @@ impl Default for CoreContext {
 }
 
 pub type SafeContext = Mutex<CoreContext>;
-
-/// 直接上下文指针独占访问（&mut SafeContext 无锁路径，锁中毒时恢复内部值）
-/// 供 FFI 内部在已持有 &mut SafeContext 时使用；类型与 Mutex::get_mut 一致
-pub fn ctx_mut(ctx: &mut SafeContext) -> &mut CoreContext {
-    match ctx.get_mut() {
-        Ok(g) => g,
-        Err(poison) => {
-            log::warn!("核心上下文锁中毒，已恢复内部状态");
-            poison.into_inner()
-        }
-    }
-}
-
-/// 获取核心上下文（线程安全访问 + 锁中毒恢复）
-/// panic 跨 extern "C" FFI 边界会导致 abort（Android 上是硬崩溃），
-/// 锁中毒时恢复内部值而非 panic
-pub fn ctx_guard(ctx: &SafeContext) -> std::sync::MutexGuard<'_, CoreContext> {
-    match ctx.lock() {
-        Ok(guard) => guard,
-        Err(poison) => {
-            log::warn!("核心上下文锁中毒，已恢复内部状态");
-            poison.into_inner()
-        }
-    }
-}

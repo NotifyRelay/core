@@ -130,7 +130,7 @@ impl ReconnectState {
                             // 用 tcp.is_connected 判定会永远失败，导致无限重复握手。
                             let connected = {
                                 let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                                let guard = crate::ctx_mut(ctx);
+                                let guard = ctx.get_mut().unwrap();
                                 let timed_out = guard.heartbeat.check_timeouts(RECENT_SEEN_SECS);
                                 !timed_out.contains(uuid)
                             };
@@ -181,7 +181,7 @@ impl ReconnectState {
                         // 携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示
                         let handshake_msg = {
                             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            let guard = crate::ctx_mut(ctx);
+                            let guard = ctx.get_mut().unwrap();
                             let local_uuid = guard
                                 .broadcast_info
                                 .as_ref()

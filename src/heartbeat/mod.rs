@@ -218,7 +218,7 @@ pub fn start_offline_detector(
 
             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
             let (timeouts, on_timeout_cb, user_data) = {
-                let guard = crate::ctx_mut(ctx);
+                let guard = ctx.get_mut().unwrap();
                 let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
                 let cb = guard.router.on_device_timeout;
                 let ud = guard.router.user_data;
@@ -233,7 +233,7 @@ pub fn start_offline_detector(
                     }
                 }
                 {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     guard.heartbeat.remove(uuid);
                     guard.registry.mark_disconnected(uuid);
                     if let Ok(mut tcp) = guard.network.tcp.lock() {

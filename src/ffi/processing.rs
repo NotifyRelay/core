@@ -19,7 +19,7 @@ fn fire_pairing_cb(
     extra: &str,
 ) {
     let (cb, ud) = {
-        let g = crate::ctx_mut(ctx);
+        let g = ctx.get_mut().unwrap();
         (g.router.on_pairing, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -40,7 +40,7 @@ fn fire_pairing_cb(
 
 fn fire_data_cb(ctx: &mut SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
     let (cb, ud) = {
-        let g = crate::ctx_mut(ctx);
+        let g = ctx.get_mut().unwrap();
         (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -85,14 +85,14 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 // 新设备密钥由 ACCEPT/SPAKE2 流程或平台侧派生建立
                 if already_paired {
                     if let Some(ref key) = {
-                        let guard = crate::ctx_mut(ctx);
+                        let guard = ctx.get_mut().unwrap();
                         guard.crypto.local_key.clone()
                     } {
                         if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
                             let aes_key = hkdf::derive_session_key(&shared);
                             let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                             {
-                                let guard = crate::ctx_mut(ctx);
+                                let guard = ctx.get_mut().unwrap();
                                 guard.crypto.device_keys.insert(
                                     uuid_str.clone(),
                                     crate::crypto::DeviceKeyEntry {
@@ -106,7 +106,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                     }
                 }
                 let ip = {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     // 握手：登记设备身份（不刷新 last_seen），IP 优先用报文携带值
                     let ip_from_ips = guard
                         .device_ips
@@ -146,7 +146,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                         .discovery
                         .add_known_device(&uuid_str, &ip);
                     let (local_uuid, local_pub, local_battery, local_type) = {
-                        let guard = crate::ctx_mut(ctx);
+                        let guard = ctx.get_mut().unwrap();
                         let bi = guard.broadcast_info.as_ref();
                         (
                             bi.map(|b| b.uuid.clone()).unwrap_or_default(),
@@ -164,7 +164,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                             local_battery,
                             &local_type,
                         );
-                        do_send(&crate::ctx_mut(ctx), &uuid_str, &accept);
+                        do_send(&ctx.get_mut().unwrap(), &uuid_str, &accept);
                         log::info!("配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT", uuid_str);
                     }
                 }
@@ -178,7 +178,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         ProtocolHeader::PairingInit => {
             if let Some(f) = codec::decode_pairing_init(line_str) {
                 {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     guard.pairing_ctx = Some(crate::PairingContext {
                         peer_uuid: f.uuid.to_string(),
                         peer_spake2_pub: f.spake2_pub.to_string(),
@@ -205,7 +205,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let peer_spake2 = f.spake2_pub.to_string();
                 let peer_lt = f.lt_pub.to_string();
                 {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     guard.pairing_ctx = Some(crate::PairingContext {
                         peer_uuid: f.uuid.to_string(),
                         peer_spake2_pub: peer_spake2.clone(),
@@ -233,7 +233,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 let uuid = f.uuid.to_string();
                 let lt_pub = f.lt_pub_key.to_string();
                 let (verifier_session, peer_spake2_pub) = {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     (
                         guard.spake2_verifier.take(),
                         guard
@@ -251,7 +251,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                             let aes_key = hkdf::derive_session_key(&shared_secret);
                             let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                             {
-                                let guard = crate::ctx_mut(ctx);
+                                let guard = ctx.get_mut().unwrap();
                                 guard.crypto.device_keys.insert(
                                     uuid.clone(),
                                     crate::crypto::DeviceKeyEntry {
@@ -270,7 +270,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                             let peer_ip = f.ip.to_string();
                             let target_uuid = uuid.clone();
                             {
-                                let g = crate::ctx_mut(ctx);
+                                let g = ctx.get_mut().unwrap();
                                 g.discovery.add_known_device(&target_uuid, &peer_ip);
                                 if !peer_ip.is_empty() {
                                     if let Ok(mut ips) = g.device_ips.lock() {
@@ -281,7 +281,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                             // 自动延迟 3s 发送应用列表请求（下沉自平台 DelayedRequestAppList）
                             // 互斥标志防止短时间多次配对时线程堆叠
                             let delay_pending = {
-                                let g = crate::ctx_mut(ctx);
+                                let g = ctx.get_mut().unwrap();
                                 g.applist_delay_pending.clone()
                             };
                             if !delay_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -345,7 +345,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 }
                 {
                     let ack = codec::encode_ack(&uuid);
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     do_send(guard, &uuid, &ack);
                 }
                 0
@@ -375,7 +375,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 );
                 {
                     let ack = codec::encode_ack(payload);
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     do_send(guard, payload, &ack);
                 }
                 0
@@ -386,7 +386,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
         }
         ProtocolHeader::HeartbeatTcp => {
             if let Some(f) = codec::decode_heartbeat_tcp(line_str) {
-                crate::ctx_mut(ctx).heartbeat.record(f.uuid);
+                ctx.get_mut().unwrap().heartbeat.record(f.uuid);
                 let name_decoded = String::from_utf8(
                     base64::engine::general_purpose::STANDARD
                         .decode(f.name)
@@ -394,7 +394,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 )
                 .unwrap_or(f.name.to_string());
                 {
-                    let guard = crate::ctx_mut(ctx);
+                    let guard = ctx.get_mut().unwrap();
                     // IP 从 device_ips 取（TCP 连接来源 IP）
                     let ip = guard
                         .device_ips
@@ -443,7 +443,7 @@ pub(crate) fn process_line(ctx: &mut SafeContext, line_str: &str) -> i32 {
                 }
             };
             let key_arr = {
-                let guard = crate::ctx_mut(ctx);
+                let guard = ctx.get_mut().unwrap();
                 let key = guard.crypto.get_aes_key(fields.local_uuid);
                 let _ud = guard.router.user_data;
                 key

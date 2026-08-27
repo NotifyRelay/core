@@ -73,20 +73,9 @@ where
         return R::default();
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    // panic 防护：panic 跨 extern "C" FFI 边界会导致 abort 崩溃（Android 上尤为严重），
-    // 统一捕获并记录，返回默认值（与「无效上下文」同语义）
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ctx.get_mut() {
+    match ctx.get_mut() {
         Ok(g) => f(g),
         Err(_) => R::default(),
-    })) {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!(
-                "FFI 内部 panic 已捕获（可能由锁中毒或状态损坏引起）: {:?}",
-                e
-            );
-            R::default()
-        }
     }
 }
 

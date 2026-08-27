@@ -18,7 +18,7 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
     }
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    let guard = crate::ctx_mut(ctx);
+    let guard = ctx.get_mut().unwrap();
 
     // 获取回调
     let on_connected = guard.router.on_device_connected;
@@ -230,7 +230,7 @@ pub unsafe extern "C" fn nrc_remove_device_session(
     let uuid_str = unsafe { from_cstr(uuid) };
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    let guard = crate::ctx_mut(ctx);
+    let guard = ctx.get_mut().unwrap();
 
     let network_state = guard.network.tcp.clone();
 
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
     // UDP 监听器使用 0.0.0.0:23334 监听所有接口，网络变化不影响其工作
     // 只有在监听器未运行时才启动，避免频繁重启导致端口占用竞争
     {
-        let guard = crate::ctx_mut(ctx);
+        let guard = ctx.get_mut().unwrap();
         let udp_running = match guard.network.tcp.lock() {
             Ok(state) => state.udp_handle.is_some(),
             Err(_) => false,

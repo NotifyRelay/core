@@ -24,7 +24,7 @@ pub(crate) unsafe fn start_offline_detector_impl(
         Ok(running) => {
             let ctx = &mut *(ctx_ptr as *mut SafeContext);
             {
-                let guard = crate::ctx_mut(ctx);
+                let guard = ctx.get_mut().unwrap();
                 let boxed = Box::new(running);
                 let handle = super::handle::put(Box::into_raw(boxed) as *mut c_void);
                 guard.offline_detector_handle = handle;
@@ -56,7 +56,7 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
     let name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
 
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    let guard = crate::ctx_mut(ctx);
+    let guard = ctx.get_mut().unwrap();
     // 重复启动时先停止旧调度器
     if guard.heartbeat_scheduler != 0 {
         let boxed = Box::from_raw(super::handle::get(guard.heartbeat_scheduler)
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
     let n = from_cstr(name).to_string();
     let d = from_cstr(device_type).to_string();
     let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    let guard = crate::ctx_mut(ctx);
+    let guard = ctx.get_mut().unwrap();
     if let Some(ref mut b) = guard.broadcast_info {
         if !n.is_empty() {
             b.name_b64 = base64::engine::general_purpose::STANDARD.encode(n.as_bytes());
