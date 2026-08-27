@@ -86,6 +86,8 @@ pub struct CoreContext {
     pub local_uuid: String,
     /// 库内设备行缓存（供 get_device_list 名称/IP 展示）
     pub persisted_devices: std::collections::HashMap<String, persistence::PersistedDevice>,
+    /// 持久化库路径覆盖（测试隔离用：每个测试注入独立库文件；生产为 None）
+    db_override: Option<std::path::PathBuf>,
 }
 
 pub struct PairingContext {
@@ -143,7 +145,32 @@ impl CoreContext {
             persistence_activated: false,
             local_uuid: String::new(),
             persisted_devices: HashMap::new(),
+            db_override: None,
         }
+    }
+
+    /// 指定持久化库路径构造（测试隔离用：每个测试注入独立库文件）
+    pub fn with_db_override(path: std::path::PathBuf) -> Self {
+        let mut c = Self::new();
+        c.db_override = Some(path);
+        c
+    }
+
+    fn open_persistence(&self) -> Option<persistence::Persistence> {
+        if let Some(p) = self.db_override.as_ref() {
+            return persistence::Persistence::open_at(p).ok();
+        }
+        persistence::Persistence::open().ok()
+    }
+
+    fn open_persistence_if_exists(&self) -> Option<persistence::Persistence> {
+        if let Some(p) = self.db_override.as_ref() {
+            if p.exists() {
+                return persistence::Persistence::open_at(p).ok();
+            }
+            return None;
+        }
+        persistence::Persistence::open_if_exists().ok().flatten()
     }
 }
 
@@ -154,8 +181,8 @@ impl CoreContext {
             return;
         }
         self.persistence_loaded = true;
-        match persistence::Persistence::open_if_exists() {
-            Ok(Some(p)) => {
+        match self.open_persistence_if_exists() {
+            Some(p) => {
                 if let Err(e) = persistence::load_all(
                     &p,
                     &mut self.crypto,
@@ -168,11 +195,8 @@ impl CoreContext {
                 }
                 self.persistence = Some(p);
             }
-            Ok(None) => {
+            None => {
                 log::info!("持久化库不存在（全新安装），跳过加载");
-            }
-            Err(e) => {
-                log::warn!("持久化打开失败: {}", e);
             }
         }
     }
@@ -190,13 +214,13 @@ impl CoreContext {
         let p = if self.persistence.is_some() {
             self.persistence.as_ref().unwrap()
         } else {
-            match persistence::Persistence::open() {
-                Ok(p) => {
+            match self.open_persistence() {
+                Some(p) => {
                     self.persistence = Some(p);
                     self.persistence.as_ref().unwrap()
                 }
-                Err(e) => {
-                    log::warn!("持久化打开失败: {}", e);
+                None => {
+                    log::warn!("持久化打开失败: 无法生成本机 UUID");
                     return false;
                 }
             }
@@ -262,31 +286,20 @@ impl CoreContext {
     }
 
     /// 打开（创建）库并写入单个设备行（配对/改名等关键路径用）
-    /// 库尚不存在时仅置脏（由读取接口前 flush 创建库并落盘），避免测试/异常环境创建空库
+    /// 库尚不存在时立即创建写入：配对密钥不依赖「库已预先存在」；
+    /// 仅打开失败时为不阻塞配对流程降至 dirty（由后续读取前 flush 兜底）
     pub fn persist_device_row_now(&mut self, uuid: &str) {
-        if self.persistence.is_none() {
-            match persistence::Persistence::resolve_db_path() {
-                Ok(path) if path.exists() => {}
-                Ok(_) => {
-                    self.mark_persistence_dirty();
-                    return;
-                }
-                Err(_) => {
-                    self.mark_persistence_dirty();
-                    return;
-                }
-            }
-        }
         let p = if self.persistence.is_some() {
             self.persistence.as_ref().unwrap()
         } else {
-            match persistence::Persistence::open() {
-                Ok(p) => {
+            match self.open_persistence() {
+                Some(p) => {
                     self.persistence = Some(p);
                     self.persistence.as_ref().unwrap()
                 }
-                Err(e) => {
-                    log::warn!("持久化打开失败: {}", e);
+                None => {
+                    log::warn!("持久化打开失败，标记 dirty 稍后重试");
+                    self.mark_persistence_dirty();
                     return;
                 }
             }
@@ -324,10 +337,10 @@ impl CoreContext {
             return false;
         }
         if self.persistence.is_none() {
-            match persistence::Persistence::open() {
-                Ok(p) => self.persistence = Some(p),
-                Err(e) => {
-                    log::warn!("持久化打开失败: {}", e);
+            match self.open_persistence() {
+                Some(p) => self.persistence = Some(p),
+                None => {
+                    log::warn!("持久化打开失败，暂缓落盘");
                     return false;
                 }
             }

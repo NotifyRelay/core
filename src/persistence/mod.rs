@@ -136,8 +136,8 @@ impl Persistence {
         Self::open_at(&path).map(Some)
     }
 
-    /// 在指定路径打开库（测试/故障排查用）
-    fn open_at(path: &Path) -> Result<Self, String> {
+    /// 在指定路径打开库（测试/故障排查/覆盖路径用）
+    pub(crate) fn open_at(path: &Path) -> Result<Self, String> {
         Self::ensure_parent(path);
         let conn = Connection::open(path)
             .map_err(|e| format!("打开数据库失败 {}: {}", path.display(), e))?;

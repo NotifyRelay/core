@@ -68,6 +68,7 @@ pub unsafe extern "C" fn nrc_export_device_key(
 ) -> *mut c_char {
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         ctx.crypto
             .device_keys
             .get(uuid)
@@ -85,6 +86,7 @@ pub unsafe extern "C" fn nrc_export_device_key(
 #[no_mangle]
 pub extern "C" fn nrc_export_state(ctx_ptr: *mut c_void) -> *mut c_char {
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         let local_priv_pem = ctx
             .crypto
             .local_key

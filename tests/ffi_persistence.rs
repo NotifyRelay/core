@@ -180,6 +180,39 @@ fn test_persistence_full_flow() {
     drop(ctx3);
     drop(ctx4);
 
+    // ===== 专项：首次配对（库不存在）密钥即时落盘 =====
+    // 全新库 + generate + derive 后不做任何 flush/读取，直接“重启”即恢复密钥
+    cleanup(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let ctx_a = create_ctx();
+    assert_eq!(ffi::nrc_ecdh_generate_keypair(ctx_ptr(&ctx_a)), 0);
+    let ctx_peer2 = create_ctx();
+    ffi::nrc_ecdh_generate_keypair(ctx_ptr(&ctx_peer2));
+    let peer_pub2 = ffi::nrc_ecdh_get_public_key(ctx_ptr(&ctx_peer2));
+    let peer_pub2_str = unsafe { read_cstr(peer_pub2) };
+    unsafe { free_str(peer_pub2) };
+    assert_eq!(
+        unsafe {
+            ffi::nrc_ecdh_derive_shared_secret(
+                ctx_ptr(&ctx_a),
+                cstr("peer-fresh"),
+                cstr(&peer_pub2_str),
+            )
+        },
+        0
+    );
+    // 无任何中间调用：库不存在时配对行已直接落库
+    assert!(db.exists(), "首次配对应即时创建持久化库");
+    let ctx_b = create_ctx();
+    let key_json = unsafe { ffi::nrc_export_device_key(ctx_ptr(&ctx_b), cstr("peer-fresh")) };
+    let key_str = unsafe { read_cstr(key_json) };
+    unsafe { free_str(key_json) };
+    assert!(!key_str.is_empty(), "库不存在时配对密钥应即时落盘可恢复");
+    assert!(key_str.contains("peer-fresh") || key_str.contains("aes_key_b64"));
+    drop(ctx_a);
+    drop(ctx_b);
+    drop(ctx_peer2);
+
     // 清理临时库
     cleanup(&db);
     let _ = std::fs::remove_dir_all(&dir);
