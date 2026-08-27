@@ -208,7 +208,15 @@ fn test_persistence_full_flow() {
     let key_str = unsafe { read_cstr(key_json) };
     unsafe { free_str(key_json) };
     assert!(!key_str.is_empty(), "库不存在时配对密钥应即时落盘可恢复");
-    assert!(key_str.contains("peer-fresh") || key_str.contains("aes_key_b64"));
+    let key_json: serde_json::Value = serde_json::from_str(&key_str).unwrap_or_default();
+    let aes = key_json
+        .get("aes_key_b64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !aes.is_empty(),
+        "恢复的密钥行应包含有效 AES 密钥；(行 uuid=peer-fresh)"
+    );
     drop(ctx_a);
     drop(ctx_b);
     drop(ctx_peer2);
