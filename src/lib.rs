@@ -79,6 +79,9 @@ pub struct CoreContext {
     pub persistence_loaded: bool,
     /// 内存状态与库不一致（读取接口前自动落盘）
     pub persistence_dirty: bool,
+    /// 持久化已激活（平台端已确认身份来源：get_local_uuid / start_core / 广播）。
+    /// 未激活时自动落盘跳过，避免测试等非应用进程在默认路径创建库
+    pub persistence_activated: bool,
     /// 本机 UUID（库为准；平台 start_core/广播时同步）
     pub local_uuid: String,
     /// 库内设备行缓存（供 get_device_list 名称/IP 展示）
@@ -137,6 +140,7 @@ impl CoreContext {
             persistence: None,
             persistence_loaded: false,
             persistence_dirty: false,
+            persistence_activated: false,
             local_uuid: String::new(),
             persisted_devices: HashMap::new(),
         }
@@ -175,6 +179,45 @@ impl CoreContext {
 
     pub fn mark_persistence_dirty(&mut self) {
         self.persistence_dirty = true;
+    }
+
+    /// 确保本机 UUID 就绪：库有则用库值；无则 Rust 生成 v4 UUID 并落库
+    /// （平台端不再生成 UUID，仅读取，减少数据流动）
+    pub fn ensure_local_uuid(&mut self) -> bool {
+        if !self.local_uuid.is_empty() {
+            return true;
+        }
+        let p = if self.persistence.is_some() {
+            self.persistence.as_ref().unwrap()
+        } else {
+            match persistence::Persistence::open() {
+                Ok(p) => {
+                    self.persistence = Some(p);
+                    self.persistence.as_ref().unwrap()
+                }
+                Err(e) => {
+                    log::warn!("持久化打开失败: {}", e);
+                    return false;
+                }
+            }
+        };
+        match p.get_local_uuid() {
+            Some(u) if !u.is_empty() => {
+                self.local_uuid = u;
+                true
+            }
+            _ => {
+                let new_uuid = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = p.save_local_uuid(&new_uuid) {
+                    log::error!("保存本机 UUID 失败: {}", e);
+                    return false;
+                }
+                self.local_uuid = new_uuid;
+                // 已生成新 uuid，状态加密密钥随之变化，需要重新落盘
+                self.persistence_dirty = true;
+                true
+            }
+        }
     }
 
     /// 组装库内设备行（密钥来自 crypto，名称/IP 来自库缓存与运行时注册表）
@@ -266,16 +309,19 @@ impl CoreContext {
         }
     }
 
-    /// 读取接口前的自动落盘：dirty 时打开库并写入 uuid/state/设备行
-    /// 注意：本机 uuid 尚未由平台端提供（start_core/广播前）时不落盘，
-    /// 避免测试等非应用进程在默认路径创建空库
+    /// 读取接口前的自动落盘：dirty 且持久化已激活时打开库并写入 uuid/state/设备行
+    /// 本机 UUID 由 Rust 生成/持有（ensure_local_uuid），平台端仅读取
     pub fn flush_persistence(&mut self) -> bool {
         if !self.persistence_dirty {
             return true;
         }
-        if self.local_uuid.is_empty() {
-            log::debug!("本机 uuid 未设置，暂缓持久化落盘");
+        if !self.persistence_activated {
+            log::debug!("持久化未激活（平台端身份未确认），跳过自动落盘");
             return true;
+        }
+        if !self.ensure_local_uuid() {
+            log::warn!("本机 UUID 不可用，暂缓持久化落盘");
+            return false;
         }
         let p = if self.persistence.is_some() {
             self.persistence.as_ref().unwrap()

@@ -71,20 +71,11 @@ fn test_persistence_full_flow() {
     unsafe { free_str(pub1) };
     assert!(!pub1_str.is_empty());
 
-    // 本机信息（模拟 periodicBroadcast 写入本机 uuid/名称）
-    assert_eq!(
-        unsafe {
-            ffi::nrc_periodic_broadcast(
-                p1,
-                1,
-                cstr("local-test-uuid"),
-                cstr("测试机"),
-                -1,
-                cstr("android"),
-            )
-        },
-        0
-    );
+    // 本机 UUID 由 Rust 生成/持有：无平台侧注入，读取即自动生成并落库
+    let uuid = unsafe { ffi::nrc_get_local_uuid(p1) };
+    let uuid1 = unsafe { read_cstr(uuid) };
+    unsafe { free_str(uuid) };
+    assert!(!uuid1.is_empty(), "Rust 应自动生成本机 UUID");
 
     // 对端设备（peer-1）：先有名字（rename），再派生密钥（模拟迁移顺序）
     assert_eq!(
@@ -121,10 +112,10 @@ fn test_persistence_full_flow() {
         list_json
     );
 
-    // 本机 uuid 已落库（flush 时机已过）
-    let uuid = unsafe { ffi::nrc_get_local_uuid(p1) };
-    assert_eq!(unsafe { read_cstr(uuid) }, "local-test-uuid");
-    unsafe { free_str(uuid) };
+    // 读取幂等：再次获取的 UUID 与首次一致
+    let uuid_dup = unsafe { ffi::nrc_get_local_uuid(p1) };
+    assert_eq!(unsafe { read_cstr(uuid_dup) }, uuid1);
+    unsafe { free_str(uuid_dup) };
 
     // 库文件确实存在
     assert!(db.exists(), "持久化库未创建: {:?}", db);
@@ -134,7 +125,7 @@ fn test_persistence_full_flow() {
     let p2 = ctx_ptr(&ctx2);
     assert_eq!(ffi::nrc_ecdh_has_keypair(p2), 1, "重启后应恢复本机密钥对");
     let uuid2 = unsafe { ffi::nrc_get_local_uuid(p2) };
-    assert_eq!(unsafe { read_cstr(uuid2) }, "local-test-uuid");
+    assert_eq!(unsafe { read_cstr(uuid2) }, uuid1, "重启后 UUID 应稳定");
     unsafe { free_str(uuid2) };
     let list2 = unsafe { ffi::nrc_get_device_list(p2, 30_000, 10_000) };
     let list2_json = unsafe { read_cstr(list2) };
