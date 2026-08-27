@@ -23,9 +23,13 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
         return -1;
     }
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         ctx.crypto
             .set_device_key(uuid.to_string(), String::new(), b64);
+        // 迁移导入的密钥：立即落库
+        ctx.mark_persistence_dirty();
+        ctx.persist_device_row_now(&uuid);
         0
     })
 }
@@ -37,8 +41,16 @@ pub unsafe extern "C" fn nrc_remove_device(
 ) -> i32 {
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         ctx.crypto.device_keys.remove(uuid);
         ctx.registry.remove(uuid);
+        ctx.persisted_devices.remove(uuid);
+        ctx.mark_persistence_dirty();
+        if let Some(p) = ctx.persistence.as_ref() {
+            if let Err(e) = p.delete_device(uuid) {
+                log::error!("从持久化库删除设备失败 {}: {}", uuid, e);
+            }
+        }
         0
     })
 }
@@ -88,27 +100,11 @@ pub extern "C" fn nrc_export_state(ctx_ptr: *mut c_void) -> *mut c_char {
 pub unsafe extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_char) -> i32 {
     let json_str = from_cstr(json);
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         match serde_json::from_str::<crypto::KeyStoreData>(json_str) {
             Ok(data) => {
-                if let Some(ref pem) = data.local_private_key_pem {
-                    ctx.crypto.local_key = ecdh::secret_from_pem(pem).ok();
-                }
-                ctx.crypto.local_pub_key_b64 = data.local_public_key_b64;
-                let mut device_keys = data.devices;
-                for entry in device_keys.values_mut() {
-                    if entry.aes_key_bytes.is_none() {
-                        if let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64)
-                        {
-                            if bytes.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&bytes);
-                                entry.aes_key_bytes = Some(arr);
-                            }
-                        }
-                    }
-                }
-                ctx.crypto.device_keys = device_keys;
+                crate::persistence::apply_keystore_data(&mut ctx.crypto, &data);
+                ctx.mark_persistence_dirty();
                 0
             }
             Err(e) => {

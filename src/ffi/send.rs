@@ -433,7 +433,9 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                 battery,
                 device_type: d,
             });
-            // 同步本机 uuid 到 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
+            // 同步本机 uuid 到持久化与 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
+            guard.local_uuid = local_uuid.clone();
+            guard.mark_persistence_dirty();
             crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
 
             if guard.broadcast_handle.is_some() {
