@@ -73,9 +73,22 @@ where
         return R::default();
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    match ctx.get_mut() {
+    // panic 跨 extern "C" 边界会导致 SIGABRT（真机已证实：device list 刷新路径）。
+    // 捕获并记录 panic 详情（消息/位置），不再终止进程；返回值与「无效上下文」同语义
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ctx.get_mut() {
         Ok(g) => f(g),
         Err(_) => R::default(),
+    })) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic payload");
+            log::error!("FFI 调用发生 panic（已捕获，进程不崩溃）：{}", msg);
+            R::default()
+        }
     }
 }
 
