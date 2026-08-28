@@ -186,7 +186,7 @@ impl StateMerge {
         device_uuid: &str,
         is_media: bool,
         payload: &str,
-    ) -> Option<(String, String, bool)> {
+    ) -> Option<(String, String, bool, bool)> {
         let v: Value = serde_json::from_str(payload).ok()?;
         let feature_id = if is_media {
             MEDIA_KEY.to_string()
@@ -203,6 +203,7 @@ impl StateMerge {
         let is_end = v.get("terminateValue").and_then(|x| x.as_str()) == Some("__END__")
             || v.get("terminate").and_then(|x| x.as_bool()) == Some(true);
 
+        let mut need_full = false;
         let new_full = if v.get("type").and_then(|x| x.as_str()) == Some("delta") {
             let changes = v.get("changes").cloned().unwrap_or(Value::Null);
             let base = self.receivers.get(&key).map(|r| r.last_full.clone());
@@ -214,10 +215,12 @@ impl StateMerge {
             if has_base {
                 merged
             } else {
+                need_full = true;
                 fill_empty_fields(&merged)
             }
         } else {
             let stripped = strip_routing(&v);
+            need_full = true;
             fill_empty_fields(&stripped)
         };
 
@@ -231,7 +234,7 @@ impl StateMerge {
                 },
             );
         }
-        Some((feature_id, new_full, is_end))
+        Some((feature_id, new_full, is_end, need_full))
     }
 
     /// 处理来自接收端的 ACK，清除对应发送会话的 pending。
@@ -542,7 +545,7 @@ pub fn handle_state_message(
         }
         return true;
     }
-    let (fid, full, is_end) = {
+    let (fid, full, is_end, need_full) = {
         let g = ctx.get_mut().unwrap();
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
             Some(r) => r,
@@ -588,6 +591,27 @@ pub fn handle_state_message(
                     coalesce_key: None,
                 };
                 q.enqueue(item);
+            }
+        }
+    }
+    // 无前文时立即请求全量
+    if need_full {
+        let (cb, ud) = {
+            let g = ctx.get_mut().unwrap();
+            (g.router.on_state_query, g.router.user_data)
+        };
+        if let Some(cb_fn) = cb {
+            let uuid_c = CString::new(uuid).unwrap_or_default();
+            let fid_c = CString::new(fid.clone()).unwrap_or_default();
+            let code = cb_fn(uuid_c.as_ptr(), fid_c.as_ptr(), is_media as i32, ud);
+            // code 2 表示存在有变更，平台会推送全量；其他情况也标记需要全量
+            if code != 2 {
+                log::debug!(
+                    "[state_merge] 无前文请求全量 uuid={} fid={} code={}",
+                    uuid,
+                    fid,
+                    code
+                );
             }
         }
     }
@@ -679,7 +703,7 @@ mod tests {
         let full1 = si_full("t1", "c1");
         let merged1 = {
             let mut r = StateMerge::new();
-            let (_, f, _) = r
+            let (_, f, _, _) = r
                 .merge_incoming(
                     "devA",
                     false,
