@@ -244,6 +244,65 @@ fn test_persistence_full_flow() {
     assert!(!pub_c_str.is_empty(), "重建库密钥对正常可使用");
     drop(ctx_c);
 
+    // ===== 专项：删除残留 pending 不得误删重新配对的行 =====
+    // 场景：未激活时 remove（flush 跳过返回 0，pending 残留）→ 同一 uuid 重新配对 →
+    // 激活 flush：行必须保留（persist_device_row_now 撤销 pending 删除意图），
+    // 否则 flush_all「先写行后执行 pending DELETE」会把新配对行删掉、state 残留密钥
+    cleanup(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let ctx_d = create_ctx();
+    let pd = ctx_ptr(&ctx_d);
+    // 激活并生成 uuid + 首次配对 peer-repair（行落库）
+    assert!(!unsafe { read_cstr(ffi::nrc_get_local_uuid(pd)) }.is_empty());
+    let ctx_peer3 = create_ctx();
+    ffi::nrc_ecdh_generate_keypair(ctx_ptr(&ctx_peer3));
+    let peer_pub3 = ffi::nrc_ecdh_get_public_key(ctx_ptr(&ctx_peer3));
+    let peer_pub3_str = unsafe { read_cstr(peer_pub3) };
+    unsafe { free_str(peer_pub3) };
+    assert_eq!(
+        unsafe {
+            ffi::nrc_ecdh_derive_shared_secret(pd, cstr("peer-repair"), cstr(&peer_pub3_str))
+        },
+        0
+    );
+    drop(ctx_d);
+    drop(ctx_peer3);
+
+    // 新 ctx 未激活（不调用 get_local_uuid）：删除 → flush 跳过 → pending 残留
+    let ctx_e = create_ctx();
+    let pe = ctx_ptr(&ctx_e);
+    assert_eq!(
+        unsafe { ffi::nrc_remove_device(pe, cstr("peer-repair")) },
+        0
+    );
+    // 同一 uuid 重新配对（pending 应被撤销）
+    let ctx_peer4 = create_ctx();
+    ffi::nrc_ecdh_generate_keypair(ctx_ptr(&ctx_peer4));
+    let peer_pub4 = ffi::nrc_ecdh_get_public_key(ctx_ptr(&ctx_peer4));
+    let peer_pub4_str = unsafe { read_cstr(peer_pub4) };
+    unsafe { free_str(peer_pub4) };
+    assert_eq!(
+        unsafe {
+            ffi::nrc_ecdh_derive_shared_secret(pe, cstr("peer-repair"), cstr(&peer_pub4_str))
+        },
+        0
+    );
+    // 激活并 flush（pending 若未撤销，此处会把 peer-repair 行删除）
+    assert!(!unsafe { read_cstr(ffi::nrc_get_local_uuid(pe)) }.is_empty());
+    drop(ctx_e);
+    drop(ctx_peer4);
+
+    // 重启：peer-repair 必须仍在（paired），验证删除意图已被撤销
+    let ctx_f = create_ctx();
+    let key_json = unsafe { ffi::nrc_export_device_key(ctx_ptr(&ctx_f), cstr("peer-repair")) };
+    let key_str = unsafe { read_cstr(key_json) };
+    unsafe { free_str(key_json) };
+    assert!(
+        !key_str.is_empty(),
+        "删除后重新配对的设备不得被残留 pending 误删（重启后密钥应恢复）"
+    );
+    drop(ctx_f);
+
     // 清理临时库
     cleanup(&db);
     let _ = std::fs::remove_dir_all(&dir);

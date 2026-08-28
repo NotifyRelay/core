@@ -69,17 +69,27 @@ where
     F: FnOnce(&mut CoreContext) -> R,
     R: Default,
 {
+    with_ctx_or(ctx_ptr, R::default(), f)
+}
+
+/// 与 with_ctx 相同，但失败（空上下文/锁中毒/panic）时返回调用方指定的值。
+/// 用于失败语义必须与成功区分的关键接口（如删除设备），避免默认值（0=成功）误导平台端
+pub fn with_ctx_or<F, R>(ctx_ptr: *mut c_void, or: R, f: F) -> R
+where
+    F: FnOnce(&mut CoreContext) -> R,
+{
     if ctx_ptr.is_null() {
-        return R::default();
+        return or;
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
     // panic 跨 extern "C" 边界会导致 SIGABRT（真机已证实：device list 刷新路径）。
     // 捕获并记录 panic 详情（消息/位置），不再终止进程；返回值与「无效上下文」同语义
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ctx.get_mut() {
-        Ok(g) => f(g),
-        Err(_) => R::default(),
+        Ok(g) => Some(f(g)),
+        Err(_) => None,
     })) {
-        Ok(r) => r,
+        Ok(Some(r)) => r,
+        Ok(None) => or,
         Err(payload) => {
             let msg = payload
                 .downcast_ref::<&str>()
@@ -87,7 +97,7 @@ where
                 .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
                 .unwrap_or("unknown panic payload");
             log::error!("FFI 调用发生 panic（已捕获，进程不崩溃）：{}", msg);
-            R::default()
+            or
         }
     }
 }

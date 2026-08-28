@@ -5,7 +5,7 @@ use base64::Engine;
 
 use crate::crypto::{self, aes, ecdh, hkdf};
 
-use super::common::{from_cstr, to_cstr, with_ctx};
+use super::common::{from_cstr, to_cstr, with_ctx, with_ctx_or};
 
 #[no_mangle]
 pub unsafe extern "C" fn nrc_migrate_shared_secret(
@@ -22,7 +22,7 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
     if key_bytes.len() != 32 {
         return -1;
     }
-    with_ctx(ctx_ptr, |ctx| {
+    with_ctx_or(ctx_ptr, -1, |ctx| {
         ctx.ensure_persistence_loaded();
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         ctx.crypto
@@ -42,7 +42,7 @@ pub unsafe extern "C" fn nrc_remove_device(
     device_uuid: *const c_char,
 ) -> i32 {
     let uuid = from_cstr(device_uuid);
-    with_ctx(ctx_ptr, |ctx| {
+    with_ctx_or(ctx_ptr, -1, |ctx| {
         ctx.ensure_persistence_loaded();
         // 先从内存移除：保持内存与意图一致
         ctx.crypto.device_keys.remove(uuid);

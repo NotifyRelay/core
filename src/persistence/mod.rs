@@ -459,15 +459,6 @@ impl Persistence {
         Ok(())
     }
 
-    pub fn delete_device(&self, uuid: &str) -> Result<(), String> {
-        self.db
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execute("DELETE FROM devices WHERE uuid = ?1", [uuid])
-            .map_err(|e| format!("删除设备失败: {}", e))?;
-        Ok(())
-    }
-
     /// 单事务写入全部落盘内容（uuid/state/设备行/墓碑清理/待删除设备），失败整体回滚
     /// 保证 state 与设备密钥行要么同时生效要么都不生效，
     /// 避免「state 已写/行未写」或「行已写/state 未写」的中间态在重启时

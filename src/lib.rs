@@ -201,18 +201,20 @@ impl CoreContext {
         // 文件存在：尝试打开，失败不标记（下次重试，应对临时权限/锁问题）
         match self.open_persistence_if_exists() {
             Some(p) => {
-                self.persistence_loaded = true;
                 if let Err(e) = persistence::load_all(
                     &p,
                     &mut self.crypto,
                     &mut self.persisted_devices,
                     &mut self.local_uuid,
                 ) {
-                    log::error!("持久化加载失败: {}", e);
-                } else {
-                    log::info!("持久化加载完成 uuid={}", self.local_uuid);
+                    // 加载失败（如设备行查询失败）：不置 loaded、不保留连接，下次重试。
+                    // 否则后续 flush 的墓碑清理会以「内存缺失」误删库中全部设备行
+                    log::error!("持久化加载失败，将在下次调用时重试: {}", e);
+                    return;
                 }
+                log::info!("持久化加载完成 uuid={}", self.local_uuid);
                 self.persistence = Some(p);
+                self.persistence_loaded = true;
             }
             None => {
                 // 文件存在但打开失败：不标记 persistence_loaded，下次重试
@@ -231,20 +233,16 @@ impl CoreContext {
         if !self.local_uuid.is_empty() {
             return true;
         }
-        let p = if self.persistence.is_some() {
-            self.persistence.as_ref().unwrap()
-        } else {
+        if self.persistence.is_none() {
             match self.open_persistence() {
-                Some(p) => {
-                    self.persistence = Some(p);
-                    self.persistence.as_ref().unwrap()
-                }
+                Some(p) => self.persistence = Some(p),
                 None => {
                     log::warn!("持久化打开失败: 无法生成本机 UUID");
                     return false;
                 }
             }
-        };
+        }
+        let p = self.persistence.as_ref().unwrap();
         match p.get_local_uuid() {
             Some(u) if !u.is_empty() => {
                 self.local_uuid = u;
@@ -309,21 +307,20 @@ impl CoreContext {
     /// 库尚不存在时立即创建写入：配对密钥不依赖「库已预先存在」；
     /// 仅打开失败时为不阻塞配对流程降至 dirty（由后续读取前 flush 兜底）
     pub fn persist_device_row_now(&mut self, uuid: &str) -> bool {
-        let p = if self.persistence.is_some() {
-            self.persistence.as_ref().unwrap()
-        } else {
+        // 重新写行即撤销该 uuid 的待删除意图：删除失败残留的 pending 不得
+        // 在后续 flush 中把「重新配对/改名」的新行删掉（否则 state 有密钥而行缺失）
+        self.pending_device_deletions.retain(|u| u != uuid);
+        if self.persistence.is_none() {
             match self.open_persistence() {
-                Some(p) => {
-                    self.persistence = Some(p);
-                    self.persistence.as_ref().unwrap()
-                }
+                Some(p) => self.persistence = Some(p),
                 None => {
                     log::warn!("持久化打开失败，标记 dirty 稍后重试");
                     self.mark_persistence_dirty();
                     return false;
                 }
             }
-        };
+        }
+        let p = self.persistence.as_ref().unwrap();
         let dev = self.build_device_row(uuid);
         let has_key = self.crypto.device_keys.contains_key(uuid);
         if let Err(e) = p.upsert_device_row(&dev, has_key) {
@@ -367,12 +364,15 @@ impl CoreContext {
             }
         }
         // ——只读收集（不持有持久化可变借用）——
-        let encrypted_state = persistence::encrypt_state(&self.crypto, &self.local_uuid)
-            .map(Some)
-            .unwrap_or_else(|e| {
-                log::error!("加密密钥状态失败: {}", e);
-                None
-            });
+        // 加密失败即中止本次落盘（保留 dirty/pending 待重试）：
+        // 若跳过 state 仅提交行/删除，库中残留的旧 state 会在重启后回灌已删设备密钥
+        let encrypted_state = match persistence::encrypt_state(&self.crypto, &self.local_uuid) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::error!("加密密钥状态失败（中止落盘，等待重试）: {}", e);
+                return false;
+            }
+        };
         let mut uuids: Vec<String> = self.crypto.device_keys.keys().cloned().collect();
         uuids.extend(self.persisted_devices.keys().cloned());
         uuids.sort();
@@ -388,7 +388,9 @@ impl CoreContext {
             .collect();
         // 墓碑清理：库中残留但内存已无的设备行（删除未直删成功/异常时兜底，
         // 防止重启后 load_all 把行内密钥回灌导致设备“复活”）
-        let tombstones: Vec<String> = {
+        // 仅在库内容已成功加载（persistence_loaded）时执行：
+        // 加载失败时内存态不完整，误删风险高于残留风险
+        let tombstones: Vec<String> = if self.persistence_loaded {
             let p = self.persistence.as_ref().unwrap();
             p.load_device_rows()
                 .ok()
@@ -402,6 +404,8 @@ impl CoreContext {
                         .collect()
                 })
                 .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         // ——单事务原子写入：state 与设备行要么同时生效要么同时回滚，
         // 避免中间态导致重启后加载旧密钥而忽略更新的设备行——
