@@ -325,6 +325,7 @@ impl CoreContext {
         let has_key = self.crypto.device_keys.contains_key(uuid);
         if let Err(e) = p.upsert_device_row(&dev, has_key) {
             log::error!("持久化设备行失败 {}: {}", uuid, e);
+            self.mark_persistence_dirty();
             return false;
         }
         // 同步库缓存

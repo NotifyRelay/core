@@ -322,23 +322,42 @@ impl StateMerge {
                 }
                 1 => {
                     if let Some(s) = self.senders.get_mut(&key) {
-                        // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
-                        // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
-                        // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
-                        let keepalive = build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
                         let header = if s.is_media {
                             "DATA_MEDIAPLAY"
                         } else {
                             "DATA_SUPERISLAND"
                         };
-                        queue.enqueue(SendItem {
-                            device_uuid: s.device_uuid.clone(),
-                            header: header.to_string(),
-                            plaintext: keepalive,
-                            dedup_key: None,
-                            retries_left: 0,
-                            coalesce_key: None,
-                        });
+                        if s.force_full_next {
+                            // ACK 超时后接收端需要重新建立基线：用 last_full 发送 FULL
+                            let full_val: Value = serde_json::from_str(&s.last_full)
+                                .unwrap_or(Value::Object(Map::new()));
+                            let full_wire =
+                                build_full_wire(&full_val, &s.feature_id, &s.last_hash, false);
+                            queue.enqueue(SendItem {
+                                device_uuid: s.device_uuid.clone(),
+                                header: header.to_string(),
+                                plaintext: full_wire,
+                                dedup_key: None,
+                                retries_left: 0,
+                                coalesce_key: None,
+                            });
+                            s.force_full_next = false;
+                            s.pending_ack = Some((s.last_hash.clone(), Instant::now()));
+                        } else {
+                            // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
+                            // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
+                            // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
+                            let keepalive =
+                                build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
+                            queue.enqueue(SendItem {
+                                device_uuid: s.device_uuid.clone(),
+                                header: header.to_string(),
+                                plaintext: keepalive,
+                                dedup_key: None,
+                                retries_left: 0,
+                                coalesce_key: None,
+                            });
+                        }
                         // 保活周期基于上次真实发送：入队成功才重置，
                         // 事件推送同样会重置，避免固定周期导致的快速触发
                         s.last_push = Instant::now();
@@ -796,6 +815,14 @@ mod tests {
         let mut sm = StateMerge::new();
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         q.test_drain_plaintexts();
+        // 模拟已收到 ACK：清除 pending_ack，避免 ACK 超时干扰保活测试
+        {
+            let s = sm
+                .senders
+                .get_mut(&StateMerge::key("devA", "test-sbn-key"))
+                .unwrap();
+            s.pending_ack = None;
+        }
         // 存在无变更 → 空差量保活包入队（接收端据此刷新时间戳，防"突然消失"）
         let queries = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries.len(), 1);
@@ -830,5 +857,49 @@ mod tests {
         assert!(sm
             .heartbeat_tick(Instant::now() + Duration::from_secs(31))
             .is_empty());
+    }
+
+    #[test]
+    fn test_ack_timeout_query_result_1_sends_full() {
+        // 场景：首次推送后接收端未回 ACK → ACK 超时标记 force_full_next →
+        // 心跳查询结果为 1（存在无变更）→ 应发送 FULL 而非空 DELTA
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        // 首次推送 FULL
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        q.test_drain_plaintexts();
+
+        // 模拟 ACK 超时：将 pending_ack 时间设为足够旧
+        {
+            let s = sm
+                .senders
+                .get_mut(&StateMerge::key("devA", "test-sbn-key"))
+                .unwrap();
+            s.pending_ack = Some((
+                s.last_hash.clone(),
+                Instant::now() - Duration::from_secs(10),
+            ));
+        }
+
+        // 心跳 tick：ACK 超时 → force_full_next = true
+        let later = Instant::now() + Duration::from_secs(31);
+        let queries = sm.heartbeat_tick(later);
+        assert_eq!(queries.len(), 1);
+
+        // 查询结果为 1（存在无变更）→ 应发送 FULL（因为 force_full_next）
+        sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 1)]);
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 1);
+        // 验证发送的是 FULL 而非 delta
+        assert!(items[0].contains("\"type\":\"SUPERISLAND\""));
+        assert!(!items[0].contains("\"type\":\"delta\""));
+        // 验证 force_full_next 已消费
+        let s = sm
+            .senders
+            .get(&StateMerge::key("devA", "test-sbn-key"))
+            .unwrap();
+        assert!(!s.force_full_next);
+        // 验证 pending_ack 已重新建立
+        assert!(s.pending_ack.is_some());
     }
 }

@@ -137,23 +137,31 @@ impl Persistence {
     }
 
     /// 在指定路径打开库（测试/故障排查/覆盖路径用）
-    /// 损坏库自愈：quick_check 失败（或写后报 malformed/locked 的已知模式）时，
-    /// 抢救可读的设备行 → 备份原库文件 → 重建空库并回灌设备行
+    /// 损坏库自愈：quick_check 明确报告损坏时，抢救可读的设备行 → 备份原库文件 → 重建空库并回灌设备行。
+    /// SQLITE_BUSY / 权限 / 暂时性 I/O 错误返回 Err，不触发重建。
     pub(crate) fn open_at(path: &Path) -> Result<Self, String> {
         Self::ensure_parent(path);
-        match Self::open_existing_or_create(path) {
-            Ok(conn) if Self::db_is_healthy(&conn) => {
+        let conn = Self::open_existing_or_create(path)?;
+        match Self::db_is_healthy(&conn) {
+            Ok(true) => {
                 return Ok(Self {
                     db: std::sync::Mutex::new(conn),
                 })
             }
-            Ok(conn) => drop(conn),
-            Err(_) => {}
+            Ok(false) => {
+                // 明确报告损坏：继续重建流程
+                drop(conn);
+            }
+            Err(e) => {
+                // 暂时性错误（SQLITE_BUSY 等）：不触发重建，透传错误
+                drop(conn);
+                return Err(e);
+            }
         }
 
         // ===== 损坏库重建 =====
         log::warn!(
-            "持久化库损坏检测（integrity_check 异常），执行自愈重建: {}",
+            "持久化库损坏检测（integrity_check 明确报告损坏），执行自愈重建: {}",
             path.display()
         );
         // 1. 抢救设备行（尽力而为）
@@ -189,11 +197,23 @@ impl Persistence {
         Ok(conn)
     }
 
-    /// 健康检查（损坏表/索引异常返回 false）
-    fn db_is_healthy(conn: &Connection) -> bool {
+    /// 健康检查：
+    /// - Ok(true)  → 健康
+    /// - Ok(false) → 明确报告损坏（应触发重建）
+    /// - Err(msg)  → 暂时性错误（SQLITE_BUSY 等），不应触发重建
+    fn db_is_healthy(conn: &Connection) -> Result<bool, String> {
         match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
-            Ok(v) => v.eq_ignore_ascii_case("ok"),
-            Err(_) => false,
+            Ok(v) => Ok(v.eq_ignore_ascii_case("ok")),
+            Err(e) => {
+                let msg = e.to_string();
+                // SQLITE_BUSY / 暂时性 I/O 错误：不视为损坏
+                if msg.contains("busy") || msg.contains("locked") || msg.contains("interrupt") {
+                    Err(format!("健康检查暂时不可用: {}", e))
+                } else {
+                    // 其他错误（如 malformed）视为损坏
+                    Ok(false)
+                }
+            }
         }
     }
 

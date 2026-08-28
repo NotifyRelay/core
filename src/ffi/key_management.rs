@@ -27,9 +27,9 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         ctx.crypto
             .set_device_key(uuid.to_string(), String::new(), b64);
-        // 迁移导入的密钥：立即落库
+        // 迁移导入的密钥：通过 flush_persistence 原子持久化（state + 设备行同一事务）
         ctx.mark_persistence_dirty();
-        if !ctx.persist_device_row_now(&uuid) {
+        if !ctx.flush_persistence() {
             return -1;
         }
         0
