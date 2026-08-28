@@ -93,6 +93,7 @@ impl HeartbeatHandle {
         ip: &str,
         interval_ms: u64,
         _mode: i32,
+        network_state: Arc<Mutex<crate::network::TcpServerState>>,
     ) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
@@ -107,6 +108,7 @@ impl HeartbeatHandle {
 
         let r = running.clone();
         let p = params.clone();
+        let net = network_state.clone();
 
         thread::Builder::new()
             .name("heartbeat-sender".to_string())
@@ -139,12 +141,30 @@ impl HeartbeatHandle {
                         continue;
                     }
 
-                    // TCP 备用心跳：定向发送到目标设备（广播主用模式下本线程不会被启动）
+                    // TCP 备用心跳：优先通过已有会话发送，无会话时 oneshot
                     let msg =
                         codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
                     let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                    let sent = if !ip_str.is_empty() {
-                        network::oneshot_send_only(&msg, &ip_str, port, 3000)
+                    let sent = if let Ok(mut tcp) = net.lock() {
+                        match tcp.send_through_session(&uuid, &msg) {
+                            Ok(true) => true, // 通过已有会话发送成功
+                            Ok(false) => {
+                                // 无已有会话，fallback 到 oneshot
+                                if !ip_str.is_empty() {
+                                    network::oneshot_send_only(&msg, &ip_str, port, 3000)
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(()) => {
+                                // 会话写入失败（已移除），fallback 到 oneshot
+                                if !ip_str.is_empty() {
+                                    network::oneshot_send_only(&msg, &ip_str, port, 3000)
+                                } else {
+                                    false
+                                }
+                            }
+                        }
                     } else {
                         false
                     };
@@ -356,6 +376,7 @@ impl HeartbeatScheduler {
                             ip,
                             interval_ms,
                             HEARTBEAT_MODE_TCP,
+                            guard.network.tcp.clone(),
                         ) {
                             Ok(h) => {
                                 log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);

@@ -72,6 +72,23 @@ impl TcpServerState {
         }
     }
 
+    /// 通过已有 TCP 会话发送二进制帧（优先复用连接）
+    /// 返回 Ok(true) 表示通过已有会话发送，Ok(false) 表示会话不存在（需 fallback）
+    pub fn send_through_session(&mut self, uuid: &str, data: &[u8]) -> Result<bool, ()> {
+        if let Some(session) = self.sessions.get_mut(uuid) {
+            match binary_codec::write_frame(&mut session.stream, data[0], &data[5..]) {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    log::warn!("通过已有会话发送失败 uuid={}, error={}, 移除会话", uuid, e);
+                    self.sessions.remove(uuid);
+                    Err(())
+                }
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
     /// 广播二进制帧到所有连接的设备
     pub fn broadcast(&mut self, data: &[u8]) {
         let uuids: Vec<String> = self.sessions.keys().cloned().collect();
