@@ -219,9 +219,7 @@ impl StateMerge {
                 fill_empty_fields(&merged)
             }
         } else {
-            let stripped = strip_routing(&v);
-            need_full = true;
-            fill_empty_fields(&stripped)
+            strip_routing(&v)
         };
 
         if is_end {
