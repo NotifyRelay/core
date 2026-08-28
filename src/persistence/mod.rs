@@ -197,37 +197,73 @@ impl Persistence {
         }
     }
 
-    /// 尽力读取设备行（损坏表可读部分）
+    /// 尽力读取设备行（损坏表可读部分）；单行列读取失败时跳过该行继续
     fn drain_device_rows(path: &Path) -> Vec<PersistedDevice> {
         let Ok(conn) =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         else {
             return Vec::new();
         };
-        conn.prepare(
+        let Ok(mut stmt) = conn.prepare(
             "SELECT uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt
              FROM devices",
-        )
-        .ok()
-        .and_then(|mut stmt| {
-            let mut rows = Vec::new();
-            let mut q = stmt.query([]).ok()?;
-            while let Some(r) = q.next().ok()? {
-                rows.push(PersistedDevice::from_row(
-                    r.get(0).ok()?,
-                    r.get(1).ok()?,
-                    r.get(2).ok()?,
-                    r.get::<_, i32>(3).ok()? != 0,
-                    r.get(4).ok()?,
-                    r.get(5).ok()?,
-                    r.get(6).ok()?,
-                    r.get(7).ok()?,
-                    r.get(8).ok()?,
-                ));
-            }
-            Some(rows)
-        })
-        .unwrap_or_default()
+        ) else {
+            return Vec::new();
+        };
+        let Ok(mut q) = stmt.query([]) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        while let Ok(Some(r)) = q.next() {
+            let uuid: String = match r.get(0) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let public_key: String = match r.get(1) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let shared_secret: String = match r.get(2) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let is_accepted: bool = match r.get::<_, i32>(3) {
+                Ok(v) => v != 0,
+                Err(_) => continue,
+            };
+            let display_name: String = match r.get(4) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let last_ip: String = match r.get(5) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let last_port: i64 = match r.get(6) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let created_at: i64 = match r.get(7) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let updated_at: i64 = match r.get(8) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            rows.push(PersistedDevice::from_row(
+                uuid,
+                public_key,
+                shared_secret,
+                is_accepted,
+                display_name,
+                last_ip,
+                last_port,
+                created_at,
+                updated_at,
+            ));
+        }
+        rows
     }
 
     fn corrupt_backup_path(path: &Path) -> std::path::PathBuf {

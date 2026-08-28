@@ -215,16 +215,33 @@ impl StateMerge {
             if has_base {
                 merged
             } else {
+                // 无前文基线：不建立合并基线，请求发送端重发 FULL
                 need_full = true;
                 fill_empty_fields(&merged)
             }
         } else {
-            strip_routing(&v)
+            let stripped = strip_routing(&v);
+            // FULL 消息：检查是否包含恢复所需的基本字段
+            if let Ok(full_val) = serde_json::from_str::<Value>(&stripped) {
+                let has_title = full_val
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                let has_text = full_val
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if !has_title && !has_text {
+                    need_full = true;
+                }
+            }
+            stripped
         };
 
         if is_end {
             self.receivers.remove(&key);
-        } else {
+        } else if !need_full {
+            // 仅在拥有可靠基线（FULL 或有基线的 DELTA 合并结果）时才写入
             self.receivers.insert(
                 key.clone(),
                 ReceiverState {
