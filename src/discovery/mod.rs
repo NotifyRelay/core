@@ -133,7 +133,7 @@ impl DiscoveryState {
                             &dt,
                         );
 
-                        let resp = network::oneshot_send_receive(
+                        let resp = network::oneshot_send_receive_bin(
                             &handshake,
                             &ip,
                             codec::DEFAULT_TCP_PORT,

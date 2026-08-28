@@ -210,7 +210,7 @@ impl ReconnectState {
                             )
                         };
 
-                        let resp = crate::network::oneshot_send_receive(
+                        let resp = crate::network::oneshot_send_receive_bin(
                             &handshake_msg,
                             &ip,
                             codec::DEFAULT_TCP_PORT,

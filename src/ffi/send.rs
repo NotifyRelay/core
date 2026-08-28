@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
@@ -18,12 +18,11 @@ use crate::{
 use super::common::{encode_name_b64, from_cstr, with_ctx};
 
 /// 通过已建立的 TCP 会话发送消息
-pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, line: &str) -> bool {
-    let data = format!("{}\n", line);
+pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, data: &[u8]) -> bool {
     match ctx.network.tcp.lock() {
         Ok(mut tcp) => {
             if let Some(session) = tcp.sessions.get_mut(uuid) {
-                if let Err(e) = session.stream.write_all(data.as_bytes()) {
+                if let Err(e) = session.stream.write_all(data) {
                     log::error!("发送消息失败 uuid={}, error={}", uuid, e);
                     false
                 } else {
@@ -46,12 +45,12 @@ fn oneshot_send_and_process(
     ctx: &mut crate::SafeContext,
     ip: &str,
     port: u16,
-    payload: &str,
+    payload: &[u8],
 ) -> i32 {
-    let resp = crate::network::oneshot_send_receive(payload, ip, port, 5000);
+    let resp = crate::network::oneshot_send_receive_bin(payload, ip, port, 5000);
     match resp {
-        Some(line) => {
-            super::processing::process_line(ctx, &line);
+        Some((msg_type, payload)) => {
+            super::processing::process_frame(ctx, msg_type, &payload);
             0
         }
         None => {
@@ -186,10 +185,7 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
     {
         let mut writer = &stream;
-        if writer
-            .write_all(format!("{}\n", ctx_ref).as_bytes())
-            .is_err()
-        {
+        if writer.write_all(&ctx_ref).is_err() {
             log::error!("配对发起: 发送 PAIRING_INIT 失败");
             fire_pairing_result(ctx, &tu, 0, "send_pairing_init_failed");
             return -1;
@@ -200,18 +196,19 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
     stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
     let resp = {
         let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            log::error!("配对发起: 读取 PAIRING_RESP 失败或连接关闭");
-            fire_pairing_result(ctx, &tu, 0, "pairing_resp_timeout");
-            let reject_msg = codec::encode_reject(&lu);
-            let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
-            return -1;
+        match crate::protocol::binary_codec::read_frame(&mut reader) {
+            Ok((t, p)) => (t, p),
+            Err(e) => {
+                log::error!("配对发起: 读取 PAIRING_RESP 失败或连接关闭: {}", e);
+                fire_pairing_result(ctx, &tu, 0, "pairing_resp_timeout");
+                let reject_msg = codec::encode_reject(&lu);
+                let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
+                return -1;
+            }
         }
-        line.trim().to_string()
     };
 
-    super::processing::process_line(ctx, &resp);
+    super::processing::process_frame(ctx, resp.0, &resp.1);
 
     let (prover_session, peer_lt_pub, peer_spake2_pub) = {
         let g = ctx.get_mut().unwrap();
@@ -254,23 +251,20 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
                     .unwrap_or_default();
                 let accept_line =
                     codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
-                let data = format!("{}\n", accept_line);
                 stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-                if stream.write_all(data.as_bytes()).is_err() || stream.flush().is_err() {
+                if stream.write_all(&accept_line).is_err() || stream.flush().is_err() {
                     log::warn!("配对发起: 发送 ACCEPT 失败");
                 } else {
                     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
                     let mut ack_reader = BufReader::new(&stream);
-                    let mut ack_line = String::new();
-                    match ack_reader.read_line(&mut ack_line) {
-                        Ok(n) if n > 0 => {
-                            if ack_line.trim().starts_with("ACK:") {
-                                log::info!("配对发起: 收到 ACK 确认: {}", ack_line.trim());
-                            } else {
-                                log::warn!("配对发起: 收到非 ACK 响应: {}", ack_line.trim());
-                            }
+                    match crate::protocol::binary_codec::read_frame(&mut ack_reader) {
+                        Ok((t, _)) if t == crate::protocol::header::MessageType::ACK => {
+                            log::info!("配对发起: 收到 ACK 确认");
                         }
-                        _ => {
+                        Ok((t, _)) => {
+                            log::warn!("配对发起: 收到非 ACK 响应 type={}", t);
+                        }
+                        Err(_) => {
                             log::warn!("配对发起: 未收到 ACK 确认");
                         }
                     }
@@ -290,13 +284,11 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
 
     log::warn!("配对发起: SPAKE2 会话或参数缺失");
     let reject_msg = codec::encode_reject(&lu);
-    let data = format!("{}\n", reject_msg);
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    if stream.write_all(data.as_bytes()).is_ok() && stream.flush().is_ok() {
+    if stream.write_all(&reject_msg).is_ok() && stream.flush().is_ok() {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let mut ack_reader = BufReader::new(&stream);
-        let mut ack_line = String::new();
-        ack_reader.read_line(&mut ack_line).ok();
+        let _ = crate::protocol::binary_codec::read_frame(&mut ack_reader);
     } else {
         let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
     }
@@ -587,22 +579,25 @@ pub unsafe extern "C" fn nrc_connect_device(
     let msg = codec::encode_handshake(&local_uuid, &local_pub, &local_ip, battery, &dt);
 
     for attempt in 0..MAX_RETRIES {
-        let resp = crate::network::oneshot_send_receive(&msg, &ti, PORT, TIMEOUT_MS);
+        let resp = crate::network::oneshot_send_receive_bin(&msg, &ti, PORT, TIMEOUT_MS);
         match resp {
-            Some(line) => {
-                let header = crate::protocol::header::ProtocolHeader::parse(&line);
-                if header == crate::protocol::header::ProtocolHeader::Accept {
+            Some((msg_type, payload)) => {
+                if msg_type == crate::protocol::header::MessageType::ACCEPT {
                     log::info!("连接设备: 握手成功 uuid={}, 第 {} 次尝试", tu, attempt + 1);
-                    super::processing::process_line(ctx, &line);
+                    super::processing::process_frame(ctx, msg_type, &payload);
                     return 0;
                 }
-                if header == crate::protocol::header::ProtocolHeader::Reject {
+                if msg_type == crate::protocol::header::MessageType::REJECT {
                     log::warn!("连接设备: 对端拒绝 uuid={}", tu);
-                    super::processing::process_line(ctx, &line);
+                    super::processing::process_frame(ctx, msg_type, &payload);
                     return -1;
                 }
-                log::warn!("连接设备: 收到非预期响应({}) uuid={}, 重试", header, tu);
-                super::processing::process_line(ctx, &line);
+                log::warn!(
+                    "连接设备: 收到非预期响应(type={}) uuid={}, 重试",
+                    msg_type,
+                    tu
+                );
+                super::processing::process_frame(ctx, msg_type, &payload);
             }
             None => {
                 log::warn!(

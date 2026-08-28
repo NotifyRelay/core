@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,12 +8,13 @@ use std::time::Duration;
 use threadpool::ThreadPool;
 
 use crate::heartbeat;
-use crate::protocol::codec;
+use crate::protocol::binary_codec;
 
 /// 回调类型
 type ConnectedCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 type DisconnectedCallback = Arc<dyn Fn(String) + Send + Sync>;
-type MessageCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+/// 消息回调: (uuid, msg_type, payload)
+type MessageCallback = Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>;
 type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 /// UDP 心跳回调（新增 String 参数为源 IP）
@@ -24,7 +25,6 @@ pub struct TcpSession {
     pub stream: TcpStream,
     pub uuid: String,
     pub ip: String,
-    pub buffer: String,
 }
 
 /// UDP 监听器状态
@@ -55,11 +55,10 @@ impl TcpServerState {
         }
     }
 
-    /// 向指定设备发送消息
-    pub fn send_to_device(&mut self, uuid: &str, message: &str) -> bool {
+    /// 向指定设备发送二进制帧
+    pub fn send_to_device(&mut self, uuid: &str, data: &[u8]) -> bool {
         if let Some(session) = self.sessions.get_mut(uuid) {
-            let data = format!("{}\n", message);
-            match session.stream.write_all(data.as_bytes()) {
+            match binary_codec::write_frame(&mut session.stream, data[0], &data[5..]) {
                 Ok(_) => true,
                 Err(e) => {
                     log::error!("发送消息失败 uuid={}, error={}", uuid, e);
@@ -72,13 +71,13 @@ impl TcpServerState {
         }
     }
 
-    /// 广播消息到所有连接的设备
-    pub fn broadcast(&mut self, message: &str) {
-        let data = format!("{}\n", message);
+    /// 广播二进制帧到所有连接的设备
+    pub fn broadcast(&mut self, data: &[u8]) {
         let uuids: Vec<String> = self.sessions.keys().cloned().collect();
         for uuid in uuids {
             if let Some(session) = self.sessions.get_mut(&uuid) {
-                if let Err(e) = session.stream.write_all(data.as_bytes()) {
+                if let Err(e) = binary_codec::write_frame(&mut session.stream, data[0], &data[5..])
+                {
                     log::error!("广播消息失败 uuid={}, error={}", uuid, e);
                 }
             }
@@ -229,7 +228,7 @@ fn accept_loop(
     }
 }
 
-/// 处理单个连接
+/// 处理单个连接（二进制帧协议）
 fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
@@ -245,96 +244,78 @@ fn handle_connection(
 
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
-    let mut buffer = String::new();
-    let mut uuid = String::new();
 
-    match reader.read_line(&mut buffer) {
-        Ok(0) => return,
-        Ok(_) => {
-            let line = buffer.trim().to_string();
-            buffer.clear();
-
-            if let Some(f) = codec::decode_handshake(&line) {
-                uuid = f.uuid.to_string();
-            } else if let Some(pos) = line.find(':') {
-                let rest = &line[pos + 1..];
-                if let Some(end) = rest.find(':') {
-                    uuid = rest[..end].to_string();
-                } else if !rest.is_empty() {
-                    uuid = rest.to_string();
-                }
-            }
-
-            if uuid.is_empty() {
-                log::warn!("无法从消息中提取 UUID: {}", &line[..line.len().min(80)]);
-                return;
-            }
-
-            // 拒绝本机发起的自我连接（如已知设备中残留本机条目导致的重连循环）
-            // 本机 uuid 动态从 state 读取（运行期由 FFI 层同步，避免启动顺序导致为空）
-            let local_uuid = state
-                .lock()
-                .map(|s| s.local_uuid.clone())
-                .unwrap_or_default();
-            if !local_uuid.is_empty() && uuid == local_uuid {
-                return;
-            }
-
-            //log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
-            {
-                let mut state = state.lock().unwrap();
-                state.sessions.insert(
-                    uuid.clone(),
-                    TcpSession {
-                        stream: stream.try_clone().expect("克隆流失败"),
-                        uuid: uuid.clone(),
-                        ip: ip.clone(),
-                        buffer: String::new(),
-                    },
-                );
-            }
-
-            if let Some(ref cb) = on_connected {
-                cb(uuid.clone(), ip.clone());
-            }
-
-            if let Some(ref cb) = on_message {
-                cb(uuid.clone(), line);
-            }
-        }
+    // 读取第一帧（必须是 HANDSHAKE）
+    let (first_type, first_payload) = match binary_codec::read_frame(&mut reader) {
+        Ok(f) => f,
         Err(e) => {
-            log::error!("读取第一行失败: {}", e);
+            log::error!("读取第一帧失败: {}", e);
             if let Some(ref cb) = on_error {
                 cb(format!("读取失败: {}", e));
             }
             return;
         }
+    };
+
+    if first_type != crate::protocol::header::MessageType::HANDSHAKE {
+        log::warn!("第一帧不是 HANDSHAKE type={}", first_type);
+        return;
     }
 
+    let hs = match binary_codec::decode_handshake_frame(&first_payload) {
+        Some(h) => h,
+        None => {
+            log::warn!("HANDSHAKE 帧解码失败");
+            return;
+        }
+    };
+    let uuid = hs.uuid.clone();
+
+    // 拒绝本机发起的自我连接
+    let local_uuid = state
+        .lock()
+        .map(|s| s.local_uuid.clone())
+        .unwrap_or_default();
+    if !local_uuid.is_empty() && uuid == local_uuid {
+        return;
+    }
+
+    // 注册会话
+    {
+        let mut state = state.lock().unwrap();
+        state.sessions.insert(
+            uuid.clone(),
+            TcpSession {
+                stream: stream.try_clone().expect("克隆流失败"),
+                uuid: uuid.clone(),
+                ip: ip.clone(),
+            },
+        );
+    }
+
+    if let Some(ref cb) = on_connected {
+        cb(uuid.clone(), ip.clone());
+    }
+
+    // 回调第一帧
+    if let Some(ref cb) = on_message {
+        cb(uuid.clone(), first_type, first_payload);
+    }
+
+    // 持续读取二进制帧
     loop {
-        buffer.clear();
-        match reader.read_line(&mut buffer) {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = buffer.trim().to_string();
-                if !line.is_empty() {
-                    if let Some(data) = codec::decode_data_message(&line) {
-                        log::info!(
-                            "收到 TCP DATA: local_uuid={}, payload_len={}, from={}",
-                            data.local_uuid,
-                            data.encrypted_payload.len(),
-                            addr
-                        );
-                    }
-                    if let Some(ref cb) = on_message {
-                        cb(uuid.clone(), line);
-                    }
+        match binary_codec::read_frame(&mut reader) {
+            Ok((msg_type, payload)) => {
+                if let Some(ref cb) = on_message {
+                    cb(uuid.clone(), msg_type, payload);
                 }
             }
             Err(e) => {
-                log::error!("读取数据失败 uuid={}, error={}", uuid, e);
-                if let Some(ref cb) = on_error {
-                    cb(format!("读取失败: {}", e));
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    log::error!("读取数据失败 uuid={}, error={}", uuid, e);
+                    if let Some(ref cb) = on_error {
+                        cb(format!("读取失败: {}", e));
+                    }
                 }
                 break;
             }
@@ -346,7 +327,6 @@ fn handle_connection(
         state.sessions.remove(&uuid);
     }
 
-    //log::info!("TCP连接已断开 uuid={}", uuid);
     if let Some(ref cb) = on_disconnected {
         cb(uuid);
     }
@@ -500,8 +480,13 @@ pub fn start_udp_listener(
     Ok(running)
 }
 
-/// Oneshot TCP 发送并接收响应，内部通过 process_line 处理响应
-pub fn oneshot_send_receive(payload: &str, ip: &str, port: u16, timeout_ms: u32) -> Option<String> {
+/// Oneshot TCP 发送二进制帧并接收二进制帧响应
+pub fn oneshot_send_receive_bin(
+    payload: &[u8],
+    ip: &str,
+    port: u16,
+    timeout_ms: u32,
+) -> Option<(u8, Vec<u8>)> {
     let addr = format!("{}:{}", ip, port);
     let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
     let stream =
@@ -512,22 +497,13 @@ pub fn oneshot_send_receive(payload: &str, ip: &str, port: u16, timeout_ms: u32)
     stream
         .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
         .ok()?;
-    let mut writer = &stream;
-    writer.write_all(format!("{}\n", payload).as_bytes()).ok()?;
-    writer.flush().ok()?;
+    binary_codec::write_frame(&mut &stream, payload[0], &payload[5..]).ok()?;
     let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let trimmed = line.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    binary_codec::read_frame(&mut reader).ok()
 }
 
-/// Oneshot TCP 发送（不等待响应）
-pub fn oneshot_send_only(payload: &str, ip: &str, port: u16, timeout_ms: u32) -> bool {
+/// Oneshot TCP 发送二进制帧（不等待响应）
+pub fn oneshot_send_only(payload: &[u8], ip: &str, port: u16, timeout_ms: u32) -> bool {
     let addr = format!("{}:{}", ip, port);
     let sock_addr = match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a,
@@ -547,9 +523,8 @@ pub fn oneshot_send_only(payload: &str, ip: &str, port: u16, timeout_ms: u32) ->
     stream
         .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
         .ok();
-    let data = format!("{}\n", payload);
     let mut writer = &stream;
-    if writer.write_all(data.as_bytes()).is_err() || writer.flush().is_err() {
+    if binary_codec::write_frame(&mut writer, payload[0], &payload[5..]).is_err() {
         log::debug!("oneshot_send_only: 写入失败 addr={}", addr);
         return false;
     }
@@ -563,7 +538,9 @@ mod tests {
     #[test]
     fn test_send_to_device_not_connected() {
         let mut state = TcpServerState::new();
-        let result = state.send_to_device("test-uuid", "test message");
+        // 构造一个最小二进制帧: type=0xFF, length=0
+        let frame = vec![0xFF, 0, 0, 0, 0];
+        let result = state.send_to_device("test-uuid", &frame);
         assert!(!result);
     }
 

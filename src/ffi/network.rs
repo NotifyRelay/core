@@ -73,11 +73,13 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
 
     let on_message_cb = {
         let ctx_usize = ctx_ptr as usize;
-        Some(Arc::new(move |_uuid: String, line: String| {
-            let ctx_ptr = ctx_usize as *mut c_void;
-            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-            super::processing::process_line(ctx, &line);
-        }) as Arc<dyn Fn(String, String) + Send + Sync>)
+        Some(
+            Arc::new(move |_uuid: String, msg_type: u8, payload: Vec<u8>| {
+                let ctx_ptr = ctx_usize as *mut c_void;
+                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                super::processing::process_frame(ctx, msg_type, &payload);
+            }) as Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>,
+        )
     };
 
     let on_error_cb = on_tcp_error.map(|cb| {
