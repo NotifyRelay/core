@@ -9,6 +9,7 @@ use threadpool::ThreadPool;
 
 use crate::heartbeat;
 use crate::protocol::binary_codec;
+use crate::protocol::header::MessageType;
 
 /// 回调类型
 type ConnectedCallback = Arc<dyn Fn(String, String) + Send + Sync>;
@@ -245,7 +246,7 @@ fn handle_connection(
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
 
-    // 读取第一帧（必须是 HANDSHAKE）
+    // 读取第一帧（允许任意类型：HANDSHAKE / DATA / 配对 / 心跳）
     let (first_type, first_payload) = match binary_codec::read_frame(&mut reader) {
         Ok(f) => f,
         Err(e) => {
@@ -257,19 +258,80 @@ fn handle_connection(
         }
     };
 
-    if first_type != crate::protocol::header::MessageType::HANDSHAKE {
-        log::warn!("第一帧不是 HANDSHAKE type={}", first_type);
-        return;
-    }
-
-    let hs = match binary_codec::decode_handshake_frame(&first_payload) {
-        Some(h) => h,
-        None => {
-            log::warn!("HANDSHAKE 帧解码失败");
+    // 根据消息类型提取 UUID
+    let uuid = match first_type {
+        MessageType::HANDSHAKE => match binary_codec::decode_handshake_frame(&first_payload) {
+            Some(h) => h.uuid,
+            None => {
+                log::warn!("HANDSHAKE 帧解码失败");
+                return;
+            }
+        },
+        MessageType::HEARTBEAT => match binary_codec::decode_heartbeat_frame(&first_payload) {
+            Some(h) => h.uuid,
+            None => {
+                log::warn!("HEARTBEAT 帧解码失败");
+                return;
+            }
+        },
+        t if t >= 10 && t <= 200 => {
+            // DATA 帧: DATA_TYPE:uuid:pub_key:encrypted_data
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let parts: Vec<&str> = s.splitn(4, ':').collect();
+                    if parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else {
+                        log::warn!("DATA 帧 payload 格式错误");
+                        return;
+                    }
+                }
+                Err(_) => {
+                    log::warn!("DATA 帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        MessageType::PAIRING_INIT | MessageType::PAIRING_RESP => {
+            // 配对帧: uuid:...
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if !parts[0].is_empty() {
+                        parts[0].to_string()
+                    } else {
+                        log::warn!("配对帧 UUID 为空");
+                        return;
+                    }
+                }
+                Err(_) => {
+                    log::warn!("配对帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        MessageType::ACCEPT | MessageType::REJECT => {
+            // 控制帧: payload 就是 UUID
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let uuid = s.trim().to_string();
+                    if uuid.is_empty() {
+                        log::warn!("控制帧 UUID 为空");
+                        return;
+                    }
+                    uuid
+                }
+                Err(_) => {
+                    log::warn!("控制帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        _ => {
+            log::warn!("第一帧类型不支持: type={}", first_type);
             return;
         }
     };
-    let uuid = hs.uuid.clone();
 
     // 拒绝本机发起的自我连接
     let local_uuid = state
