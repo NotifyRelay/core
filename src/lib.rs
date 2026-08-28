@@ -308,7 +308,7 @@ impl CoreContext {
     /// 打开（创建）库并写入单个设备行（配对/改名等关键路径用）
     /// 库尚不存在时立即创建写入：配对密钥不依赖「库已预先存在」；
     /// 仅打开失败时为不阻塞配对流程降至 dirty（由后续读取前 flush 兜底）
-    pub fn persist_device_row_now(&mut self, uuid: &str) {
+    pub fn persist_device_row_now(&mut self, uuid: &str) -> bool {
         let p = if self.persistence.is_some() {
             self.persistence.as_ref().unwrap()
         } else {
@@ -320,7 +320,7 @@ impl CoreContext {
                 None => {
                     log::warn!("持久化打开失败，标记 dirty 稍后重试");
                     self.mark_persistence_dirty();
-                    return;
+                    return false;
                 }
             }
         };
@@ -328,7 +328,7 @@ impl CoreContext {
         let has_key = self.crypto.device_keys.contains_key(uuid);
         if let Err(e) = p.upsert_device_row(&dev, has_key) {
             log::error!("持久化设备行失败 {}: {}", uuid, e);
-            return;
+            return false;
         }
         // 同步库缓存
         if let Some(info) = self.persisted_devices.get_mut(uuid) {
@@ -340,6 +340,7 @@ impl CoreContext {
             info.is_accepted = dev.is_accepted;
             info.updated_at = dev.updated_at;
         }
+        true
     }
 
     /// 读取接口前的自动落盘：dirty 且持久化已激活时打开库并写入 uuid/state/设备行

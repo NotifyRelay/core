@@ -29,7 +29,9 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
             .set_device_key(uuid.to_string(), String::new(), b64);
         // 迁移导入的密钥：立即落库
         ctx.mark_persistence_dirty();
-        ctx.persist_device_row_now(&uuid);
+        if !ctx.persist_device_row_now(&uuid) {
+            return -1;
+        }
         0
     })
 }
