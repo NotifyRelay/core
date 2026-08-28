@@ -570,7 +570,8 @@ pub fn handle_state_message(
         cb_fn(uuid_c.as_ptr(), mt_c.as_ptr(), wire_c.as_ptr(), ud);
     }
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
-    if !is_media && !is_end {
+    // 无前文时不发 ACK，让发送端超时后强制发全量
+    if !is_media && !is_end && !need_full {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
             let g = ctx.get_mut().unwrap();
             if g.sender_queue != 0 {
@@ -593,14 +594,11 @@ pub fn handle_state_message(
                 q.enqueue(item);
             }
         }
-    }
-    // 无前文时记录日志，依赖发送端 ACK 超时后重发全量
-    if need_full {
+    } else if need_full {
         log::debug!(
-            "[state_merge] 无前文,等待ACK超时获取全量 uuid={} fid={} is_media={}",
+            "[state_merge] 无前文,跳过ACK等待发送端超时重发全量 uuid={} fid={}",
             uuid,
-            fid,
-            is_media
+            fid
         );
     }
     true
