@@ -594,26 +594,14 @@ pub fn handle_state_message(
             }
         }
     }
-    // 无前文时立即请求全量
+    // 无前文时记录日志，依赖发送端 ACK 超时后重发全量
     if need_full {
-        let (cb, ud) = {
-            let g = ctx.get_mut().unwrap();
-            (g.router.on_state_query, g.router.user_data)
-        };
-        if let Some(cb_fn) = cb {
-            let uuid_c = CString::new(uuid).unwrap_or_default();
-            let fid_c = CString::new(fid.clone()).unwrap_or_default();
-            let code = cb_fn(uuid_c.as_ptr(), fid_c.as_ptr(), is_media as i32, ud);
-            // code 2 表示存在有变更，平台会推送全量；其他情况也标记需要全量
-            if code != 2 {
-                log::debug!(
-                    "[state_merge] 无前文请求全量 uuid={} fid={} code={}",
-                    uuid,
-                    fid,
-                    code
-                );
-            }
-        }
+        log::debug!(
+            "[state_merge] 无前文,等待ACK超时获取全量 uuid={} fid={} is_media={}",
+            uuid,
+            fid,
+            is_media
+        );
     }
     true
 }
