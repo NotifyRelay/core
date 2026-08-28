@@ -209,9 +209,16 @@ impl StateMerge {
             let base_val: Value = base
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(Value::Object(Map::new()));
-            merge_island(&base_val, &changes)
+            let has_base = base_val.as_object().is_some_and(|m| !m.is_empty());
+            let merged = merge_island(&base_val, &changes);
+            if has_base {
+                merged
+            } else {
+                fill_empty_fields(&merged)
+            }
         } else {
-            strip_routing(&v)
+            let stripped = strip_routing(&v);
+            fill_empty_fields(&stripped)
         };
 
         if is_end {
@@ -481,6 +488,29 @@ fn merge_island(base: &Value, changes: &Value) -> String {
         }
     }
     serde_json::to_string(&merged).unwrap_or_default()
+}
+
+/// 当没有前文可供合并时，将空字段填充为"未知"
+fn fill_empty_fields(s: &str) -> String {
+    let v: Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(_) => return s.to_string(),
+    };
+    let mut obj = match v {
+        Value::Object(m) => m,
+        _ => return s.to_string(),
+    };
+    let default_value = json!("未知");
+    for k in ["title", "text"] {
+        if let Some(val) = obj.get(k) {
+            if val.as_str().is_some_and(|s| s.is_empty()) {
+                obj.insert(k.to_string(), default_value.clone());
+            }
+        } else {
+            obj.insert(k.to_string(), default_value.clone());
+        }
+    }
+    serde_json::to_string(&obj).unwrap_or_default()
 }
 
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
