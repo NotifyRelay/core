@@ -136,14 +136,8 @@ impl StateMerge {
         let payload = if first || force || is_end {
             build_full_wire(&full, &feature_id, &hash, is_end)
         } else {
-            // 无变化时发送空差量保活包：接收端据此刷新时间戳，避免卡片超时消失
-            let delta = if session.last_full == canonical {
-                json!({})
-            } else {
-                let old_val: Value =
-                    serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
-                diff_island(&old_val, &full)
-            };
+            let old_val: Value = serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
+            let delta = diff_island(&old_val, &full);
             build_delta_wire(&delta, &feature_id, &hash)
         };
 
@@ -344,11 +338,12 @@ impl StateMerge {
                             s.force_full_next = false;
                             s.pending_ack = Some((s.last_hash.clone(), Instant::now()));
                         } else {
-                            // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
-                            // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
-                            // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
-                            let keepalive =
-                                build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
+                            // 保活：发送差量包（非 pics 字段填入实际值），
+                            // 接收端据此刷新时间戳，避免卡片/岛"突然消失"
+                            let last_val: Value = serde_json::from_str(&s.last_full)
+                                .unwrap_or(Value::Object(Map::new()));
+                            let delta = diff_island(&last_val, &last_val);
+                            let keepalive = build_delta_wire(&delta, &s.feature_id, &s.last_hash);
                             queue.enqueue(SendItem {
                                 device_uuid: s.device_uuid.clone(),
                                 header: header.to_string(),
@@ -427,24 +422,18 @@ fn pics_map(v: &Value) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// 计算 island 状态差异（title/text/param_v2_raw/coverUrl/isPlaying/pics），返回 changes 对象。
+/// 计算 island 状态差异：pics 保持差量逻辑，其他字段（title/text/param_v2_raw/coverUrl/isPlaying）填入实际值。
 fn diff_island(old: &Value, new: &Value) -> Value {
     let mut changes = Map::new();
+    // 非 pics 字段：填入实际值（无论是否变化）
     for k in ["title", "text", "param_v2_raw", "coverUrl"] {
-        let o = field_str(old, k);
-        let n = field_str(new, k);
-        if o != n {
-            changes.insert(k.to_string(), json!(n.unwrap_or_default()));
-        }
+        let v = field_str(new, k);
+        changes.insert(k.to_string(), json!(v.unwrap_or_default()));
     }
-    // isPlaying 为布尔字段，单独比较：仅暂停/播放切换时生成 delta，接收端可正确合并
-    let o_play = old.get("isPlaying").and_then(|x| x.as_bool());
-    let n_play = new.get("isPlaying").and_then(|x| x.as_bool());
-    if o_play != n_play {
-        if let Some(v) = new.get("isPlaying") {
-            changes.insert("isPlaying".to_string(), v.clone());
-        }
+    if let Some(v) = new.get("isPlaying") {
+        changes.insert("isPlaying".to_string(), v.clone());
     }
+    // pics 字段：保持差量（仅变化的 key）
     let op = pics_map(old);
     let np = pics_map(new);
     let mut pics_changed = Map::new();
@@ -712,12 +701,12 @@ mod tests {
         let mut sm = StateMerge::new();
         // 首次推送应为 FULL
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
-        // 相同内容 → 发送空差量保活包（不跳过），接收端据此刷新时间戳
+        // 相同内容 → 发送差量保活包（非 pics 字段填入实际值）
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         let items = q.test_drain_plaintexts();
         assert_eq!(items.len(), 2);
         assert!(items[1].contains("\"type\":\"delta\""));
-        assert!(items[1].contains("\"changes\":{}"));
+        assert!(items[1].contains("\"title\":\"t1\""));
         // 变化产生 delta（通过队列内容判断）
         // 这里只验证 merge 往返：模拟接收端
         let full1 = si_full("t1", "c1");
@@ -741,6 +730,11 @@ mod tests {
             json!({"device":"self","title":"a","text":"x","param_v2_raw":"","pics":{"k":"v"}});
         let full_b = json!({"device":"self","title":"b","text":"x","param_v2_raw":"","pics":{"k":"v","k2":"v2"}});
         let delta = diff_island(&full_a, &full_b);
+        // 非 pics 字段填入实际值
+        assert_eq!(delta["title"], json!("b"));
+        assert_eq!(delta["text"], json!("x"));
+        // pics 保持差量
+        assert_eq!(delta["pics"]["k2"], json!("v2"));
         let merged = merge_island(&full_a, &delta);
         let merged_v: Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(merged_v["title"], json!("b"));
@@ -749,33 +743,30 @@ mod tests {
 
     #[test]
     fn test_media_fields_diff_and_merge() {
-        // 仅切换 isPlaying：FULL 之后产生非空 delta，接收端合并后状态正确
         let full_playing =
             json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":true});
         let full_paused =
             json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":false});
         let delta = diff_island(&full_playing, &full_paused);
-        assert_ne!(delta, json!({}));
+        // 非 pics 字段填入实际值（无论是否变化）
         assert_eq!(delta["isPlaying"], json!(false));
-        let merged = merge_island(&full_playing, &delta);
-        let merged_v: Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(merged_v["isPlaying"], json!(false));
-        assert_eq!(merged_v["coverUrl"], json!("url1"));
-        // 无变化时 delta 为空
+        assert_eq!(delta["coverUrl"], json!("url1"));
+        // 无变化时 delta 仍包含非 pics 字段实际值
         let no_change = diff_island(&full_paused, &full_paused);
-        assert_eq!(no_change, json!({}));
+        assert_eq!(no_change["isPlaying"], json!(false));
+        assert_eq!(no_change["coverUrl"], json!("url1"));
 
-        // 仅更换 coverUrl：delta 非空且合并后封面正确
-        let full_new_cover =
-            json!({"device":"self","title":"t","text":"a","coverUrl":"url2","isPlaying":false});
-        let delta2 = diff_island(&full_paused, &full_new_cover);
+        // pics 变化时 delta 非空
+        let full_with_pic = json!({"device":"self","title":"t","text":"a","coverUrl":"url2","isPlaying":false,"pics":{"k":"v"}});
+        let delta2 = diff_island(&full_paused, &full_with_pic);
         assert_ne!(delta2, json!({}));
         assert_eq!(delta2["coverUrl"], json!("url2"));
-        assert!(delta2.get("isPlaying").is_none());
+        assert_eq!(delta2["pics"]["k"], json!("v"));
         let merged2 = merge_island(&full_paused, &delta2);
         let merged2_v: Value = serde_json::from_str(&merged2).unwrap();
         assert_eq!(merged2_v["coverUrl"], json!("url2"));
         assert_eq!(merged2_v["isPlaying"], json!(false));
+        assert_eq!(merged2_v["pics"]["k"], json!("v"));
     }
 
     #[test]
@@ -823,14 +814,14 @@ mod tests {
                 .unwrap();
             s.pending_ack = None;
         }
-        // 存在无变更 → 空差量保活包入队（接收端据此刷新时间戳，防"突然消失"）
+        // 存在无变更 → 差量保活包入队（非 pics 字段填入实际值）
         let queries = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries.len(), 1);
         sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 1)]);
         let items = q.test_drain_plaintexts();
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("\"type\":\"delta\""));
-        assert!(items[0].contains("\"changes\":{}"));
+        assert!(items[0].contains("\"title\":\"t1\""));
         // 保活基于上次真实发送：重置后间隔内不再查询（无快速触发）
         assert!(sm
             .heartbeat_tick(Instant::now() + Duration::from_secs(7))
@@ -844,7 +835,7 @@ mod tests {
         sm2.apply_query_results(&q, vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
         let items2 = q.test_drain_plaintexts();
         assert_eq!(items2.len(), 1);
-        assert!(items2[0].contains("\"changes\":{}"));
+        assert!(items2[0].contains("\"title\":\"t1\""));
     }
 
     #[test]
