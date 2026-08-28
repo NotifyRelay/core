@@ -86,6 +86,9 @@ pub struct CoreContext {
     pub local_uuid: String,
     /// 库内设备行缓存（供 get_device_list 名称/IP 展示）
     pub persisted_devices: std::collections::HashMap<String, persistence::PersistedDevice>,
+    /// 待删除设备 UUID（nrc_remove_device 加入，flush_all 事务内执行 DELETE，
+    /// 保证 state 更新与行删除原子生效，避免 flush 失败后重启设备"复活"）
+    pub pending_device_deletions: Vec<String>,
     /// 持久化库路径覆盖（测试隔离用：每个测试注入独立库文件；生产为 None）
     db_override: Option<std::path::PathBuf>,
 }
@@ -145,6 +148,7 @@ impl CoreContext {
             persistence_activated: false,
             local_uuid: String::new(),
             persisted_devices: HashMap::new(),
+            pending_device_deletions: Vec::new(),
             db_override: None,
         }
     }
@@ -176,13 +180,28 @@ impl CoreContext {
 
 impl CoreContext {
     /// 惰性加载：库文件已存在才 open+load；全新安装跳过
+    /// 区分"文件不存在"（不重试）与"文件存在但打开失败"（保留重试机会）
     pub fn ensure_persistence_loaded(&mut self) {
         if self.persistence.is_some() || self.persistence_loaded {
             return;
         }
-        self.persistence_loaded = true;
+        // 先检查库文件是否已存在：不存在则标记已尝试（全新安装不创建库）
+        let path_exists = if let Some(p) = self.db_override.as_ref() {
+            p.exists()
+        } else {
+            persistence::Persistence::resolve_db_path()
+                .map(|p| p.exists())
+                .unwrap_or(false)
+        };
+        if !path_exists {
+            self.persistence_loaded = true;
+            log::info!("持久化库不存在（全新安装），跳过加载");
+            return;
+        }
+        // 文件存在：尝试打开，失败不标记（下次重试，应对临时权限/锁问题）
         match self.open_persistence_if_exists() {
             Some(p) => {
+                self.persistence_loaded = true;
                 if let Err(e) = persistence::load_all(
                     &p,
                     &mut self.crypto,
@@ -196,7 +215,8 @@ impl CoreContext {
                 self.persistence = Some(p);
             }
             None => {
-                log::info!("持久化库不存在（全新安装），跳过加载");
+                // 文件存在但打开失败：不标记 persistence_loaded，下次重试
+                log::warn!("持久化库存在但打开失败，将在下次调用时重试");
             }
         }
     }
@@ -390,9 +410,11 @@ impl CoreContext {
             encrypted_state.as_deref(),
             &rows,
             &tombstones,
+            &self.pending_device_deletions,
         ) {
             Ok(()) => {
                 self.persistence_dirty = false;
+                self.pending_device_deletions.clear();
                 true
             }
             Err(e) => {

@@ -391,36 +391,34 @@ impl Persistence {
         Ok(rows)
     }
 
-    /// 幂等 upsert：基础行 INSERT OR IGNORE，密钥列/元数据列分别补充
+    /// 幂等 upsert：基础行 INSERT OR IGNORE，密钥列/元数据列分别补充（单次加锁）
     pub fn upsert_device_row(&self, dev: &PersistedDevice, has_key: bool) -> Result<(), String> {
-        self.db.lock().unwrap_or_else(|p| p.into_inner())
-            .execute(
-                "INSERT OR IGNORE INTO devices (uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt)
-                 VALUES (?1, '', '', 0, '', '', 0, ?2, ?2)",
-                rusqlite::params![dev.uuid, dev.updated_at],
-            )
-            .map_err(|e| format!("插入设备行失败: {}", e))?;
+        let db = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.execute(
+            "INSERT OR IGNORE INTO devices (uuid, publicKey, sharedSecret, isAccepted, displayName, lastIp, lastPort, createdAt, updatedAt)
+             VALUES (?1, '', '', 0, '', '', 0, ?2, ?2)",
+            rusqlite::params![dev.uuid, dev.updated_at],
+        )
+        .map_err(|e| format!("插入设备行失败: {}", e))?;
         if has_key && !dev.shared_secret.is_empty() {
-            self.db.lock().unwrap_or_else(|p| p.into_inner())
-                .execute(
-                    "UPDATE devices SET publicKey = ?1, sharedSecret = ?2, isAccepted = 1, updatedAt = ?3 WHERE uuid = ?4",
-                    rusqlite::params![dev.public_key, dev.shared_secret, dev.updated_at, dev.uuid],
-                )
-                .map_err(|e| format!("更新设备密钥失败: {}", e))?;
+            db.execute(
+                "UPDATE devices SET publicKey = ?1, sharedSecret = ?2, isAccepted = 1, updatedAt = ?3 WHERE uuid = ?4",
+                rusqlite::params![dev.public_key, dev.shared_secret, dev.updated_at, dev.uuid],
+            )
+            .map_err(|e| format!("更新设备密钥失败: {}", e))?;
         }
         if !dev.display_name.is_empty() || !dev.last_ip.is_empty() || dev.last_port > 0 {
-            self.db.lock().unwrap_or_else(|p| p.into_inner())
-                .execute(
-                    "UPDATE devices SET displayName = ?1, lastIp = ?2, lastPort = ?3, updatedAt = ?4 WHERE uuid = ?5",
-                    rusqlite::params![
-                        dev.display_name,
-                        dev.last_ip,
-                        dev.last_port as i64,
-                        dev.updated_at,
-                        dev.uuid
-                    ],
-                )
-                .map_err(|e| format!("更新设备信息失败: {}", e))?;
+            db.execute(
+                "UPDATE devices SET displayName = ?1, lastIp = ?2, lastPort = ?3, updatedAt = ?4 WHERE uuid = ?5",
+                rusqlite::params![
+                    dev.display_name,
+                    dev.last_ip,
+                    dev.last_port as i64,
+                    dev.updated_at,
+                    dev.uuid
+                ],
+            )
+            .map_err(|e| format!("更新设备信息失败: {}", e))?;
         }
         Ok(())
     }
@@ -434,7 +432,7 @@ impl Persistence {
         Ok(())
     }
 
-    /// 单事务写入全部落盘内容（uuid/state/设备行/墓碑清理），失败整体回滚
+    /// 单事务写入全部落盘内容（uuid/state/设备行/墓碑清理/待删除设备），失败整体回滚
     /// 保证 state 与设备密钥行要么同时生效要么都不生效，
     /// 避免「state 已写/行未写」或「行已写/state 未写」的中间态在重启时
     /// 加载旧密钥而忽略更新的设备行（load_all 以 state 优先）
@@ -444,6 +442,7 @@ impl Persistence {
         encrypted_state: Option<&str>,
         rows: &[(PersistedDevice, bool)],
         tombstones: &[String],
+        pending_deletions: &[String],
     ) -> Result<(), String> {
         let mut db = self.db.lock().unwrap_or_else(|p| p.into_inner());
         let tx = db
@@ -467,6 +466,11 @@ impl Persistence {
         }
         for (dev, has_key) in rows {
             Self::upsert_device_row_tx(&tx, dev, *has_key)?;
+        }
+        // 待删除设备：事务内 DELETE，与 state 更新原子生效
+        for uuid in pending_deletions {
+            tx.execute("DELETE FROM devices WHERE uuid = ?1", [uuid.as_str()])
+                .map_err(|e| format!("删除设备行失败 {}: {}", uuid, e))?;
         }
         for uuid in tombstones {
             tx.execute("DELETE FROM devices WHERE uuid = ?1", [uuid.as_str()])
