@@ -413,7 +413,8 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             if let Some(handle) = guard.broadcast_handle.take() {
                 handle.running.store(false, Ordering::Relaxed);
             }
-            guard.broadcast_info = None;
+            // 注意：不清空 broadcast_info，心跳调度器/重连/发现等组件依赖它获取本机身份
+            // （锁屏切换 TCP 备用心跳时若本机信息为空，心跳调度器将停摆不工作）
             0
         }
         1 => {
@@ -432,7 +433,16 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                 battery,
                 device_type: d,
             });
-            // 同步本机 uuid 到 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
+            // 同步本机 uuid 到持久化与 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
+            // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
+            if !local_uuid.is_empty() {
+                guard.ensure_persistence_loaded();
+                if guard.local_uuid.is_empty() {
+                    guard.local_uuid = local_uuid.clone();
+                    guard.mark_persistence_dirty();
+                }
+                guard.persistence_activated = true;
+            }
             crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
 
             if guard.broadcast_handle.is_some() {

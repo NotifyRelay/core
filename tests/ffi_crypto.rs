@@ -8,8 +8,13 @@ use std::sync::Mutex;
 use base64::Engine;
 use notify_relay_core::{ffi, CoreContext, SafeContext};
 
+static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 fn create_ctx() -> SafeContext {
-    Mutex::new(CoreContext::new())
+    let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = std::env::temp_dir()
+        .join(format!("nrctx_{}_{}", std::process::id(), n))
+        .join("rust_core.db");
+    Mutex::new(CoreContext::with_db_override(p))
 }
 
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {

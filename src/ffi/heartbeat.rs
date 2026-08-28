@@ -74,7 +74,16 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
         battery,
         device_type: d,
     });
-    // 同步本机 uuid 到 TCP 层状态（防御平台端 StartTcpServer 早于本函数调用的情况）
+    // 同步本机 uuid 到持久化（读取接口前自动落盘）与 TCP 层状态（防御平台端 StartTcpServer 早于本函数调用的情况）
+    // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
+    if !local_uuid.is_empty() {
+        guard.ensure_persistence_loaded();
+        if guard.local_uuid.is_empty() {
+            guard.local_uuid = local_uuid.clone();
+            guard.mark_persistence_dirty();
+        }
+        guard.persistence_activated = true;
+    }
     crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
 
     match crate::heartbeat::HeartbeatScheduler::start(ctx_ptr as usize, interval_ms) {

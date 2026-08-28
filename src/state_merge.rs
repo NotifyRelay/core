@@ -186,7 +186,7 @@ impl StateMerge {
         device_uuid: &str,
         is_media: bool,
         payload: &str,
-    ) -> Option<(String, String, bool)> {
+    ) -> Option<(String, String, bool, bool)> {
         let v: Value = serde_json::from_str(payload).ok()?;
         let feature_id = if is_media {
             MEDIA_KEY.to_string()
@@ -203,20 +203,45 @@ impl StateMerge {
         let is_end = v.get("terminateValue").and_then(|x| x.as_str()) == Some("__END__")
             || v.get("terminate").and_then(|x| x.as_bool()) == Some(true);
 
+        let mut need_full = false;
         let new_full = if v.get("type").and_then(|x| x.as_str()) == Some("delta") {
             let changes = v.get("changes").cloned().unwrap_or(Value::Null);
             let base = self.receivers.get(&key).map(|r| r.last_full.clone());
             let base_val: Value = base
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(Value::Object(Map::new()));
-            merge_island(&base_val, &changes)
+            let has_base = base_val.as_object().is_some_and(|m| !m.is_empty());
+            let merged = merge_island(&base_val, &changes);
+            if has_base {
+                merged
+            } else {
+                // 无前文基线：不建立合并基线，请求发送端重发 FULL
+                need_full = true;
+                fill_empty_fields(&merged)
+            }
         } else {
-            strip_routing(&v)
+            let stripped = strip_routing(&v);
+            // FULL 消息：检查是否包含恢复所需的基本字段
+            if let Ok(full_val) = serde_json::from_str::<Value>(&stripped) {
+                let has_title = full_val
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                let has_text = full_val
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if !has_title && !has_text {
+                    need_full = true;
+                }
+            }
+            stripped
         };
 
         if is_end {
             self.receivers.remove(&key);
-        } else {
+        } else if !need_full {
+            // 仅在拥有可靠基线（FULL 或有基线的 DELTA 合并结果）时才写入
             self.receivers.insert(
                 key.clone(),
                 ReceiverState {
@@ -224,7 +249,7 @@ impl StateMerge {
                 },
             );
         }
-        Some((feature_id, new_full, is_end))
+        Some((feature_id, new_full, is_end, need_full))
     }
 
     /// 处理来自接收端的 ACK，清除对应发送会话的 pending。
@@ -297,23 +322,42 @@ impl StateMerge {
                 }
                 1 => {
                     if let Some(s) = self.senders.get_mut(&key) {
-                        // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
-                        // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
-                        // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
-                        let keepalive = build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
                         let header = if s.is_media {
                             "DATA_MEDIAPLAY"
                         } else {
                             "DATA_SUPERISLAND"
                         };
-                        queue.enqueue(SendItem {
-                            device_uuid: s.device_uuid.clone(),
-                            header: header.to_string(),
-                            plaintext: keepalive,
-                            dedup_key: None,
-                            retries_left: 0,
-                            coalesce_key: None,
-                        });
+                        if s.force_full_next {
+                            // ACK 超时后接收端需要重新建立基线：用 last_full 发送 FULL
+                            let full_val: Value = serde_json::from_str(&s.last_full)
+                                .unwrap_or(Value::Object(Map::new()));
+                            let full_wire =
+                                build_full_wire(&full_val, &s.feature_id, &s.last_hash, false);
+                            queue.enqueue(SendItem {
+                                device_uuid: s.device_uuid.clone(),
+                                header: header.to_string(),
+                                plaintext: full_wire,
+                                dedup_key: None,
+                                retries_left: 0,
+                                coalesce_key: None,
+                            });
+                            s.force_full_next = false;
+                            s.pending_ack = Some((s.last_hash.clone(), Instant::now()));
+                        } else {
+                            // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
+                            // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
+                            // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
+                            let keepalive =
+                                build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
+                            queue.enqueue(SendItem {
+                                device_uuid: s.device_uuid.clone(),
+                                header: header.to_string(),
+                                plaintext: keepalive,
+                                dedup_key: None,
+                                retries_left: 0,
+                                coalesce_key: None,
+                            });
+                        }
                         // 保活周期基于上次真实发送：入队成功才重置，
                         // 事件推送同样会重置，避免固定周期导致的快速触发
                         s.last_push = Instant::now();
@@ -483,6 +527,29 @@ fn merge_island(base: &Value, changes: &Value) -> String {
     serde_json::to_string(&merged).unwrap_or_default()
 }
 
+/// 当没有前文可供合并时，将空字段填充为"未知"
+fn fill_empty_fields(s: &str) -> String {
+    let v: Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(_) => return s.to_string(),
+    };
+    let mut obj = match v {
+        Value::Object(m) => m,
+        _ => return s.to_string(),
+    };
+    let default_value = json!("未知");
+    for k in ["title", "text"] {
+        if let Some(val) = obj.get(k) {
+            if val.as_str().is_some_and(|s| s.is_empty()) {
+                obj.insert(k.to_string(), default_value.clone());
+            }
+        } else {
+            obj.insert(k.to_string(), default_value.clone());
+        }
+    }
+    serde_json::to_string(&obj).unwrap_or_default()
+}
+
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
 /// 并在需要时回 ACK。返回 true 表示该消息已被引擎消费（无需再走通用 on_data）。
 pub fn handle_state_message(
@@ -512,7 +579,7 @@ pub fn handle_state_message(
         }
         return true;
     }
-    let (fid, full, is_end) = {
+    let (fid, full, is_end, need_full) = {
         let g = ctx.get_mut().unwrap();
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
             Some(r) => r,
@@ -537,7 +604,8 @@ pub fn handle_state_message(
         cb_fn(uuid_c.as_ptr(), mt_c.as_ptr(), wire_c.as_ptr(), ud);
     }
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
-    if !is_media && !is_end {
+    // 无前文时不发 ACK，让发送端超时后强制发全量
+    if !is_media && !is_end && !need_full {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
             let g = ctx.get_mut().unwrap();
             if g.sender_queue != 0 {
@@ -560,6 +628,12 @@ pub fn handle_state_message(
                 q.enqueue(item);
             }
         }
+    } else if need_full {
+        log::debug!(
+            "[state_merge] 无前文,跳过ACK等待发送端超时重发全量 uuid={} fid={}",
+            uuid,
+            fid
+        );
     }
     true
 }
@@ -649,7 +723,7 @@ mod tests {
         let full1 = si_full("t1", "c1");
         let merged1 = {
             let mut r = StateMerge::new();
-            let (_, f, _) = r
+            let (_, f, _, _) = r
                 .merge_incoming(
                     "devA",
                     false,
@@ -741,6 +815,14 @@ mod tests {
         let mut sm = StateMerge::new();
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         q.test_drain_plaintexts();
+        // 模拟已收到 ACK：清除 pending_ack，避免 ACK 超时干扰保活测试
+        {
+            let s = sm
+                .senders
+                .get_mut(&StateMerge::key("devA", "test-sbn-key"))
+                .unwrap();
+            s.pending_ack = None;
+        }
         // 存在无变更 → 空差量保活包入队（接收端据此刷新时间戳，防"突然消失"）
         let queries = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries.len(), 1);
@@ -775,5 +857,49 @@ mod tests {
         assert!(sm
             .heartbeat_tick(Instant::now() + Duration::from_secs(31))
             .is_empty());
+    }
+
+    #[test]
+    fn test_ack_timeout_query_result_1_sends_full() {
+        // 场景：首次推送后接收端未回 ACK → ACK 超时标记 force_full_next →
+        // 心跳查询结果为 1（存在无变更）→ 应发送 FULL 而非空 DELTA
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        // 首次推送 FULL
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        q.test_drain_plaintexts();
+
+        // 模拟 ACK 超时：将 pending_ack 时间设为足够旧
+        {
+            let s = sm
+                .senders
+                .get_mut(&StateMerge::key("devA", "test-sbn-key"))
+                .unwrap();
+            s.pending_ack = Some((
+                s.last_hash.clone(),
+                Instant::now() - Duration::from_secs(10),
+            ));
+        }
+
+        // 心跳 tick：ACK 超时 → force_full_next = true
+        let later = Instant::now() + Duration::from_secs(31);
+        let queries = sm.heartbeat_tick(later);
+        assert_eq!(queries.len(), 1);
+
+        // 查询结果为 1（存在无变更）→ 应发送 FULL（因为 force_full_next）
+        sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 1)]);
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 1);
+        // 验证发送的是 FULL 而非 delta
+        assert!(items[0].contains("\"type\":\"SUPERISLAND\""));
+        assert!(!items[0].contains("\"type\":\"delta\""));
+        // 验证 force_full_next 已消费
+        let s = sm
+            .senders
+            .get(&StateMerge::key("devA", "test-sbn-key"))
+            .unwrap();
+        assert!(!s.force_full_next);
+        // 验证 pending_ack 已重新建立
+        assert!(s.pending_ack.is_some());
     }
 }

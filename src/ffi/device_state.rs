@@ -8,7 +8,9 @@ use super::common::{to_cstr, with_ctx};
 /// online = now - lastSeen <= 已配对 ? authed_timeout_ms : unauthed_timeout_ms
 /// 在线判定完全基于 lastSeen 时效（mark_connected 已刷新 lastSeen），
 /// 避免 TCP 半开连接（对端断网无 FIN/RST）导致 connected 粘滞而永远在线；
-/// connected 仅作快照展示字段。在线判定归 Rust；displayName 等 UI 元数据由平台端用 uuid 与 Room 匹配
+/// connected 仅作快照展示字段。在线判定归 Rust。
+/// 设备名称/IP 数据源：私有库设备行（改名/历史）+ 运行时注册表（实时），
+/// 读取前自动落盘（保证库与内存一致）。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_get_device_list(
     ctx_ptr: *mut c_void,
@@ -16,6 +18,8 @@ pub unsafe extern "C" fn nrc_get_device_list(
     unauthed_timeout_ms: i64,
 ) -> *mut c_char {
     let json = with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
+        let _ = ctx.flush_persistence();
         let now = crate::device_registry::now_sec();
         let paired: HashSet<String> = ctx.crypto.device_keys.keys().cloned().collect();
         let mut devices = ctx.registry.snapshot();
@@ -51,11 +55,45 @@ pub unsafe extern "C" fn nrc_get_device_list(
                 });
             }
         }
+        // 私有库设备行（含改名/元数据）以离线占位补全，名称/IP 优先于运行时空值
+        let persisted: Vec<crate::persistence::PersistedDevice> =
+            ctx.persisted_devices.values().cloned().collect();
+        for row in &persisted {
+            if !devices.iter().any(|d| d.uuid == row.uuid) {
+                devices.push(crate::device_registry::RegisteredDevice {
+                    uuid: row.uuid.clone(),
+                    name: row.display_name.clone(),
+                    ip: row.last_ip.clone(),
+                    port: row.last_port,
+                    battery: crate::device_registry::BATTERY_UNKNOWN,
+                    device_type: String::new(),
+                    last_seen: 0,
+                    connected: false,
+                });
+            }
+        }
 
         let list: Vec<serde_json::Value> = devices
             .into_iter()
-            .map(|d| {
-                let is_paired = paired.contains(&d.uuid);
+            .map(|mut d| {
+                let is_paired = paired.contains(&d.uuid)
+                    || ctx
+                        .persisted_devices
+                        .get(&d.uuid)
+                        .map(|x| x.is_accepted)
+                        .unwrap_or(false);
+                // 名称：库行（改名/历史）优先，运行时更新兜底
+                if let Some(row) = ctx.persisted_devices.get(&d.uuid) {
+                    if !row.display_name.is_empty() {
+                        d.name = row.display_name.clone();
+                    }
+                    if d.ip.is_empty() && !row.last_ip.is_empty() {
+                        d.ip = row.last_ip.clone();
+                    }
+                    if d.port == 0 && row.last_port > 0 {
+                        d.port = row.last_port;
+                    }
+                }
                 let threshold = if is_paired {
                     authed_timeout_ms
                 } else {

@@ -5,7 +5,7 @@ use base64::Engine;
 
 use crate::crypto::{self, aes, ecdh, hkdf};
 
-use super::common::{from_cstr, to_cstr, with_ctx};
+use super::common::{from_cstr, to_cstr, with_ctx, with_ctx_or};
 
 #[no_mangle]
 pub unsafe extern "C" fn nrc_migrate_shared_secret(
@@ -22,10 +22,16 @@ pub unsafe extern "C" fn nrc_migrate_shared_secret(
     if key_bytes.len() != 32 {
         return -1;
     }
-    with_ctx(ctx_ptr, |ctx| {
+    with_ctx_or(ctx_ptr, -1, |ctx| {
+        ctx.ensure_persistence_loaded();
         let b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         ctx.crypto
             .set_device_key(uuid.to_string(), String::new(), b64);
+        // 迁移导入的密钥：通过 flush_persistence 原子持久化（state + 设备行同一事务）
+        ctx.mark_persistence_dirty();
+        if !ctx.flush_persistence() {
+            return -1;
+        }
         0
     })
 }
@@ -36,9 +42,22 @@ pub unsafe extern "C" fn nrc_remove_device(
     device_uuid: *const c_char,
 ) -> i32 {
     let uuid = from_cstr(device_uuid);
-    with_ctx(ctx_ptr, |ctx| {
+    with_ctx_or(ctx_ptr, -1, |ctx| {
+        ctx.ensure_persistence_loaded();
+        // 先从内存移除：保持内存与意图一致
         ctx.crypto.device_keys.remove(uuid);
         ctx.registry.remove(uuid);
+        ctx.persisted_devices.remove(uuid);
+        // 加入待删除队列：flush_all 事务内执行 DELETE，与 state 更新原子生效
+        // 避免「行已删/state 未写」导致重启后旧 state 密钥回灌使设备"复活"
+        ctx.pending_device_deletions.push(uuid.to_string());
+        ctx.mark_persistence_dirty();
+        // 立即重写密钥状态：删除后进程被杀/重启时，旧 state 中的密钥
+        // 会把设备从库中"复活"，必须同步落盘（未激活时由下次读取前 flush 兜底）
+        if !ctx.flush_persistence() {
+            log::error!("删除设备后持久化落盘失败 {}: 将在下次读取前重试", uuid);
+            return -1;
+        }
         0
     })
 }
@@ -50,6 +69,7 @@ pub unsafe extern "C" fn nrc_export_device_key(
 ) -> *mut c_char {
     let uuid = from_cstr(device_uuid);
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         ctx.crypto
             .device_keys
             .get(uuid)
@@ -67,6 +87,7 @@ pub unsafe extern "C" fn nrc_export_device_key(
 #[no_mangle]
 pub extern "C" fn nrc_export_state(ctx_ptr: *mut c_void) -> *mut c_char {
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         let local_priv_pem = ctx
             .crypto
             .local_key
@@ -88,27 +109,11 @@ pub extern "C" fn nrc_export_state(ctx_ptr: *mut c_void) -> *mut c_char {
 pub unsafe extern "C" fn nrc_import_state(ctx_ptr: *mut c_void, json: *const c_char) -> i32 {
     let json_str = from_cstr(json);
     with_ctx(ctx_ptr, |ctx| {
+        ctx.ensure_persistence_loaded();
         match serde_json::from_str::<crypto::KeyStoreData>(json_str) {
             Ok(data) => {
-                if let Some(ref pem) = data.local_private_key_pem {
-                    ctx.crypto.local_key = ecdh::secret_from_pem(pem).ok();
-                }
-                ctx.crypto.local_pub_key_b64 = data.local_public_key_b64;
-                let mut device_keys = data.devices;
-                for entry in device_keys.values_mut() {
-                    if entry.aes_key_bytes.is_none() {
-                        if let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(&entry.aes_key_b64)
-                        {
-                            if bytes.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&bytes);
-                                entry.aes_key_bytes = Some(arr);
-                            }
-                        }
-                    }
-                }
-                ctx.crypto.device_keys = device_keys;
+                crate::persistence::apply_keystore_data(&mut ctx.crypto, &data);
+                ctx.mark_persistence_dirty();
                 0
             }
             Err(e) => {
