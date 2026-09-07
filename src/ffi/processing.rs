@@ -278,14 +278,24 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
 }
 
 fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
-    let uuid = match std::str::from_utf8(payload) {
-        Ok(s) => s.trim(),
+    // ACCEPT 负载格式：uuid:lt_pub_key（与 encode_accept 对应）
+    let (uuid, lt_pub_key) = match std::str::from_utf8(payload) {
+        Ok(s) => {
+            let s = s.trim();
+            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            let u = parts.first().map(|p| p.to_string()).unwrap_or_default();
+            let k = if parts.len() > 1 {
+                parts[1].to_string()
+            } else {
+                String::new()
+            };
+            (u, k)
+        }
         Err(_) => {
             log::error!("处理消息: ACCEPT payload 非 UTF-8");
             return -1;
         }
     };
-    let uuid = uuid.to_string();
 
     let (verifier_session, peer_spake2_pub) = {
         let guard = ctx.get_mut().unwrap();
@@ -311,7 +321,7 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                     guard.crypto.device_keys.insert(
                         uuid.clone(),
                         crate::crypto::DeviceKeyEntry {
-                            remote_pub_key: String::new(),
+                            remote_pub_key: lt_pub_key.clone(),
                             aes_key_b64: b64,
                             aes_key_bytes: Some(aes_key),
                         },
@@ -375,12 +385,13 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     let data = serde_json::json!({
         "uuid": uuid,
         "success": success,
+        "lt_pub_key": lt_pub_key,
     })
     .to_string();
     fire_pairing_cb(ctx, &uuid, "ACCEPT", &data, 0, "");
 
     if pairing_flow {
-        fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
+        fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "lt_pub_key": lt_pub_key, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
     }
 
     {

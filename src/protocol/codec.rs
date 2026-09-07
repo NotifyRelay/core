@@ -59,12 +59,16 @@ pub fn encode_pairing_resp(
 
 pub fn encode_accept(
     uuid: &str,
-    _lt_pub_key: &str,
+    lt_pub_key: &str,
     _ip: &str,
     _battery: i32,
     _device_type: &str,
 ) -> Vec<u8> {
-    binary_codec::encode_control_frame(MessageType::ACCEPT, uuid)
+    // 接收方在 ACCEPT 阶段需要发起方的长期公钥以完成长期密钥派生，
+    // 否则 device_keys.remote_pub_key 为空，导致 Kotlin 侧 deriveSharedSecret 失败。
+    // 负载格式与配对消息帧一致：uuid:lt_pub_key（base64 不含冒号，splitn(2, ':') 安全）。
+    let payload = format!("{}:{}", uuid, lt_pub_key);
+    binary_codec::encode_pairing_frame(MessageType::ACCEPT, &payload)
 }
 
 pub fn encode_reject(uuid: &str) -> Vec<u8> {
