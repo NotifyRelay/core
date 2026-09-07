@@ -470,7 +470,9 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                         }
                     };
 
-                    let _ = crate::network::send_udp_broadcast(&msg);
+                    if let Err(e) = crate::network::send_udp_broadcast(&msg) {
+                        log::error!("periodic-broadcast: UDP 广播发送失败: {}", e);
+                    }
                     thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
                 }) {
                 Ok(_) => {

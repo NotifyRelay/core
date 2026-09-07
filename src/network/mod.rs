@@ -530,6 +530,12 @@ pub fn start_udp_listener(
                         s if s.is_empty() => continue,
                         s => s,
                     };
+                    log::info!(
+                        "UDP 收到数据: src={}, len={}, preview={}",
+                        src_ip,
+                        n,
+                        &line[..line.len().min(80)]
+                    );
                     if let Some(ref cb) = on_heartbeat {
                         if let Some((uuid, name_b64, hb_port, battery, device_type)) =
                             heartbeat::parse_udp_heartbeat(&line)
