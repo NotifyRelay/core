@@ -430,9 +430,10 @@ pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
 
     let data = message.as_bytes();
 
-    socket
-        .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
-        .map_err(|e| format!("有限广播失败: {}", e))?;
+    // 有限广播失败不中止，部分 ROM（如小米 Pad）会拒绝 255.255.255.255
+    if let Err(e) = socket.send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT)) {
+        log::warn!("有限广播失败（继续尝试子网广播）: {}", e);
+    }
 
     #[cfg(target_os = "android")]
     {
