@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,6 +32,8 @@ pub struct TcpServerState {
     pub port: u16,
     /// 本机 uuid（运行期动态更新，用于 TCP 层拒绝自我连接）
     pub local_uuid: String,
+    /// 广播信息副本（供发现请求响应使用）
+    pub broadcast_info: Option<crate::BroadcastInfo>,
 }
 
 impl TcpServerState {
@@ -42,6 +44,7 @@ impl TcpServerState {
             running: false,
             port: 0,
             local_uuid: String::new(),
+            broadcast_info: None,
         }
     }
 
@@ -184,6 +187,13 @@ pub fn set_local_uuid(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
     }
 }
 
+/// 同步广播信息到 TCP 服务器状态（供发现请求响应使用）
+pub fn set_broadcast_info(state: Arc<Mutex<TcpServerState>>, info: Option<crate::BroadcastInfo>) {
+    if let Ok(mut s) = state.lock() {
+        s.broadcast_info = info;
+    }
+}
+
 /// 接受连接循环
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
@@ -237,7 +247,7 @@ fn accept_loop(
 
 /// 处理单个连接（二进制帧协议）
 fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     addr: SocketAddr,
     state: Arc<Mutex<TcpServerState>>,
     on_connected: Option<ConnectedCallback>,
@@ -252,7 +262,7 @@ fn handle_connection(
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
 
-    // 读取第一帧（允许任意类型：HANDSHAKE / DATA / 配对 / 心跳）
+    // 读取第一帧（允许任意类型：HANDSHAKE / DATA / 配对 / 心跳 / 发现请求）
     let (first_type, first_payload) = match binary_codec::read_frame(&mut reader) {
         Ok(f) => f,
         Err(e) => {
@@ -263,6 +273,43 @@ fn handle_connection(
             return;
         }
     };
+
+    // 发现请求：解析请求并回复本机发现响应，然后关闭连接
+    if first_type == MessageType::DISCOVERY_REQUEST {
+        let request_text = match std::str::from_utf8(&first_payload) {
+            Ok(s) => s.trim(),
+            Err(_) => {
+                log::warn!("DISCOVERY_REQUEST payload 非 UTF-8");
+                return;
+            }
+        };
+        // 从请求中解析发送方信息，记录IP映射
+        if let Some((peer_uuid, _name_b64, _port, _battery, _device_type)) =
+            crate::protocol::codec::decode_discovery_request(request_text)
+        {
+            if !peer_uuid.is_empty() && !ip.is_empty() {
+                log::debug!("TCP扫描发现: uuid={}, ip={}", peer_uuid, ip);
+            }
+        }
+        // 生成本机发现响应
+        if let Ok(s) = state.lock() {
+            if let Some(ref info) = s.broadcast_info {
+                let response = crate::protocol::codec::encode_discovery_response(
+                    &info.uuid,
+                    &info.name_b64,
+                    crate::protocol::codec::DEFAULT_TCP_PORT,
+                    info.battery,
+                    &info.device_type,
+                );
+                let resp_frame =
+                    binary_codec::encode_pairing_frame(MessageType::DISCOVERY_RESPONSE, &response);
+                use std::io::Write;
+                let _ = stream.write_all(&resp_frame);
+                let _ = stream.flush();
+            }
+        }
+        return;
+    }
 
     // 根据消息类型提取 UUID
     let uuid = match first_type {
@@ -497,7 +544,7 @@ pub fn tcp_scan_discover_single(
     discovery_request: &str,
     timeout_ms: u32,
 ) -> Option<(String, String, u16, i32, String)> {
-    use crate::protocol::codec;
+    use crate::protocol::{binary_codec, header::MessageType};
 
     let addr = format!("{}:{}", ip, crate::protocol::codec::DEFAULT_TCP_PORT);
     let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
@@ -513,26 +560,28 @@ pub fn tcp_scan_discover_single(
         .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
         .ok()?;
 
-    // 发送发现请求（文本格式，与UDP广播相同）
-    let mut writer = &stream;
-    use std::io::Write;
-    writer
-        .write_all(format!("{}\n", discovery_request).as_bytes())
-        .ok()?;
-    writer.flush().ok()?;
+    // 发送发现请求（二进制帧格式）
+    let frame =
+        binary_codec::encode_pairing_frame(MessageType::DISCOVERY_REQUEST, discovery_request);
+    {
+        let mut writer = &stream;
+        use std::io::Write;
+        writer.write_all(&frame).ok()?;
+        writer.flush().ok()?;
+    }
 
-    // 读取响应
+    // 读取响应（二进制帧格式）
     let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
+    let (_msg_type, payload) = binary_codec::read_frame(&mut reader).ok()?;
 
-    let trimmed = line.trim().to_string();
+    // 解析响应
+    let response_text = std::str::from_utf8(&payload).ok()?;
+    let trimmed = response_text.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    // 解析响应
-    codec::decode_discovery_response(&trimmed)
+    crate::protocol::codec::decode_discovery_response(trimmed)
 }
 
 /// TCP扫描发现：并发扫描局域网IP段

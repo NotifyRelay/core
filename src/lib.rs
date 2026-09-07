@@ -96,6 +96,7 @@ pub struct PairingContext {
     pub peer_lt_pub: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct BroadcastInfo {
     pub uuid: String,
     pub name_b64: String,

@@ -74,6 +74,8 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
         battery,
         device_type: d,
     });
+    // 同步广播信息到 TCP 层（供发现请求响应使用）
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
     // 同步本机 uuid 到持久化（读取接口前自动落盘）与 TCP 层状态（防御平台端 StartTcpServer 早于本函数调用的情况）
     // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
     if !local_uuid.is_empty() {

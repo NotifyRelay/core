@@ -425,6 +425,11 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                 battery,
                 device_type: d,
             });
+            // 同步广播信息到 TCP 层（供发现请求响应使用）
+            crate::network::set_broadcast_info(
+                guard.network.tcp.clone(),
+                guard.broadcast_info.clone(),
+            );
             // 同步本机 uuid 到持久化与 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
             // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
             if !local_uuid.is_empty() {
