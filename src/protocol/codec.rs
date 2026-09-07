@@ -32,21 +32,24 @@ pub fn encode_pairing_resp(
     uuid: &str,
     spake2_pub: &str,
     lt_pub: &str,
-    _ip: &str,
+    ip: &str,
     battery: i32,
     device_type: &str,
 ) -> Vec<u8> {
+    // 字段顺序须与 processing::process_pairing_resp 解析一致：
+    // uuid : spake2_pub : lt_pub : ip : battery : device_type
     let payload = if battery >= 0 {
         format!(
-            "{}:{}:{}:{}+:{}",
-            uuid, spake2_pub, lt_pub, battery, device_type
+            "{}:{}:{}:{}:{}+:{}",
+            uuid, spake2_pub, lt_pub, ip, battery, device_type
         )
     } else {
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             uuid,
             spake2_pub,
             lt_pub,
+            ip,
             battery.abs(),
             device_type
         )

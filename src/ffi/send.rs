@@ -331,11 +331,13 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
         None => return -1,
     };
 
+    // 响应方 IP 使用本机地址（与 nrc_send_pairing_init 对称），平台传入的 ip 仅作兜底
+    let local_ip = super::utils::get_local_ip_impl().unwrap_or_else(|| i.clone());
     let msg = {
         let guard = ctx.get_mut().unwrap();
         let (session, spake2_pub) = spake2::generate_verifier_session(&code);
         guard.spake2_verifier = Some(session);
-        codec::encode_pairing_resp(&u, &spake2_pub, &l, &i, battery, &d)
+        codec::encode_pairing_resp(&u, &spake2_pub, &l, &local_ip, battery, &d)
     };
 
     with_ctx(ctx_ptr, |ctx| {
