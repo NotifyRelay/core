@@ -623,6 +623,19 @@ pub fn handle_state_message(
             uuid,
             fid
         );
+        // 媒体 need_full 时，设置 force_full_next 确保下次推送时发送全量
+        if is_media {
+            let g = ctx.get_mut().unwrap();
+            let key = StateMerge::key(uuid, &fid);
+            if let Some(s) = g.state_merge.senders.get_mut(&key) {
+                s.force_full_next = true;
+                log::debug!(
+                    "[state_merge] 媒体 need_full,设置 force_full_next uuid={} fid={}",
+                    uuid,
+                    fid
+                );
+            }
+        }
     }
     true
 }

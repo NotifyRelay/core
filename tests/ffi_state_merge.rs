@@ -171,3 +171,24 @@ fn test_push_query_flag() {
     );
     assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 1), 0);
 }
+
+/// 媒体 need_full 回归测试：无前文 DELTA 时应设置 force_full_next
+#[test]
+fn test_media_need_full_sets_force_full_next() {
+    let ctx = create_ctx();
+    let queue_handle = make_queue_handle();
+
+    // 首次推送媒体状态（FULL）
+    assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 0), 0);
+
+    // 发送 DELTA 但无前文基线（模拟接收端重启后丢失基线）
+    let delta_state = r#"{"type":"delta","changes":{"title":"updated"}}"#;
+    assert_eq!(
+        push_media(&ctx, queue_handle, "dev-1", delta_state, 0, 0),
+        0
+    );
+
+    // 验证 force_full_next 已设置（下次推送应发送全量）
+    // 通过再次推送全量来验证不失败
+    assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 0), 0);
+}

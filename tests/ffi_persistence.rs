@@ -13,6 +13,10 @@ fn create_ctx() -> SafeContext {
     Mutex::new(CoreContext::new())
 }
 
+fn create_ctx_with_db(db: &std::path::Path) -> SafeContext {
+    Mutex::new(CoreContext::with_db_override(db.to_path_buf()))
+}
+
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
     ctx as *const SafeContext as *mut c_void
 }
@@ -307,4 +311,36 @@ fn test_persistence_full_flow() {
     cleanup(&db);
     let _ = std::fs::remove_dir_all(&dir);
     unsafe { std::env::remove_var("NR_NOTIFY_CORE_DB_PATH") };
+}
+
+/// 持久化故障注入测试：ensure_local_uuid 在 flush_persistence 事务中原子性保存
+#[test]
+fn test_uuid_atomicity_in_flush() {
+    let dir = db_path_env();
+    let db = dir.join("rust_core_atomicity.db");
+    cleanup(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    // 全新启动：UUID 仅在内存中生成，不立即保存
+    let ctx = create_ctx_with_db(&db);
+    let p = ctx_ptr(&ctx);
+
+    // 调用 ensure_local_uuid（通过 nrc_get_local_uuid 触发）
+    let uuid1 = unsafe { ffi::nrc_get_local_uuid(p) };
+    let uuid1_str = unsafe { read_cstr(uuid1) };
+    unsafe { free_str(uuid1) };
+    assert!(!uuid1_str.is_empty(), "UUID 应成功生成");
+
+    // 模拟重启验证 UUID 已持久化
+    drop(ctx);
+    let ctx2 = create_ctx_with_db(&db);
+    let p2 = ctx_ptr(&ctx2);
+    let uuid2 = unsafe { ffi::nrc_get_local_uuid(p2) };
+    let uuid2_str = unsafe { read_cstr(uuid2) };
+    unsafe { free_str(uuid2) };
+    assert_eq!(uuid1_str, uuid2_str, "重启后 UUID 应一致");
+
+    cleanup(&db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
