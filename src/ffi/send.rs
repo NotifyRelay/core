@@ -383,7 +383,7 @@ pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_ch
     });
 }
 
-const BROADCAST_INTERVAL_MS: u64 = 2000;
+const BROADCAST_INTERVAL_MS: u64 = 30000; // TCP扫描发现间隔：30秒
 
 #[no_mangle]
 pub unsafe extern "C" fn nrc_periodic_broadcast(
@@ -446,17 +446,17 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
             let ctx_usize = ctx_ptr as usize;
 
             match thread::Builder::new()
-                .name("periodic-broadcast".to_string())
+                .name("periodic-discovery".to_string())
                 .spawn(move || loop {
                     if !r.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    let msg = {
+                    let discovery_request = {
                         let ctx = unsafe { &mut *(ctx_usize as *mut SafeContext) };
                         let guard = ctx.get_mut().unwrap();
                         match &guard.broadcast_info {
-                            Some(i) => codec::encode_udp_broadcast(
+                            Some(i) => codec::encode_discovery_request(
                                 &i.uuid,
                                 &i.name_b64,
                                 codec::DEFAULT_TCP_PORT,
@@ -470,9 +470,11 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                         }
                     };
 
-                    if let Err(e) = crate::network::send_udp_broadcast(&msg) {
-                        log::error!("periodic-broadcast: UDP 广播发送失败: {}", e);
-                    }
+                    // TCP扫描发现
+                    crate::network::tcp_scan_discover_all(
+                        &discovery_request,
+                        None, // 回调由平台层通过心跳处理
+                    );
                     thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
                 }) {
                 Ok(_) => {
@@ -480,7 +482,7 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                     0
                 }
                 Err(e) => {
-                    log::error!("启动广播线程失败: {}", e);
+                    log::error!("启动发现线程失败: {}", e);
                     -1
                 }
             }

@@ -108,6 +108,8 @@ pub enum ProtocolHeader<'a> {
     Handshake,
     Data(&'a str),
     HeartbeatTcp,
+    DiscoveryRequest,
+    DiscoveryResponse,
     Unknown(&'a str),
 }
 
@@ -131,6 +133,12 @@ impl<'a> ProtocolHeader<'a> {
         }
     }
 
+    /// 检查是否是发现请求/响应格式（无前缀，冒号分隔的5个字段）
+    pub fn is_discovery_message(line: &'a str) -> bool {
+        let parts: Vec<&str> = line.split(':').collect();
+        parts.len() == 5
+    }
+
     pub fn is_data(&self) -> bool {
         matches!(self, Self::Data(_))
     }
@@ -146,6 +154,8 @@ impl fmt::Display for ProtocolHeader<'_> {
             Self::Ack => write!(f, "ACK"),
             Self::Handshake => write!(f, "HANDSHAKE"),
             Self::HeartbeatTcp => write!(f, "HEARTBEAT_TCP"),
+            Self::DiscoveryRequest => write!(f, "DISCOVERY_REQUEST"),
+            Self::DiscoveryResponse => write!(f, "DISCOVERY_RESPONSE"),
             Self::Data(h) => write!(f, "{}", h),
             Self::Unknown(h) => write!(f, "{}", h),
         }

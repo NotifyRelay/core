@@ -50,20 +50,6 @@ fn now_sec() -> i64 {
         .as_secs() as i64
 }
 
-pub fn parse_udp_heartbeat(line: &str) -> Option<(String, String, u16, i32, String)> {
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    Some((
-        parts[0].to_string(),
-        parts[1].to_string(),
-        parts[2].parse().unwrap_or(codec::DEFAULT_TCP_PORT),
-        parts[3].parse().unwrap_or(0),
-        parts[4].to_string(),
-    ))
-}
-
 /// 心跳发送器参数（可通过 FFI 更新）
 pub struct HeartbeatSenderParams {
     pub uuid: Mutex<String>,
@@ -325,22 +311,9 @@ impl HeartbeatScheduler {
 
                     let known_devices = guard.discovery.get_known_devices();
                     let paired: Vec<String> = guard.crypto.device_keys.keys().cloned().collect();
-                    // 广播主用（默认）：UDP 广播 2s 兼发现+心跳，不启动每设备心跳；
-                    // TCP 备用（锁屏/WLAN直连）：为已配对设备启动每设备 TCP 定向心跳
-                    let tcp_backup = guard.heartbeat_tcp_backup.load(Ordering::Relaxed);
 
                     // 已配对设备的 handle 注册表（uuid -> HeartbeatHandle，跨轮次持久）
                     let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
-
-                    // 0. 广播主用模式：停止全部每设备心跳（广播已承担心跳职责）
-                    if !tcp_backup {
-                        for (_, h) in handles.drain() {
-                            h.stop();
-                        }
-                        guard.heartbeat_scheduler_handles = handles;
-                        thread::sleep(Duration::from_millis(interval_ms.min(2000)));
-                        continue;
-                    }
 
                     // 1. 移除已不在 known_devices 的 handle
                     let stale: Vec<String> = handles.keys().cloned().collect();

@@ -103,7 +103,8 @@ pub fn encode_data_message(
     binary_codec::encode_data_frame(msg_type, local_uuid, local_pub_key, encrypted_payload)
 }
 
-pub fn encode_udp_broadcast(
+/// 编码发现请求（格式同UDP广播：uuid:name_b64:port:battery:device_type）
+pub fn encode_discovery_request(
     uuid: &str,
     name_b64: &str,
     port: u16,
@@ -119,4 +120,34 @@ pub fn encode_udp_broadcast(
         "{}:{}:{}:{}:{}",
         uuid, name_b64, port, battery_str, device_type
     )
+}
+
+/// 解码发现请求
+pub fn decode_discovery_request(line: &str) -> Option<(String, String, u16, i32, String)> {
+    let parts: Vec<&str> = line.split(':').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let uuid = parts[0].to_string();
+    let name_b64 = parts[1].to_string();
+    let port = parts[2].parse().ok()?;
+    let battery = parts[3].parse().unwrap_or(0);
+    let device_type = parts[4].to_string();
+    Some((uuid, name_b64, port, battery, device_type))
+}
+
+/// 编码发现响应（格式同请求：uuid:name_b64:port:battery:device_type）
+pub fn encode_discovery_response(
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+) -> String {
+    encode_discovery_request(uuid, name_b64, port, battery, device_type)
+}
+
+/// 解码发现响应
+pub fn decode_discovery_response(line: &str) -> Option<(String, String, u16, i32, String)> {
+    decode_discovery_request(line)
 }

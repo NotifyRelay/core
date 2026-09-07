@@ -27,16 +27,6 @@ pub extern "C" fn nrc_set_on_state_query_cb(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_set_on_heartbeat_udp_cb(
-    ctx_ptr: *mut c_void,
-    cb: crate::router::OnHeartbeatUdpCb,
-) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.router.on_heartbeat_udp = cb;
-    });
-}
-
-#[no_mangle]
 pub extern "C" fn nrc_set_on_device_timeout_cb(
     ctx_ptr: *mut c_void,
     cb: crate::router::OnDeviceTimeoutCb,
