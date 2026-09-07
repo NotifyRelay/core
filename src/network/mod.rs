@@ -421,7 +421,10 @@ pub fn remove_device_session(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
 /// UDP 广播端口
 const UDP_BROADCAST_PORT: u16 = 23334;
 
-/// 发送 UDP 广播消息（支持多子网）
+/// UDP 组播地址（受管理范围，避免与公网冲突）
+const MULTICAST_GROUP: &str = "239.255.0.1";
+
+/// 发送 UDP 组播消息（兼容广播兜底）
 pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("绑定 UDP 失败: {}", e))?;
     socket
@@ -430,9 +433,14 @@ pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
 
     let data = message.as_bytes();
 
-    // 有限广播失败不中止，部分 ROM（如小米 Pad）会拒绝 255.255.255.255
-    if let Err(e) = socket.send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT)) {
-        log::warn!("有限广播失败（继续尝试子网广播）: {}", e);
+    // 优先组播发送
+    let multicast_addr = format!("{}:{}", MULTICAST_GROUP, UDP_BROADCAST_PORT);
+    if let Err(e) = socket.send_to(data, &multicast_addr) {
+        log::warn!("组播发送失败，回退广播: {}", e);
+        // 组播失败时回退到有限广播
+        if let Err(e2) = socket.send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT)) {
+            log::warn!("有限广播也失败: {}", e2);
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -497,6 +505,53 @@ unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
     ]
 }
 
+/// 加入组播组以接收组播消息
+#[cfg(target_os = "android")]
+fn join_multicast_group(socket: &UdpSocket, multicast_addr: &str) -> Result<(), String> {
+    use std::net::Ipv4Addr;
+    use std::os::fd::AsRawFd;
+
+    let group_ip: Ipv4Addr = multicast_addr
+        .parse()
+        .map_err(|e| format!("解析组播地址失败: {}", e))?;
+    let group_bytes = group_ip.octets();
+
+    // Android/Linux: 使用 IP_ADD_MEMBERSHIP (setsockopt)
+    // ip_mreq { imr_multiaddr, imr_interface }
+    // imr_interface = INADDR_ANY (0.0.0.0) 让系统选择接口
+    let mreq = libc::ip_mreq {
+        imr_multiaddr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(group_bytes),
+        },
+        imr_interface: libc::in_addr { s_addr: 0 }, // INADDR_ANY
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_ADD_MEMBERSHIP,
+            &mreq as *const libc::ip_mreq as *const libc::c_void,
+            std::mem::size_of::<libc::ip_mreq>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log::warn!("加入组播组 {} 失败: {}", multicast_addr, err);
+        // 不中止，广播兜底仍然有效
+    } else {
+        log::info!("已加入组播组 {}", multicast_addr);
+    }
+
+    Ok(())
+}
+
+/// 非 Android 平台暂不加入组播组（广播兜底）
+#[cfg(not(target_os = "android"))]
+fn join_multicast_group(_socket: &UdpSocket, multicast_addr: &str) -> Result<(), String> {
+    log::info!("跳过组播加入（仅 Android 启用）: {}", multicast_addr);
+    Ok(())
+}
+
 /// 启动 UDP 监听器，绑定到指定端口接收心跳广播
 pub fn start_udp_listener(
     port: u16,
@@ -509,6 +564,9 @@ pub fn start_udp_listener(
     socket
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|e| format!("设置 UDP 超时失败: {}", e))?;
+
+    // 加入组播组以接收组播消息
+    join_multicast_group(&socket, MULTICAST_GROUP)?;
 
     let running = Arc::new(Mutex::new(true));
     let running_clone = running.clone();
