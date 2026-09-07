@@ -128,6 +128,4 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
             b.device_type = d;
         }
     }
-    // 本机名称/电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
-    guard.mdns.update_name_battery(&n, battery);
 }

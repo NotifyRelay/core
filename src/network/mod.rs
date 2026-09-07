@@ -517,8 +517,11 @@ pub fn get_local_subnet_ips() -> Vec<String> {
             if let Ok(addr) = socket.local_addr() {
                 if let std::net::IpAddr::V4(ip) = addr.ip() {
                     let octets = ip.octets();
-                    // 生成同子网的所有IP（/24子网）
+                    // 生成同子网的所有IP（/24子网），排除本机自身（避免自我扫描）
                     for i in 1..=254 {
+                        if octets[3] == i {
+                            continue;
+                        }
                         let subnet_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], i);
                         ips.push(subnet_ip.to_string());
                     }
@@ -536,6 +539,9 @@ pub fn get_local_subnet_ips() -> Vec<String> {
 
     ips
 }
+
+/// 单 IP 扫描超时（毫秒）：局域网内连接/响应均为毫秒级，超时过长会拖慢整轮扫描
+const SCAN_SINGLE_TIMEOUT_MS: u32 = 1200;
 
 /// TCP扫描发现：向指定IP发送发现请求并解析响应
 /// 返回 (uuid, name_b64, port, battery, device_type)
@@ -592,10 +598,11 @@ pub fn tcp_scan_discover_all(
     >,
 ) {
     let ips = get_local_subnet_ips();
-    let pool_size = std::thread::available_parallelism()
+    let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(20); // 限制最大并发数
+        .unwrap_or(4);
+    // 并发上限：一轮扫描需控制在发现周期内（多数 IP 为瞬时拒绝），移动端同时限制线程数
+    let pool_size = (parallelism * 8).clamp(8, 96);
 
     let pool = threadpool::ThreadPool::new(pool_size);
     let on_discovered = on_device_discovered;
@@ -606,7 +613,7 @@ pub fn tcp_scan_discover_all(
 
         pool.execute(move || {
             if let Some((uuid, name_b64, port, battery, device_type)) =
-                tcp_scan_discover_single(&ip, &request, 3000)
+                tcp_scan_discover_single(&ip, &request, SCAN_SINGLE_TIMEOUT_MS)
             {
                 if let Some(ref cb) = cb {
                     cb(uuid, name_b64, port, battery, device_type, ip);

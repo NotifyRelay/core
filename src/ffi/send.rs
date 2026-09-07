@@ -383,7 +383,7 @@ pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_ch
     });
 }
 
-const BROADCAST_INTERVAL_MS: u64 = 30000; // TCP扫描发现间隔：30秒
+const BROADCAST_INTERVAL_MS: u64 = 10000; // TCP扫描发现间隔：10秒（需小于未认证在线窗口，避免列表闪烁）
 
 #[no_mangle]
 pub unsafe extern "C" fn nrc_periodic_broadcast(
@@ -483,14 +483,41 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                         Some(Arc::new(
                             move |uuid, name_b64, port, battery, device_type, ip| {
                                 let ctx_ref = unsafe { &*(scan_ctx as *const SafeContext) };
-                                let (cb, user_data) = if let Ok(guard) = ctx_ref.lock() {
-                                    (guard.router.on_device_discovered, guard.router.user_data)
-                                } else {
-                                    (None, std::ptr::null_mut())
+                                let Ok(guard) = ctx_ref.lock() else {
+                                    return;
                                 };
+                                // 跳过本机自身：扫描会覆盖本机所在 IP，避免自我登记为远程设备
+                                if guard
+                                    .broadcast_info
+                                    .as_ref()
+                                    .map(|b| b.uuid == uuid)
+                                    .unwrap_or(false)
+                                {
+                                    return;
+                                }
+                                // 名称 base64 解码（与心跳路径一致），失败回退原串
+                                let name = String::from_utf8(
+                                    base64::engine::general_purpose::STANDARD
+                                        .decode(&name_b64)
+                                        .unwrap_or_default(),
+                                )
+                                .unwrap_or(name_b64);
+                                // 设备状态统一由 core 维护：登记注册表并刷新 last_seen（在线判定唯一依据）
+                                guard.registry.upsert(
+                                    &uuid,
+                                    &name,
+                                    &ip,
+                                    port,
+                                    battery,
+                                    &device_type,
+                                );
+                                let (cb, user_data) =
+                                    (guard.router.on_device_discovered, guard.router.user_data);
+                                // 回调前释放锁：平台端回调内可能再次调用 core 接口（如拉取设备快照）
+                                drop(guard);
                                 if let Some(f) = cb {
                                     let c_uuid = CString::new(uuid).unwrap_or_default();
-                                    let c_name = CString::new(name_b64).unwrap_or_default();
+                                    let c_name = CString::new(name).unwrap_or_default();
                                     let c_type = CString::new(device_type).unwrap_or_default();
                                     let c_ip = CString::new(ip).unwrap_or_default();
                                     f(

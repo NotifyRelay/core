@@ -3,12 +3,20 @@ use std::os::raw::{c_char, c_void};
 
 use super::common::{to_cstr, with_ctx};
 
+/// 已配对设备在线判定默认窗口（毫秒）：平台端传 <=0 时使用
+const DEFAULT_AUTHED_ONLINE_MS: i64 = 12_000;
+/// 未配对设备在线判定默认窗口（毫秒）：平台端传 <=0 时使用。
+/// 需大于扫描周期（10s），否则扫描间隔内设备会被判定离线而在列表中闪烁
+const DEFAULT_UNAUTHED_ONLINE_MS: i64 = 20_000;
+
 /// 获取设备状态快照（JSON 数组）
 /// 每项: {uuid, name, ip, port, battery, deviceType, lastSeen, connected, paired, online}
 /// online = now - lastSeen <= 已配对 ? authed_timeout_ms : unauthed_timeout_ms
 /// 在线判定完全基于 lastSeen 时效（mark_connected 已刷新 lastSeen），
 /// 避免 TCP 半开连接（对端断网无 FIN/RST）导致 connected 粘滞而永远在线；
 /// connected 仅作快照展示字段。在线判定归 Rust。
+/// 可见性同样归 Rust：未配对、且未被平台登记（known_devices / 私有库设备行）且已离线的
+/// 设备不再返回，平台端只负责展示，不再各自实现过滤策略（两端行为保持一致）。
 /// 设备名称/IP 数据源：私有库设备行（改名/历史）+ 运行时注册表（实时），
 /// 读取前自动落盘（保证库与内存一致）。
 #[no_mangle]
@@ -17,6 +25,17 @@ pub unsafe extern "C" fn nrc_get_device_list(
     authed_timeout_ms: i64,
     unauthed_timeout_ms: i64,
 ) -> *mut c_char {
+    // 平台端传 <=0 表示使用 core 内建阈值（保持 ABI 兼容）
+    let authed_timeout_ms = if authed_timeout_ms > 0 {
+        authed_timeout_ms
+    } else {
+        DEFAULT_AUTHED_ONLINE_MS
+    };
+    let unauthed_timeout_ms = if unauthed_timeout_ms > 0 {
+        unauthed_timeout_ms
+    } else {
+        DEFAULT_UNAUTHED_ONLINE_MS
+    };
     let json = with_ctx(ctx_ptr, |ctx| {
         ctx.ensure_persistence_loaded();
         let _ = ctx.flush_persistence();
@@ -26,7 +45,9 @@ pub unsafe extern "C" fn nrc_get_device_list(
 
         // 补全：已登记已知设备（known_devices，平台只喂 uuid+ip）但尚未收到心跳的设备，
         // 以离线占位显示，保持平台端「已配对设备始终在列表」的旧行为
+        let mut known_uuids: HashSet<String> = HashSet::new();
         for (uuid, ip) in ctx.discovery.get_known_devices() {
+            known_uuids.insert(uuid.clone());
             if !devices.iter().any(|d| d.uuid == uuid) {
                 devices.push(crate::device_registry::RegisteredDevice {
                     uuid,
@@ -58,6 +79,7 @@ pub unsafe extern "C" fn nrc_get_device_list(
         // 私有库设备行（含改名/元数据）以离线占位补全，名称/IP 优先于运行时空值
         let persisted: Vec<crate::persistence::PersistedDevice> =
             ctx.persisted_devices.values().cloned().collect();
+        let persisted_uuids: HashSet<String> = persisted.iter().map(|r| r.uuid.clone()).collect();
         for row in &persisted {
             if !devices.iter().any(|d| d.uuid == row.uuid) {
                 devices.push(crate::device_registry::RegisteredDevice {
@@ -75,7 +97,7 @@ pub unsafe extern "C" fn nrc_get_device_list(
 
         let list: Vec<serde_json::Value> = devices
             .into_iter()
-            .map(|mut d| {
+            .filter_map(|mut d| {
                 let is_paired = paired.contains(&d.uuid)
                     || ctx
                         .persisted_devices
@@ -101,7 +123,16 @@ pub unsafe extern "C" fn nrc_get_device_list(
                 };
                 let online = threshold > 0
                     && now.saturating_sub(d.last_seen).saturating_mul(1000) <= threshold;
-                serde_json::json!({
+                // 可见性归 core：未配对、未被平台登记（known_devices/私有库设备行）且已离线的设备不进入列表。
+                // 仅由扫描/心跳临时发现的设备离线后即消失，平台端不再各自实现过滤策略
+                if !is_paired
+                    && !known_uuids.contains(&d.uuid)
+                    && !persisted_uuids.contains(&d.uuid)
+                    && !online
+                {
+                    return None;
+                }
+                Some(serde_json::json!({
                     "uuid": d.uuid,
                     "name": d.name,
                     "ip": d.ip,
@@ -112,7 +143,7 @@ pub unsafe extern "C" fn nrc_get_device_list(
                     "connected": d.connected,
                     "paired": is_paired,
                     "online": online,
-                })
+                }))
             })
             .collect();
         serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())

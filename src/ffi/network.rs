@@ -179,11 +179,11 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
         .start_known_device_scanner(ctx_ptr as usize);
 }
 
-/// 高层统一启动接口：一次完成 TCP/UDP、发送队列、心跳调度、离线检测、
-/// 已知设备扫描、重连状态机、mDNS 广告与发现的启动。
+/// 高层统一启动接口：一次完成 TCP、发送队列、心跳调度、离线检测、
+/// 已知设备扫描、重连状态机的启动。
 /// 返回发送队列句柄（正整数，供入队使用），失败返回 0。
 /// 注意：本机身份（uuid/name/battery/device_type）写入 broadcast_info；
-/// pubkey 用于 mDNS 广告 TXT。
+/// 设备发现由 nrc_periodic_broadcast 启动的 TCP 扫描负责。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_start_core(
     ctx_ptr: *mut c_void,
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn nrc_start_core(
     battery: i32,
     device_type: *const c_char,
     tcp_port: u16,
-    pubkey: *const c_char,
+    _pubkey: *const c_char,
     heartbeat_interval_ms: u64,
     offline_timeout_sec: i64,
     offline_check_interval_ms: u64,
@@ -211,7 +211,7 @@ pub unsafe extern "C" fn nrc_start_core(
 
     // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
     if start_tcp_server_impl(ctx_ptr, tcp_port) != 0 {
-        // TCP 绑定失败不阻塞其他组件：发送队列/心跳/mDNS 照常启动，
+        // TCP 绑定失败不阻塞其他组件：发送队列/心跳照常启动，
         // 出站发送由发送队列 worker 独立负责，网络恢复后重连状态机会补建连接
         log::warn!("nrc_start_core: TCP 服务器启动失败，继续启动其他组件");
     }
@@ -257,23 +257,6 @@ pub unsafe extern "C" fn nrc_start_core(
             reconnect_interval_secs,
             reconnect_max_retries,
         );
-    }
-
-    // mDNS 广告 + 发现
-    if super::mdns::start_mdns_advertiser_impl(
-        ctx_ptr,
-        uuid,
-        name,
-        tcp_port,
-        pubkey,
-        device_type,
-        battery,
-    ) != 0
-    {
-        log::warn!("nrc_start_core: mDNS 广告启动失败");
-    }
-    if super::mdns::start_mdns_discovery_impl(ctx_ptr) != 0 {
-        log::warn!("nrc_start_core: mDNS 发现启动失败");
     }
 
     queue_handle

@@ -12,7 +12,6 @@ mod discovery;
 pub mod ffi;
 mod filter;
 mod heartbeat;
-mod mdns;
 mod models;
 mod network;
 mod persistence;
@@ -38,7 +37,6 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub audio: Arc<Mutex<audio_stream::AudioStreamState>>,
     pub network: network::NetworkState,
-    pub mdns: mdns::MdnsState,
     pub dedup: dedup::DedupState,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
@@ -117,7 +115,6 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             audio: Arc::new(Mutex::new(audio_stream::AudioStreamState::new())),
             network: network::NetworkState::new(),
-            mdns: mdns::MdnsState::new(),
             dedup: dedup::DedupState::new(),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),

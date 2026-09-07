@@ -21,18 +21,6 @@ pub type OnDataCb = Option<
     ),
 >;
 
-pub type OnMdnsDiscoveredCb = Option<
-    extern "C" fn(
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        u16,
-        i32, // battery（正=充电，负=放电，-101=未知）
-        *const c_char,
-        *mut c_void,
-    ),
->;
-
 /// 状态查询回调（心跳线程锁外调用）：
 /// 参数为 (device_uuid, feature_id, is_media, user_data)，返回状态码：
 /// 0 = 该会话在平台上不存在（引擎应移除会话，不发任何包）
@@ -65,7 +53,6 @@ pub struct Router {
     pub on_data: OnDataCb,
     pub on_state_query: OnStateQueryCb,
 
-    pub on_mdns_discovered: OnMdnsDiscoveredCb,
     pub on_device_discovered: OnDeviceDiscoveredCb,
     pub on_device_timeout: OnDeviceTimeoutCb,
     pub on_device_connected: OnDeviceConnectedCb,
@@ -80,7 +67,6 @@ impl Router {
             on_pairing: None,
             on_data: None,
             on_state_query: None,
-            on_mdns_discovered: None,
             on_device_discovered: None,
             on_device_timeout: None,
             on_device_connected: None,
