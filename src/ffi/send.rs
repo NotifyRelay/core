@@ -475,10 +475,36 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                         }
                     };
 
-                    // TCP扫描发现
+                    // TCP扫描发现：回调闭包仅捕获 ctx_usize（usize 是 Send+Sync），
+                    // 每次回调时从上下文读取 on_device_discovered 和 user_data
+                    let scan_ctx = ctx_usize;
                     crate::network::tcp_scan_discover_all(
                         &discovery_request,
-                        None, // 回调由平台层通过心跳处理
+                        Some(Arc::new(
+                            move |uuid, name_b64, port, battery, device_type, ip| {
+                                let ctx_ref = unsafe { &*(scan_ctx as *const SafeContext) };
+                                let (cb, user_data) = if let Ok(guard) = ctx_ref.lock() {
+                                    (guard.router.on_device_discovered, guard.router.user_data)
+                                } else {
+                                    (None, std::ptr::null_mut())
+                                };
+                                if let Some(f) = cb {
+                                    let c_uuid = CString::new(uuid).unwrap_or_default();
+                                    let c_name = CString::new(name_b64).unwrap_or_default();
+                                    let c_type = CString::new(device_type).unwrap_or_default();
+                                    let c_ip = CString::new(ip).unwrap_or_default();
+                                    f(
+                                        c_uuid.as_ptr(),
+                                        c_name.as_ptr(),
+                                        port,
+                                        battery,
+                                        c_type.as_ptr(),
+                                        c_ip.as_ptr(),
+                                        user_data,
+                                    );
+                                }
+                            },
+                        )),
                     );
                     thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS));
                 }) {

@@ -72,3 +72,13 @@ pub extern "C" fn nrc_set_on_mdns_discovered_cb(
         ctx.router.on_mdns_discovered = cb;
     });
 }
+
+#[no_mangle]
+pub extern "C" fn nrc_set_on_device_discovered_cb(
+    ctx_ptr: *mut c_void,
+    cb: crate::router::OnDeviceDiscoveredCb,
+) {
+    with_ctx(ctx_ptr, |ctx| {
+        ctx.router.on_device_discovered = cb;
+    });
+}

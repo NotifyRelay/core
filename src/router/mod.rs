@@ -47,6 +47,18 @@ pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char
 pub type OnDeviceDisconnectedCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 pub type OnTcpErrorCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
+pub type OnDeviceDiscoveredCb = Option<
+    extern "C" fn(
+        *const c_char, // device_uuid
+        *const c_char, // name_b64
+        u16,           // port
+        i32,           // battery
+        *const c_char, // device_type
+        *const c_char, // ip
+        *mut c_void,   // user_data
+    ),
+>;
+
 pub struct Router {
     pub user_data: *mut c_void,
     pub on_pairing: OnPairingCb,
@@ -54,6 +66,7 @@ pub struct Router {
     pub on_state_query: OnStateQueryCb,
 
     pub on_mdns_discovered: OnMdnsDiscoveredCb,
+    pub on_device_discovered: OnDeviceDiscoveredCb,
     pub on_device_timeout: OnDeviceTimeoutCb,
     pub on_device_connected: OnDeviceConnectedCb,
     pub on_device_disconnected: OnDeviceDisconnectedCb,
@@ -68,6 +81,7 @@ impl Router {
             on_data: None,
             on_state_query: None,
             on_mdns_discovered: None,
+            on_device_discovered: None,
             on_device_timeout: None,
             on_device_connected: None,
             on_device_disconnected: None,
