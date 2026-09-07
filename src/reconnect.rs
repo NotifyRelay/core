@@ -187,8 +187,6 @@ impl ReconnectState {
                                 .as_ref()
                                 .map(|i| i.uuid.clone())
                                 .unwrap_or_default();
-                            let local_pub =
-                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
                             let local_battery = guard
                                 .broadcast_info
                                 .as_ref()
@@ -201,13 +199,7 @@ impl ReconnectState {
                                 .unwrap_or_default();
                             let local_ip =
                                 crate::ffi::utils::get_local_ip_impl().unwrap_or_default();
-                            codec::encode_handshake(
-                                &local_uuid,
-                                &local_pub,
-                                &local_ip,
-                                local_battery,
-                                &dt,
-                            )
+                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt)
                         };
 
                         let resp = crate::network::oneshot_send_receive_bin(

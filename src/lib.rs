@@ -45,6 +45,9 @@ pub struct CoreContext {
     pub registry: device_registry::DeviceRegistry,
     pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
     pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
+    /// SPAKE2 协商出的会话密钥 K_s([u8;32])，配对阶段暂存：
+    /// 用于 AES 加密/解密长期公钥 lt_pub，RESULT 后清零，避免长期驻留。
+    pub spake2_session_key: Option<[u8; 32]>,
     pub pairing_ctx: Option<PairingContext>,
     pub expected_pairing_code: Option<String>,
     /// 配对码生成（接收端/初始生成端）
@@ -123,6 +126,7 @@ impl CoreContext {
             device_ips: Mutex::new(HashMap::new()),
             spake2_prover: None,
             spake2_verifier: None,
+            spake2_session_key: None,
             pairing_ctx: None,
             expected_pairing_code: None,
             pairing_code: None,

@@ -84,8 +84,6 @@ pub fn type_to_data_header(msg_type: u8) -> &'static str {
 pub struct ProtoHandshake {
     #[serde(rename = "uuid")]
     pub uuid: String,
-    #[serde(rename = "pubKey")]
-    pub pub_key: String,
     #[serde(rename = "deviceName")]
     pub device_name: String,
     #[serde(rename = "deviceType")]
@@ -97,9 +95,10 @@ pub struct ProtoHandshake {
 }
 
 /// 编码 ProtoHandshake 为二进制帧
+/// 注意：HANDSHAKE 不再携带长期公钥 pub_key（公钥在配对阶段经 SPAKE2 会话密钥加密交换并锁定），
+/// 重连时仅使用已锁定的 remote_pub_key 派生，避免明文重传。
 pub fn encode_handshake_frame(
     uuid: &str,
-    pub_key: &str,
     device_name: &str,
     device_type: &str,
     battery: i32,
@@ -107,7 +106,6 @@ pub fn encode_handshake_frame(
 ) -> Vec<u8> {
     let hs = ProtoHandshake {
         uuid: uuid.to_string(),
-        pub_key: pub_key.to_string(),
         device_name: device_name.to_string(),
         device_type: device_type.to_string(),
         battery,

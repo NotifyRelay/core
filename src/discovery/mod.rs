@@ -105,13 +105,12 @@ impl DiscoveryState {
                         has_offline = true;
 
                         // 尝试握手建立连接（携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示）
-                        let (local_uuid, local_pub, local_battery, local_ip) = {
+                        let (local_uuid, local_battery, local_ip) = {
                             let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
                             let guard = ctx.get_mut().unwrap();
                             let bi = guard.broadcast_info.as_ref();
                             (
                                 bi.map(|i| i.uuid.clone()).unwrap_or_default(),
-                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                                 bi.map(|i| i.battery).unwrap_or(0),
                                 crate::ffi::utils::get_local_ip_impl().unwrap_or_default(),
                             )
@@ -125,13 +124,8 @@ impl DiscoveryState {
                                 .map(|i| i.device_type.clone())
                                 .unwrap_or_default()
                         };
-                        let handshake = codec::encode_handshake(
-                            &local_uuid,
-                            &local_pub,
-                            &local_ip,
-                            local_battery,
-                            &dt,
-                        );
+                        let handshake =
+                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt);
 
                         let resp = network::oneshot_send_receive_bin(
                             &handshake,

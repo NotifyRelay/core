@@ -11,8 +11,9 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::{
-    crypto::hkdf, crypto::spake2, protocol::codec, BroadcastHandle, BroadcastInfo, CoreContext,
-    SafeContext,
+    crypto::{aes, hkdf, spake2},
+    protocol::codec,
+    BroadcastHandle, BroadcastInfo, CoreContext, SafeContext,
 };
 
 use super::common::{encode_name_b64, from_cstr, with_ctx};
@@ -65,19 +66,18 @@ fn oneshot_send_and_process(
 pub unsafe extern "C" fn nrc_send_handshake(
     ctx_ptr: *mut c_void,
     uuid: *const c_char,
-    pub_key: *const c_char,
+    _pub_key: *const c_char,
     local_ip: *const c_char,
     target_ip: *const c_char,
     battery: i32,
     device_type: *const c_char,
 ) -> i32 {
     let u = unsafe { from_cstr(uuid).to_string() };
-    let p = unsafe { from_cstr(pub_key).to_string() };
     let li = unsafe { from_cstr(local_ip).to_string() };
     let ti = unsafe { from_cstr(target_ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
-    let msg = codec::encode_handshake(&u, &p, &li, battery, &d);
+    let msg = codec::encode_handshake(&u, &li, battery, &d);
 
     // 尝试通过已有 TCP 会话发送
     let sent = with_ctx(ctx_ptr, |ctx| do_send(ctx, &u, &msg));
@@ -210,79 +210,65 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
 
     super::processing::process_frame(ctx, resp.0, &resp.1);
 
-    let (prover_session, peer_lt_pub, peer_spake2_pub) = {
+    let (ks, peer_lt_pub) = {
         let g = ctx.get_mut().unwrap();
         (
-            g.spake2_prover.take(),
+            g.spake2_session_key.take(),
             g.pairing_ctx.as_ref().and_then(|c| c.peer_lt_pub.clone()),
-            g.pairing_ctx.as_ref().map(|c| c.peer_spake2_pub.clone()),
         )
     };
 
-    if let (Some(session), Some(lt_pub), Some(spake2_pub)) =
-        (prover_session, peer_lt_pub, peer_spake2_pub)
-    {
-        match spake2::prover_complete(session, &spake2_pub) {
-            Ok(shared_secret) => {
-                log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
-                let aes_key = hkdf::derive_session_key(&shared_secret);
-                let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                {
-                    let guard = ctx.get_mut().unwrap();
-                    guard.crypto.device_keys.insert(
-                        tu.clone(),
-                        crate::crypto::DeviceKeyEntry {
-                            remote_pub_key: lt_pub.clone(),
-                            aes_key_b64: b64,
-                            aes_key_bytes: Some(aes_key),
-                        },
-                    );
-                    guard.spake2_prover = None;
-                    guard.spake2_verifier = None;
-                    guard.pairing_ctx = None;
-                    guard.expected_pairing_code = None;
+    if let (Some(aes_key), Some(lt_pub)) = (ks, peer_lt_pub) {
+        log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
+        let local_pub_b64 = ctx
+            .get_mut()
+            .unwrap()
+            .crypto
+            .local_pub_key_b64
+            .clone()
+            .unwrap_or_default();
+        // 用 K_s 加密本机 lt_pub，避免明文传输
+        let enc_lt = aes::encrypt(&aes_key, local_pub_b64.as_bytes()).unwrap_or_default();
+        {
+            let guard = ctx.get_mut().unwrap();
+            guard.crypto.device_keys.insert(
+                tu.clone(),
+                crate::crypto::DeviceKeyEntry {
+                    remote_pub_key: lt_pub.clone(),
+                    aes_key_b64: b64,
+                    aes_key_bytes: Some(aes_key),
+                },
+            );
+            guard.spake2_prover = None;
+            guard.spake2_verifier = None;
+            guard.pairing_ctx = None;
+            guard.expected_pairing_code = None;
+        }
+        let accept_line = codec::encode_accept(&lu, &enc_lt, &local_ip, battery, &dt);
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        if stream.write_all(&accept_line).is_err() || stream.flush().is_err() {
+            log::warn!("配对发起: 发送 ACCEPT 失败");
+        } else {
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut ack_reader = BufReader::new(&stream);
+            match crate::protocol::binary_codec::read_frame(&mut ack_reader) {
+                Ok((t, _)) if t == crate::protocol::header::MessageType::ACK => {
+                    log::info!("配对发起: 收到 ACK 确认");
                 }
-                let local_pub_b64 = ctx
-                    .get_mut()
-                    .unwrap()
-                    .crypto
-                    .local_pub_key_b64
-                    .clone()
-                    .unwrap_or_default();
-                let accept_line =
-                    codec::encode_accept(&lu, &local_pub_b64, &local_ip, battery, &dt);
-                stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-                if stream.write_all(&accept_line).is_err() || stream.flush().is_err() {
-                    log::warn!("配对发起: 发送 ACCEPT 失败");
-                } else {
-                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-                    let mut ack_reader = BufReader::new(&stream);
-                    match crate::protocol::binary_codec::read_frame(&mut ack_reader) {
-                        Ok((t, _)) if t == crate::protocol::header::MessageType::ACK => {
-                            log::info!("配对发起: 收到 ACK 确认");
-                        }
-                        Ok((t, _)) => {
-                            log::warn!("配对发起: 收到非 ACK 响应 type={}", t);
-                        }
-                        Err(_) => {
-                            log::warn!("配对发起: 未收到 ACK 确认");
-                        }
-                    }
+                Ok((t, _)) => {
+                    log::warn!("配对发起: 收到非 ACK 响应 type={}", t);
                 }
-                fire_pairing_result(ctx, &tu, 1, "ok");
-                return 0;
-            }
-            Err(e) => {
-                log::error!("配对发起: SPAKE2 密钥协商失败: {}", e);
-                fire_pairing_result(ctx, &tu, 0, "spake2_failed");
-                let reject_msg = codec::encode_reject(&lu);
-                let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
-                return -1;
+                Err(_) => {
+                    log::warn!("配对发起: 未收到 ACK 确认");
+                }
             }
         }
+        fire_pairing_result(ctx, &tu, 1, "ok");
+        return 0;
     }
 
-    log::warn!("配对发起: SPAKE2 会话或参数缺失");
+    log::warn!("配对发起: SPAKE2 会话密钥或对方公钥缺失");
     let reject_msg = codec::encode_reject(&lu);
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     if stream.write_all(&reject_msg).is_ok() && stream.flush().is_ok() {
@@ -333,12 +319,35 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
 
     // 响应方 IP 使用本机地址（与 nrc_send_pairing_init 对称），平台传入的 ip 仅作兜底
     let local_ip = super::utils::get_local_ip_impl().unwrap_or_else(|| i.clone());
+    // 接收方在此完成 SPAKE2 verifier，得到会话密钥 K_s（与发起方对称），
+    // 并用 K_s 加密本机 lt_pub，避免明文传输；K_s 暂存供后续 ACCEPT 解密复用。
     let msg = {
         let guard = ctx.get_mut().unwrap();
         let (session, spake2_pub) = spake2::generate_verifier_session(&code);
-        guard.spake2_verifier = Some(session);
-        codec::encode_pairing_resp(&u, &spake2_pub, &l, &local_ip, battery, &d)
+        let peer_spake2_pub = guard
+            .pairing_ctx
+            .as_ref()
+            .map(|c| c.peer_spake2_pub.clone())
+            .unwrap_or_default();
+        match spake2::verifier_complete(session, &peer_spake2_pub) {
+            Ok(shared) => {
+                let ks = hkdf::derive_session_key(&shared);
+                let enc_lt = aes::encrypt(&ks, l.as_bytes()).unwrap_or_default();
+                guard.spake2_session_key = Some(ks);
+                guard.spake2_verifier = None;
+                codec::encode_pairing_resp(&u, &spake2_pub, &enc_lt, &local_ip, battery, &d)
+            }
+            Err(e) => {
+                log::error!("发送 PAIRING_RESP: SPAKE2 verifier 完成失败: {}", e);
+                guard.spake2_verifier = None;
+                Vec::new()
+            }
+        }
     };
+    if msg.is_empty() {
+        log::error!("发送 PAIRING_RESP: 密钥协商失败，放弃发送");
+        return -1;
+    }
 
     with_ctx(ctx_ptr, |ctx| {
         do_send(ctx, &target_uuid, &msg);
@@ -629,7 +638,7 @@ pub unsafe extern "C" fn nrc_connect_device(
     let dt = unsafe { from_cstr(device_type).to_string() };
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let (local_uuid, local_pub, local_ip) = {
+    let (local_uuid, local_ip) = {
         let guard = ctx.get_mut().unwrap();
         (
             guard
@@ -637,16 +646,15 @@ pub unsafe extern "C" fn nrc_connect_device(
                 .as_ref()
                 .map(|b| b.uuid.clone())
                 .unwrap_or_default(),
-            guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
             super::utils::get_local_ip_impl().unwrap_or_default(),
         )
     };
-    if local_uuid.is_empty() || local_pub.is_empty() {
+    if local_uuid.is_empty() {
         log::error!("连接设备: 本机身份未初始化 uuid={}", tu);
         return -1;
     }
 
-    let msg = codec::encode_handshake(&local_uuid, &local_pub, &local_ip, battery, &dt);
+    let msg = codec::encode_handshake(&local_uuid, &local_ip, battery, &dt);
 
     for attempt in 0..MAX_RETRIES {
         let resp = crate::network::oneshot_send_receive_bin(&msg, &ti, PORT, TIMEOUT_MS);

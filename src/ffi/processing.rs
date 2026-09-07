@@ -93,7 +93,6 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         return 0;
     }
 
-    let peer_pub_str = hs.pub_key.clone();
     let already_paired = ctx
         .get_mut()
         .unwrap()
@@ -101,12 +100,29 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         .device_keys
         .contains_key(&uuid_str);
 
+    // 重连 HANDSHAKE 不再明文携带长期公钥；仅使用配对阶段锁定的 remote_pub_key 派生，
+    // 使长期 ECDH 密钥严格绑定到经配对码(SPAKE2)认证的身份，杜绝链路劫持替换公钥。
+    let (local_key, locked_remote) = {
+        let guard = ctx.get_mut().unwrap();
+        (
+            guard.crypto.local_key.clone(),
+            guard
+                .crypto
+                .device_keys
+                .get(&uuid_str)
+                .map(|e| e.remote_pub_key.clone())
+                .unwrap_or_default(),
+        )
+    };
+
     if already_paired {
-        if let Some(ref key) = {
-            let guard = ctx.get_mut().unwrap();
-            guard.crypto.local_key.clone()
-        } {
-            if let Ok(shared) = ecdh::compute_shared_secret(key, &peer_pub_str) {
+        if locked_remote.is_empty() {
+            log::warn!(
+                "HANDSHAKE: 锁定 remote_pub_key 为空，跳过 ECDH 重派生(uuid={}，建议重新配对)",
+                uuid_str
+            );
+        } else if let Some(ref key) = local_key {
+            if let Ok(shared) = ecdh::compute_shared_secret(key, &locked_remote) {
                 let aes_key = hkdf::derive_session_key(&shared);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                 {
@@ -114,7 +130,7 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                     guard.crypto.device_keys.insert(
                         uuid_str.clone(),
                         crate::crypto::DeviceKeyEntry {
-                            remote_pub_key: peer_pub_str.clone(),
+                            remote_pub_key: locked_remote.clone(),
                             aes_key_b64: b64,
                             aes_key_bytes: Some(aes_key),
                         },
@@ -150,7 +166,7 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
 
     let data = serde_json::json!({
         "uuid": hs.uuid,
-        "pub_key": hs.pub_key,
+        "pub_key": locked_remote,
         "device_name": hs.device_name,
         "battery": hs.battery,
         "device_type": hs.device_type,
@@ -189,7 +205,14 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         }
     }
 
-    fire_pairing_cb(ctx, &uuid_str, "HANDSHAKE", &data, hs.battery, &hs.pub_key);
+    fire_pairing_cb(
+        ctx,
+        &uuid_str,
+        "HANDSHAKE",
+        &data,
+        hs.battery,
+        &locked_remote,
+    );
     0
 }
 
@@ -241,7 +264,8 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
             return -1;
         }
     };
-    // 配对消息 payload 格式: uuid:spake2_pub:lt_pub:ip:battery:device_type
+    // 配对消息 payload 格式: uuid:spake2_pub:enc_lt_pub:ip:battery:device_type
+    // enc_lt_pub 为接收方用 K_s 加密的本机长期公钥；此处用 K_s 解密
     let parts: Vec<&str> = text.split(':').collect();
     if parts.len() < 6 {
         log::error!("处理消息: PAIRING_RESP 字段不足");
@@ -249,37 +273,72 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     }
     let uuid = parts[0];
     let spake2_pub = parts[1];
-    let lt_pub = parts[2];
+    let enc_lt_pub = parts[2];
     let ip = parts[3];
     let battery: i32 = parts[4].trim_end_matches('+').parse().unwrap_or(0);
     let device_type = parts[5];
 
-    let peer_spake2 = spake2_pub.to_string();
-    let peer_lt = lt_pub.to_string();
+    // 发起方在此完成 SPAKE2 prover，得到会话密钥 K_s，并用其解密对端 lt_pub；
+    // K_s 暂存供后续 ACCEPT 加密复用（两端推导出的 K_s 对称一致）
+    let (peer_lt_pub, ks) = {
+        let guard = ctx.get_mut().unwrap();
+        let session = guard.spake2_prover.take();
+        if let Some(s) = session {
+            match spake2::prover_complete(s, spake2_pub) {
+                Ok(shared) => {
+                    let k = hkdf::derive_session_key(&shared);
+                    match aes::decrypt(&k, enc_lt_pub) {
+                        Ok(bytes) => (Some(String::from_utf8_lossy(&bytes).to_string()), Some(k)),
+                        Err(e) => {
+                            log::error!("处理 PAIRING_RESP: 对端 lt_pub 解密失败: {}", e);
+                            (None, Some(k))
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("处理 PAIRING_RESP: SPAKE2 prover 完成失败: {}", e);
+                    (None, None)
+                }
+            }
+        } else {
+            log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
+            (None, None)
+        }
+    };
+
     {
         let guard = ctx.get_mut().unwrap();
+        guard.spake2_session_key = ks;
         guard.pairing_ctx = Some(crate::PairingContext {
             peer_uuid: uuid.to_string(),
-            peer_spake2_pub: peer_spake2.clone(),
-            peer_lt_pub: Some(peer_lt.clone()),
+            peer_spake2_pub: spake2_pub.to_string(),
+            peer_lt_pub: peer_lt_pub.clone(),
         });
     }
+
     let data = serde_json::json!({
         "uuid": uuid,
         "spake2_pub": spake2_pub,
-        "lt_pub": lt_pub,
+        "lt_pub": peer_lt_pub.clone().unwrap_or_default(),
         "ip": ip,
         "battery": battery,
         "device_type": device_type,
     })
     .to_string();
-    fire_pairing_cb(ctx, uuid, "PAIRING_RESP", &data, battery, lt_pub);
+    fire_pairing_cb(
+        ctx,
+        uuid,
+        "PAIRING_RESP",
+        &data,
+        battery,
+        peer_lt_pub.as_deref().unwrap_or(""),
+    );
     0
 }
 
 fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
-    // ACCEPT 负载格式：uuid:lt_pub_key（与 encode_accept 对应）
-    let (uuid, lt_pub_key) = match std::str::from_utf8(payload) {
+    // ACCEPT 负载格式：uuid:enc_lt_pub（enc_lt_pub 为 AES(K_s) 密文，与 encode_accept 对应）
+    let (uuid, enc_lt) = match std::str::from_utf8(payload) {
         Ok(s) => {
             let s = s.trim();
             let parts: Vec<&str> = s.splitn(2, ':').collect();
@@ -297,31 +356,28 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         }
     };
 
-    let (verifier_session, peer_spake2_pub) = {
+    // 配对流程判定：接收方在 nrc_send_pairing_resp 已完成 verifier 并暂存 K_s（spake2_session_key）
+    let ks = {
         let guard = ctx.get_mut().unwrap();
-        (
-            guard.spake2_verifier.take(),
-            guard
-                .pairing_ctx
-                .as_ref()
-                .map(|c| c.peer_spake2_pub.clone()),
-        )
+        guard.spake2_session_key.take()
     };
 
     let mut success = false;
     let mut pairing_flow = false;
-    if let (Some(session), Some(spake2_pub)) = (verifier_session, peer_spake2_pub) {
+    let mut cb_lt_pub = String::new();
+    if let Some(aes_key) = ks {
         pairing_flow = true;
-        match spake2::verifier_complete(session, &spake2_pub) {
-            Ok(shared_secret) => {
-                let aes_key = hkdf::derive_session_key(&shared_secret);
+        match aes::decrypt(&aes_key, &enc_lt) {
+            Ok(bytes) => {
+                let remote_lt = String::from_utf8_lossy(&bytes).to_string();
+                cb_lt_pub = remote_lt.clone();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                 {
                     let guard = ctx.get_mut().unwrap();
                     guard.crypto.device_keys.insert(
                         uuid.clone(),
                         crate::crypto::DeviceKeyEntry {
-                            remote_pub_key: lt_pub_key.clone(),
+                            remote_pub_key: remote_lt.clone(),
                             aes_key_b64: b64,
                             aes_key_bytes: Some(aes_key),
                         },
@@ -375,23 +431,30 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 }
             }
             Err(e) => {
-                log::error!("处理消息: SPAKE2 verifier 完成失败: {}", e);
+                log::error!("处理消息: ACCEPT 中 lt_pub 解密失败: {}", e);
             }
         }
     } else {
-        log::warn!("处理消息: ACCEPT 时 SPAKE2 会话或参数缺失(已配对设备重连场景，跳过)");
+        log::warn!("处理消息: ACCEPT 时 SPAKE2 会话密钥缺失(已配对设备重连场景，跳过密钥更新)");
+        let g = ctx.get_mut().unwrap();
+        cb_lt_pub = g
+            .crypto
+            .device_keys
+            .get(&uuid)
+            .map(|e| e.remote_pub_key.clone())
+            .unwrap_or_default();
     }
 
     let data = serde_json::json!({
         "uuid": uuid,
         "success": success,
-        "lt_pub_key": lt_pub_key,
+        "lt_pub_key": cb_lt_pub,
     })
     .to_string();
     fire_pairing_cb(ctx, &uuid, "ACCEPT", &data, 0, "");
 
     if pairing_flow {
-        fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "lt_pub_key": lt_pub_key, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
+        fire_pairing_cb(ctx, &uuid, "RESULT", &serde_json::json!({"uuid": uuid, "success": success, "lt_pub_key": cb_lt_pub, "error": if success { "ok" } else { "spake2_failed" }}).to_string(), if success { 1 } else { 0 }, if success { "ok" } else { "spake2_failed" });
     }
 
     {

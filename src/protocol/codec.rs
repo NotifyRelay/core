@@ -79,15 +79,9 @@ pub fn encode_ack(uuid: &str) -> Vec<u8> {
     binary_codec::encode_control_frame(MessageType::ACK, uuid)
 }
 
-pub fn encode_handshake(
-    uuid: &str,
-    pub_key: &str,
-    ip: &str,
-    battery: i32,
-    device_type: &str,
-) -> Vec<u8> {
+pub fn encode_handshake(uuid: &str, ip: &str, battery: i32, device_type: &str) -> Vec<u8> {
     let flags = FeatureFlag::supported();
-    binary_codec::encode_handshake_frame(uuid, pub_key, ip, device_type, battery, &flags)
+    binary_codec::encode_handshake_frame(uuid, ip, device_type, battery, &flags)
 }
 
 pub fn encode_heartbeat_tcp(
