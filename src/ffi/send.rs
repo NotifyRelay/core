@@ -511,6 +511,12 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                                     battery,
                                     &device_type,
                                 );
+                                // 记录扫描到的 IP 到内部映射：
+                                // 该表原本仅由「TCP 连接建立」写入，而扫描走发现请求短连接不建立会话，
+                                // 缺失会导致配对发起（nrc_send_pairing_init）等出站操作解析不到目标 IP
+                                if let Ok(mut ips) = guard.device_ips.lock() {
+                                    ips.insert(uuid.clone(), ip.clone());
+                                }
                                 let (cb, user_data) =
                                     (guard.router.on_device_discovered, guard.router.user_data);
                                 // 回调前释放锁：平台端回调内可能再次调用 core 接口（如拉取设备快照）
