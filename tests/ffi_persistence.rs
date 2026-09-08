@@ -38,8 +38,10 @@ unsafe fn free_str(p: *mut c_char) {
     }
 }
 
-fn db_path_env() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("nrc_persist_test_{}", std::process::id()))
+/// 每个测试使用彼此独立的库目录：
+/// 同文件内的测试并行执行，共用目录会互相 remove_dir_all 删除对方的 SQLite 文件
+fn db_path_env(case: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("nrc_persist_test_{}_{}", std::process::id(), case))
 }
 
 fn cleanup(path: &std::path::Path) {
@@ -50,7 +52,7 @@ fn cleanup(path: &std::path::Path) {
 
 #[test]
 fn test_persistence_full_flow() {
-    let dir = db_path_env();
+    let dir = db_path_env("full_flow");
     let db = dir.join("rust_core.db");
     // 清理历史残留（损坏库也一并处理）
     cleanup(&db);
@@ -316,7 +318,7 @@ fn test_persistence_full_flow() {
 /// 持久化故障注入测试：ensure_local_uuid 在 flush_persistence 事务中原子性保存
 #[test]
 fn test_uuid_atomicity_in_flush() {
-    let dir = db_path_env();
+    let dir = db_path_env("uuid_atomicity");
     let db = dir.join("rust_core_atomicity.db");
     cleanup(&db);
     let _ = std::fs::remove_dir_all(&dir);
