@@ -67,6 +67,20 @@ impl StateMerge {
         format!("{}|{}", device_uuid, feature_id)
     }
 
+    /// 发送端收到重同步请求时调用：标记对应发送会话 `force_full_next`，
+    /// 下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致）。
+    pub fn handle_resend_request(&mut self, remote_uuid: &str, feature_id: &str) {
+        let key = StateMerge::key(remote_uuid, feature_id);
+        if let Some(s) = self.senders.get_mut(&key) {
+            s.force_full_next = true;
+            log::debug!(
+                "[state_merge] 收到重同步请求,标记 force_full_next uuid={} fid={}",
+                remote_uuid,
+                feature_id
+            );
+        }
+    }
+
     fn compute_feature_id(full: &Value) -> String {
         // 平台端必须注入稳定的 featureIdOverride（sbn.key），内容变化不再产生新会话；
         // 缺失时返回空串，不做内容哈希兜底
@@ -136,14 +150,8 @@ impl StateMerge {
         let payload = if first || force || is_end {
             build_full_wire(&full, &feature_id, &hash, is_end)
         } else {
-            // 无变化时发送空差量保活包：接收端据此刷新时间戳，避免卡片超时消失
-            let delta = if session.last_full == canonical {
-                json!({})
-            } else {
-                let old_val: Value =
-                    serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
-                diff_island(&old_val, &full)
-            };
+            let old_val: Value = serde_json::from_str(&session.last_full).unwrap_or(Value::Null);
+            let delta = diff_island(&old_val, &full);
             build_delta_wire(&delta, &feature_id, &hash)
         };
 
@@ -344,11 +352,12 @@ impl StateMerge {
                             s.force_full_next = false;
                             s.pending_ack = Some((s.last_hash.clone(), Instant::now()));
                         } else {
-                            // 假周期保活：发送空差量包（几字节），接收端据此刷新时间戳，
-                            // 避免平台轮询周期大于接收端超时周期时卡片/岛"突然消失"；
-                            // 查询时平台实时比较，无变更才走此分支，不会发送陈旧数据
-                            let keepalive =
-                                build_delta_wire(&json!({}), &s.feature_id, &s.last_hash);
+                            // 保活：发送差量包（非 pics 字段填入实际值），
+                            // 接收端据此刷新时间戳，避免卡片/岛"突然消失"
+                            let last_val: Value = serde_json::from_str(&s.last_full)
+                                .unwrap_or(Value::Object(Map::new()));
+                            let delta = diff_island(&last_val, &last_val);
+                            let keepalive = build_delta_wire(&delta, &s.feature_id, &s.last_hash);
                             queue.enqueue(SendItem {
                                 device_uuid: s.device_uuid.clone(),
                                 header: header.to_string(),
@@ -427,24 +436,18 @@ fn pics_map(v: &Value) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// 计算 island 状态差异（title/text/param_v2_raw/coverUrl/isPlaying/pics），返回 changes 对象。
+/// 计算 island 状态差异：pics 保持差量逻辑，其他字段（title/text/param_v2_raw/coverUrl/isPlaying）填入实际值。
 fn diff_island(old: &Value, new: &Value) -> Value {
     let mut changes = Map::new();
+    // 非 pics 字段：填入实际值（无论是否变化）
     for k in ["title", "text", "param_v2_raw", "coverUrl"] {
-        let o = field_str(old, k);
-        let n = field_str(new, k);
-        if o != n {
-            changes.insert(k.to_string(), json!(n.unwrap_or_default()));
-        }
+        let v = field_str(new, k);
+        changes.insert(k.to_string(), json!(v.unwrap_or_default()));
     }
-    // isPlaying 为布尔字段，单独比较：仅暂停/播放切换时生成 delta，接收端可正确合并
-    let o_play = old.get("isPlaying").and_then(|x| x.as_bool());
-    let n_play = new.get("isPlaying").and_then(|x| x.as_bool());
-    if o_play != n_play {
-        if let Some(v) = new.get("isPlaying") {
-            changes.insert("isPlaying".to_string(), v.clone());
-        }
+    if let Some(v) = new.get("isPlaying") {
+        changes.insert("isPlaying".to_string(), v.clone());
     }
+    // pics 字段：保持差量（仅变化的 key）
     let op = pics_map(old);
     let np = pics_map(new);
     let mut pics_changed = Map::new();
@@ -550,10 +553,50 @@ fn fill_empty_fields(s: &str) -> String {
     serde_json::to_string(&obj).unwrap_or_default()
 }
 
+/// 接收端缺失基线后，向实际远端发送方请求重发 FULL。
+///
+/// 通过对端发送队列投递 `DATA_STATE_RESEND` 帧；对端收到后标记其发送会话
+/// `force_full_next`，下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致），
+/// 避免仅依赖本地状态导致接收端始终无法解码对端 DELTA。
+pub fn enqueue_resync_request(
+    queue_handle: u64,
+    remote_uuid: &str,
+    feature_id: &str,
+    is_media: bool,
+) {
+    if queue_handle == 0 {
+        return;
+    }
+    let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *const SenderQueue) };
+    let payload = json!({
+        "type": "RESEND_FULL",
+        "feature": feature_id,
+        "media": is_media,
+    })
+    .to_string();
+    q.enqueue(SendItem {
+        device_uuid: remote_uuid.to_string(),
+        header: "DATA_STATE_RESEND".to_string(),
+        plaintext: payload,
+        dedup_key: None,
+        retries_left: 0,
+        coalesce_key: None,
+    });
+}
+
+/// 发送端收到重同步请求：标记对应发送会话 `force_full_next`，
+/// 下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致）。
+pub fn apply_resync_request(ctx: &SafeContext, requester_uuid: &str, feature_id: &str) {
+    if let Ok(mut g) = ctx.lock() {
+        g.state_merge
+            .handle_resend_request(requester_uuid, feature_id);
+    }
+}
+
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
 /// 并在需要时回 ACK。返回 true 表示该消息已被引擎消费（无需再走通用 on_data）。
 pub fn handle_state_message(
-    ctx: &mut SafeContext,
+    ctx: &SafeContext,
     uuid: &str,
     is_media: bool,
     plaintext: &str,
@@ -574,13 +617,17 @@ pub fn handle_state_message(
             .unwrap_or("")
             .to_string();
         {
-            let g = ctx.get_mut().unwrap();
+            let Ok(mut g) = ctx.lock() else {
+                return false;
+            };
             g.state_merge.handle_ack(uuid, &fid, &hash);
         }
         return true;
     }
     let (fid, full, is_end, need_full) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(mut g) = ctx.lock() else {
+            return false;
+        };
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
             Some(r) => r,
             None => return false,
@@ -593,7 +640,9 @@ pub fn handle_state_message(
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(g) = ctx.lock() else {
+            return false;
+        };
         (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -607,9 +656,9 @@ pub fn handle_state_message(
     // 无前文时不发 ACK，让发送端超时后强制发全量
     if !is_media && !is_end && !need_full {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
-            let g = ctx.get_mut().unwrap();
-            if g.sender_queue != 0 {
-                let q = unsafe { &*(crate::ffi::handle::get(g.sender_queue) as *mut SenderQueue) };
+            let queue_handle = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
+            if queue_handle != 0 {
+                let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
                 let ack = json!({
                     "type": "SI_ACK",
                     "device": uuid,
@@ -630,10 +679,38 @@ pub fn handle_state_message(
         }
     } else if need_full {
         log::debug!(
-            "[state_merge] 无前文,跳过ACK等待发送端超时重发全量 uuid={} fid={}",
+            "[state_merge] 无前文基线,向远端发送方请求重发 FULL uuid={} fid={} media={}",
             uuid,
-            fid
+            fid,
+            is_media
         );
+        // 向实际远端发送方发送重同步请求：对端收到后标记其发送会话 force_full_next，
+        // 下个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致），
+        // 避免仅依赖本地状态导致接收端始终无法解码对端 DELTA
+        let qh = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
+        if qh != 0 {
+            enqueue_resync_request(qh, uuid, &fid, is_media);
+        }
+        // 兼容：本机后续推送该 feature 时发送全量，便于对端重建基线
+        if is_media {
+            if let Ok(mut g) = ctx.lock() {
+                let key = StateMerge::key(uuid, &fid);
+                g.state_merge
+                    .senders
+                    .entry(key)
+                    .or_insert_with(|| SenderState {
+                        device_uuid: uuid.to_string(),
+                        feature_id: fid.clone(),
+                        is_media,
+                        last_full: String::new(),
+                        last_hash: String::new(),
+                        pending_ack: None,
+                        force_full_next: false,
+                        last_push: Instant::now(),
+                    })
+                    .force_full_next = true;
+            }
+        }
     }
     true
 }
@@ -690,6 +767,9 @@ impl Default for StateMerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CoreContext;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
 
     fn si_full(title: &str, text: &str) -> String {
         json!({
@@ -712,12 +792,12 @@ mod tests {
         let mut sm = StateMerge::new();
         // 首次推送应为 FULL
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
-        // 相同内容 → 发送空差量保活包（不跳过），接收端据此刷新时间戳
+        // 相同内容 → 发送差量保活包（非 pics 字段填入实际值）
         assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
         let items = q.test_drain_plaintexts();
         assert_eq!(items.len(), 2);
         assert!(items[1].contains("\"type\":\"delta\""));
-        assert!(items[1].contains("\"changes\":{}"));
+        assert!(items[1].contains("\"title\":\"t1\""));
         // 变化产生 delta（通过队列内容判断）
         // 这里只验证 merge 往返：模拟接收端
         let full1 = si_full("t1", "c1");
@@ -741,6 +821,11 @@ mod tests {
             json!({"device":"self","title":"a","text":"x","param_v2_raw":"","pics":{"k":"v"}});
         let full_b = json!({"device":"self","title":"b","text":"x","param_v2_raw":"","pics":{"k":"v","k2":"v2"}});
         let delta = diff_island(&full_a, &full_b);
+        // 非 pics 字段填入实际值
+        assert_eq!(delta["title"], json!("b"));
+        assert_eq!(delta["text"], json!("x"));
+        // pics 保持差量
+        assert_eq!(delta["pics"]["k2"], json!("v2"));
         let merged = merge_island(&full_a, &delta);
         let merged_v: Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(merged_v["title"], json!("b"));
@@ -749,33 +834,30 @@ mod tests {
 
     #[test]
     fn test_media_fields_diff_and_merge() {
-        // 仅切换 isPlaying：FULL 之后产生非空 delta，接收端合并后状态正确
         let full_playing =
             json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":true});
         let full_paused =
             json!({"device":"self","title":"t","text":"a","coverUrl":"url1","isPlaying":false});
         let delta = diff_island(&full_playing, &full_paused);
-        assert_ne!(delta, json!({}));
+        // 非 pics 字段填入实际值（无论是否变化）
         assert_eq!(delta["isPlaying"], json!(false));
-        let merged = merge_island(&full_playing, &delta);
-        let merged_v: Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(merged_v["isPlaying"], json!(false));
-        assert_eq!(merged_v["coverUrl"], json!("url1"));
-        // 无变化时 delta 为空
+        assert_eq!(delta["coverUrl"], json!("url1"));
+        // 无变化时 delta 仍包含非 pics 字段实际值
         let no_change = diff_island(&full_paused, &full_paused);
-        assert_eq!(no_change, json!({}));
+        assert_eq!(no_change["isPlaying"], json!(false));
+        assert_eq!(no_change["coverUrl"], json!("url1"));
 
-        // 仅更换 coverUrl：delta 非空且合并后封面正确
-        let full_new_cover =
-            json!({"device":"self","title":"t","text":"a","coverUrl":"url2","isPlaying":false});
-        let delta2 = diff_island(&full_paused, &full_new_cover);
+        // pics 变化时 delta 非空
+        let full_with_pic = json!({"device":"self","title":"t","text":"a","coverUrl":"url2","isPlaying":false,"pics":{"k":"v"}});
+        let delta2 = diff_island(&full_paused, &full_with_pic);
         assert_ne!(delta2, json!({}));
         assert_eq!(delta2["coverUrl"], json!("url2"));
-        assert!(delta2.get("isPlaying").is_none());
+        assert_eq!(delta2["pics"]["k"], json!("v"));
         let merged2 = merge_island(&full_paused, &delta2);
         let merged2_v: Value = serde_json::from_str(&merged2).unwrap();
         assert_eq!(merged2_v["coverUrl"], json!("url2"));
         assert_eq!(merged2_v["isPlaying"], json!(false));
+        assert_eq!(merged2_v["pics"]["k"], json!("v"));
     }
 
     #[test]
@@ -823,14 +905,14 @@ mod tests {
                 .unwrap();
             s.pending_ack = None;
         }
-        // 存在无变更 → 空差量保活包入队（接收端据此刷新时间戳，防"突然消失"）
+        // 存在无变更 → 差量保活包入队（非 pics 字段填入实际值）
         let queries = sm.heartbeat_tick(Instant::now() + Duration::from_secs(31));
         assert_eq!(queries.len(), 1);
         sm.apply_query_results(&q, vec![(queries[0].0.clone(), queries[0].1.clone(), 1)]);
         let items = q.test_drain_plaintexts();
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("\"type\":\"delta\""));
-        assert!(items[0].contains("\"changes\":{}"));
+        assert!(items[0].contains("\"title\":\"t1\""));
         // 保活基于上次真实发送：重置后间隔内不再查询（无快速触发）
         assert!(sm
             .heartbeat_tick(Instant::now() + Duration::from_secs(7))
@@ -844,7 +926,7 @@ mod tests {
         sm2.apply_query_results(&q, vec![(queries2[0].0.clone(), queries2[0].1.clone(), 1)]);
         let items2 = q.test_drain_plaintexts();
         assert_eq!(items2.len(), 1);
-        assert!(items2[0].contains("\"changes\":{}"));
+        assert!(items2[0].contains("\"title\":\"t1\""));
     }
 
     #[test]
@@ -901,5 +983,82 @@ mod tests {
         assert!(!s.force_full_next);
         // 验证 pending_ack 已重新建立
         assert!(s.pending_ack.is_some());
+    }
+
+    #[test]
+    fn test_media_need_full_enqueues_resync_request() {
+        use crate::ffi::handle as hdl;
+        let ctx = Mutex::new(CoreContext::new());
+        let queue = Box::new(SenderQueue::new());
+        let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
+        {
+            let mut g = ctx.lock().unwrap();
+            g.sender_queue = qh;
+        }
+        let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };
+
+        // 先建立 peer 的媒体发送会话（FULL 入队）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t1", "c1"), false, false);
+        }
+        let before = q.pending_count();
+        assert_eq!(before, 1);
+
+        // 接收路径：注入无基线 DELTA（对端媒体基线丢失）→ 应请求对端重发 FULL
+        let delta = r#"{"type":"delta","changes":{"title":"x"}}"#;
+        let consumed = handle_state_message(&ctx, "peer", true, delta);
+        assert!(consumed);
+        assert_eq!(
+            q.pending_count(),
+            before + 1,
+            "缺失基线应向远端发送方投递重同步请求"
+        );
+        let items = q.test_drain_plaintexts();
+        assert!(
+            items
+                .iter()
+                .any(|p| { p.contains("\"type\":\"RESEND_FULL\"") && p.contains("media_global") }),
+            "重同步请求应携带着 media 特征（feature=media_global）发往对端"
+        );
+    }
+
+    #[test]
+    fn test_resync_request_triggers_full_resend() {
+        use crate::ffi::handle as hdl;
+        let ctx = Mutex::new(CoreContext::new());
+        let queue = Box::new(SenderQueue::new());
+        let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
+        let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };
+
+        // 建立 peer 的媒体发送会话（带基线）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t1", "c1"), false, false);
+        }
+        q.test_drain_plaintexts(); // 清空基线推送产生的 FULL
+
+        // 收到 peer 的重同步请求 → 标记 force_full_next
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge.handle_resend_request("peer", MEDIA_KEY);
+        }
+
+        // 后续推送应发送 FULL（而非 DELTA）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t2", "c2"), false, false);
+        }
+        let items = q.test_drain_plaintexts();
+        assert!(
+            items.iter().any(|p| {
+                // 媒体 FULL 帧的 type 为 MEDIA_PLAY（见 build_full_wire）；重同步后应重发全量而非 delta
+                p.contains("\"type\":\"MEDIA_PLAY\"") && !p.contains("\"type\":\"delta\"")
+            }),
+            "重同步后应重发 FULL (MEDIA_PLAY)"
+        );
     }
 }

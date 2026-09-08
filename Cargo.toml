@@ -21,7 +21,6 @@ base64 = "0.22"
 rand = "0.8"
 log = "0.4"
 libc = "0.2"
-mdns-sd = "0.12"
 socket2 = "0.5"
 ruopus = "0.1"
 rtp = "0.14"
@@ -32,7 +31,7 @@ strsim = "0.11"
 parking_lot = "0.12"
 threadpool = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+zeroize = "1"
 
 [dev-dependencies]
 env_logger = "0.11"
-

@@ -171,3 +171,26 @@ fn test_push_query_flag() {
     );
     assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 1), 0);
 }
+
+/// 媒体状态推送回归测试：FULL → 差量 → FULL 发送链路正常，
+/// 且 force_full_next（重同步触发后）逻辑可经由此路径重发全量。
+///
+/// 注意：将 DELTA 注入"接收路径"并断言"远端下一帧为 FULL"的完整重同步验证，
+/// 由 crate 内单元测试覆盖（`state_merge::tests::test_media_need_full_enqueues_resync_request`
+/// 与 `test_resync_request_triggers_full_resend`），因集成测试作为外部 crate 无法访问
+/// 私有 `handle_state_message`，也无法检查发送队列内部内容。
+#[test]
+fn test_media_resync_sender_path() {
+    let ctx = create_ctx();
+    let queue_handle = make_queue_handle();
+
+    // 首次推送媒体状态（FULL，建立发送端基线）
+    assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 0), 0);
+
+    // 推送变更（按差量发送）
+    let changed = r#"{"featureIdOverride":"f1","title":"updated","text":"c"}"#;
+    assert_eq!(push_media(&ctx, queue_handle, "dev-1", changed, 0, 0), 0);
+
+    // 再次推送全量（接收端重同步请求后，发送端应经 force_full_next 重发 FULL 而非 delta）
+    assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 0), 0);
+}

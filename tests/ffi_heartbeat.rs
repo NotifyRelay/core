@@ -1,4 +1,4 @@
-//! FFI 心跳接口语义测试（nrc_set_heartbeat_tcp_backup / nrc_update_heartbeat_scheduler_params）
+//! FFI 心跳接口语义测试（nrc_update_heartbeat_scheduler_params）
 //! 目的：保证 PC 与 Android 两个平台端共享的心跳配置接口契约不变
 
 use std::ffi::CString;
@@ -28,40 +28,6 @@ unsafe fn free_cstr(p: *const c_char) {
     if !p.is_null() {
         drop(CString::from_raw(p as *mut c_char));
     }
-}
-
-#[test]
-fn test_set_heartbeat_tcp_backup_toggle() {
-    let ctx = create_ctx();
-    let ptr = ctx_ptr(&ctx);
-    // 默认广播主用；开启 TCP 备用 → 0
-    assert_eq!(
-        unsafe { ffi::heartbeat::nrc_set_heartbeat_tcp_backup(ptr, 1) },
-        0
-    );
-    // 重复开启（幂等）→ 0
-    assert_eq!(
-        unsafe { ffi::heartbeat::nrc_set_heartbeat_tcp_backup(ptr, 1) },
-        0
-    );
-    // 关闭 → 0
-    assert_eq!(
-        unsafe { ffi::heartbeat::nrc_set_heartbeat_tcp_backup(ptr, 0) },
-        0
-    );
-    // 任意非 0 视为开启 → 0
-    assert_eq!(
-        unsafe { ffi::heartbeat::nrc_set_heartbeat_tcp_backup(ptr, 2) },
-        0
-    );
-}
-
-#[test]
-fn test_set_heartbeat_tcp_backup_null_ctx_fails() {
-    assert_eq!(
-        unsafe { ffi::heartbeat::nrc_set_heartbeat_tcp_backup(std::ptr::null_mut(), 1) },
-        -1
-    );
 }
 
 #[test]

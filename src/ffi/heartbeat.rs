@@ -74,6 +74,8 @@ pub(crate) unsafe fn start_heartbeat_scheduler_impl(
         battery,
         device_type: d,
     });
+    // 同步广播信息到 TCP 层（供发现请求响应使用）
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
     // 同步本机 uuid 到持久化（读取接口前自动落盘）与 TCP 层状态（防御平台端 StartTcpServer 早于本函数调用的情况）
     // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
     if !local_uuid.is_empty() {
@@ -126,37 +128,7 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
             b.device_type = d;
         }
     }
-    // 本机名称/电量变化同步更新 mDNS 广告 TXT（广告同时承担发现与 UDP 信息源）
-    guard.mdns.update_name_battery(&n, battery);
-}
-
-/// 切换心跳模式（广播主用 / TCP 备用）
-/// enabled=1：TCP 备用（锁屏/WLAN直连），为已配对设备启动每设备 TCP 定向心跳；
-/// enabled=0：广播主用（默认），UDP 广播兼发现+心跳，停止每设备心跳
-#[no_mangle]
-pub unsafe extern "C" fn nrc_set_heartbeat_tcp_backup(ctx_ptr: *mut c_void, enabled: i32) -> i32 {
-    if ctx_ptr.is_null() {
-        return -1;
-    }
-    let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    if let Ok(guard) = ctx.get_mut() {
-        let new_state = enabled != 0;
-        if guard
-            .heartbeat_tcp_backup
-            .swap(new_state, std::sync::atomic::Ordering::Relaxed)
-            != new_state
-        {
-            log::info!(
-                "心跳模式切换: {}",
-                if new_state {
-                    "TCP 备用（每设备定向心跳）"
-                } else {
-                    "广播主用（UDP 广播兼发现+心跳）"
-                }
-            );
-        }
-        0
-    } else {
-        -1
-    }
+    // 同步到 TCP 层：发现请求响应携带的广播信息取自该副本，
+    // 更新后必须回写，否则对端扫描到的名称/电量/设备类型停留在启动时的旧值
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
 }

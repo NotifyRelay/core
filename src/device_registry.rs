@@ -38,7 +38,7 @@ impl DeviceRegistry {
         }
     }
 
-    /// 登记/刷新设备状态（心跳、mDNS 发现），刷新 last_seen
+    /// 登记/刷新设备状态（心跳、TCP 扫描发现），刷新 last_seen
     /// 非空字段才覆盖旧值（握手等缺少名称的场景不覆盖已有名称）
     pub fn upsert(
         &self,

@@ -4,8 +4,6 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-
 use crate::SafeContext;
 
 use super::common::from_cstr;
@@ -24,7 +22,6 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
     let on_connected = guard.router.on_device_connected;
     let on_disconnected = guard.router.on_device_disconnected;
     let on_tcp_error = guard.router.on_tcp_error;
-    let on_heartbeat_udp = guard.router.on_heartbeat_udp;
     let user_data = guard.router.user_data;
 
     // 获取网络状态
@@ -57,27 +54,33 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
         }
     }) as Arc<dyn Fn(String, String) + Send + Sync>);
 
-    let on_disconnected_cb = on_disconnected.map(|cb| {
+    let on_disconnected_cb = {
         let ctx_usize = ctx_ptr as usize;
-        Arc::new(move |uuid: String| {
-            // TCP 断开：登记断开状态（设备可能仍经 UDP 心跳在线）
-            if let Ok(guard) = unsafe { &*(ctx_usize as *mut crate::SafeContext) }.lock() {
+        Some(Arc::new(move |uuid: String| {
+            // TCP 断开：登记断开状态，并清理该连接遗留的未完成配对会话。
+            if let Ok(mut guard) = unsafe { &*(ctx_usize as *const crate::SafeContext) }.lock() {
                 guard.registry.mark_disconnected(&uuid);
+                guard.pairing_sessions.remove(&uuid);
             }
-            if let Ok(uuid_c) = CString::new(uuid.as_str()) {
-                let ud = user_data_usize as *mut c_void;
-                cb(uuid_c.as_ptr(), ud);
+            if let Some(cb) = on_disconnected {
+                if let Ok(uuid_c) = CString::new(uuid.as_str()) {
+                    let ud = user_data_usize as *mut c_void;
+                    cb(uuid_c.as_ptr(), ud);
+                }
             }
-        }) as Arc<dyn Fn(String) + Send + Sync>
-    });
+        }) as Arc<dyn Fn(String) + Send + Sync>)
+    };
 
     let on_message_cb = {
         let ctx_usize = ctx_ptr as usize;
-        Some(Arc::new(move |_uuid: String, line: String| {
-            let ctx_ptr = ctx_usize as *mut c_void;
-            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-            super::processing::process_line(ctx, &line);
-        }) as Arc<dyn Fn(String, String) + Send + Sync>)
+        Some(
+            Arc::new(move |uuid: String, msg_type: u8, payload: Vec<u8>| {
+                let ctx_ptr = ctx_usize as *mut c_void;
+                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                // 传入会话 uuid：帧内声明的发送方必须与之相同，否则丢弃
+                super::processing::process_frame(ctx, Some(&uuid), msg_type, &payload);
+            }) as Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>,
+        )
     };
 
     let on_error_cb = on_tcp_error.map(|cb| {
@@ -120,98 +123,6 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
             log::error!("启动 TCP 服务器失败（已重试 5 次）: {}", e);
             return -1;
         }
-    }
-
-    // 同时启动 UDP 监听器（仅在未启动时）
-    let udp_already_running = match network_state.lock() {
-        Ok(state) => state.udp_handle.is_some(),
-        Err(_) => false,
-    };
-
-    if !udp_already_running {
-        let udp_port = 23334u16;
-        let udp_user_data = user_data_usize;
-        let udp_ctx = ctx_ptr as usize;
-        let udp_on_heartbeat = on_heartbeat_udp;
-        let on_udp_cb = Some(Arc::new(
-            move |uuid: String,
-                  name_b64: String,
-                  port: u16,
-                  battery: i32,
-                  device_type: String,
-                  src_ip: String| {
-                // 忽略本机自身发出的 UDP 广播（广播会回环被自己接收）
-                if let Ok(guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
-                    if guard
-                        .broadcast_info
-                        .as_ref()
-                        .map(|b| b.uuid == uuid)
-                        .unwrap_or(false)
-                    {
-                        return;
-                    }
-                }
-                let name = String::from_utf8(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(&name_b64)
-                        .unwrap_or_default(),
-                )
-                .unwrap_or(name_b64);
-                let src_ip_clone = src_ip.clone();
-                if let Ok(mut guard) = unsafe { &*(udp_ctx as *mut crate::SafeContext) }.lock() {
-                    if let Ok(mut ips) = guard.device_ips.lock() {
-                        ips.insert(uuid.clone(), src_ip_clone);
-                    }
-                    // UDP 心跳：记录 last_seen 并登记状态
-                    guard.heartbeat.record(&uuid);
-                    guard
-                        .registry
-                        .upsert(&uuid, &name, &src_ip, port, battery, &device_type);
-                }
-                if let Some(cb) = udp_on_heartbeat {
-                    if let (Ok(uuid_c), Ok(name_c), Ok(dt_c), Ok(ip_c)) = (
-                        CString::new(uuid.as_str()),
-                        CString::new(name.as_str()),
-                        CString::new(device_type.as_str()),
-                        CString::new(src_ip.as_str()),
-                    ) {
-                        let ud = udp_user_data as *mut c_void;
-                        cb(
-                            uuid_c.as_ptr(),
-                            name_c.as_ptr(),
-                            port,
-                            battery,
-                            dt_c.as_ptr(),
-                            ip_c.as_ptr(),
-                            ud,
-                        );
-                    }
-                }
-            },
-        )
-            as Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>);
-        let on_udp_err = on_tcp_error.map(|cb| {
-            Arc::new(move |error: String| {
-                if let Ok(err_c) = CString::new(error.as_str()) {
-                    let ud = user_data_usize as *mut c_void;
-                    cb(err_c.as_ptr(), ud);
-                }
-            }) as Arc<dyn Fn(String) + Send + Sync>
-        });
-
-        match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
-            Ok(running) => {
-                if let Ok(mut state) = network_state.lock() {
-                    state.udp_handle = Some(crate::network::UdpListenerHandle { running });
-                }
-                log::info!("UDP 监听器已启动，端口: {}", udp_port);
-            }
-            Err(e) => {
-                log::warn!("启动 UDP 监听器失败: {}", e);
-            }
-        }
-    } else {
-        log::info!("UDP 监听器已在运行，跳过");
     }
 
     0
@@ -263,115 +174,6 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
 
     log::info!("网络变化通知: ip={:?}", new_ip);
 
-    // UDP 监听器使用 0.0.0.0:23334 监听所有接口，网络变化不影响其工作
-    // 只有在监听器未运行时才启动，避免频繁重启导致端口占用竞争
-    {
-        let guard = ctx.get_mut().unwrap();
-        let udp_running = match guard.network.tcp.lock() {
-            Ok(state) => state.udp_handle.is_some(),
-            Err(_) => false,
-        };
-
-        if !udp_running {
-            let on_heartbeat_udp = guard.router.on_heartbeat_udp;
-            let on_tcp_error = guard.router.on_tcp_error;
-            let user_data = guard.router.user_data;
-            let network_state = guard.network.tcp.clone();
-
-            let udp_port = 23334u16;
-            let udp_ctx2 = ctx_ptr as usize;
-            let udp_user_data = user_data as usize;
-            let on_udp_cb = on_heartbeat_udp.map(|cb| {
-                Arc::new(
-                    move |uuid: String,
-                          name_b64: String,
-                          port: u16,
-                          battery: i32,
-                          device_type: String,
-                          src_ip: String| {
-                        // 忽略本机自身发出的 UDP 广播（广播会回环被自己接收）
-                        if let Ok(guard) = unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock()
-                        {
-                            if guard
-                                .broadcast_info
-                                .as_ref()
-                                .map(|b| b.uuid == uuid)
-                                .unwrap_or(false)
-                            {
-                                return;
-                            }
-                        }
-                        let name = String::from_utf8(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(&name_b64)
-                                .unwrap_or_default(),
-                        )
-                        .unwrap_or(name_b64);
-                        let src_ip_clone = src_ip.clone();
-                        if let Ok(mut guard) =
-                            unsafe { &*(udp_ctx2 as *mut crate::SafeContext) }.lock()
-                        {
-                            if let Ok(mut ips) = guard.device_ips.lock() {
-                                ips.insert(uuid.clone(), src_ip_clone);
-                            }
-                            // UDP 心跳：记录 last_seen 并登记状态
-                            guard.heartbeat.record(&uuid);
-                            guard.registry.upsert(
-                                &uuid,
-                                &name,
-                                &src_ip,
-                                port,
-                                battery,
-                                &device_type,
-                            );
-                        }
-                        if let (Ok(uuid_c), Ok(name_c), Ok(dt_c), Ok(ip_c)) = (
-                            std::ffi::CString::new(uuid.as_str()),
-                            std::ffi::CString::new(name.as_str()),
-                            std::ffi::CString::new(device_type.as_str()),
-                            std::ffi::CString::new(src_ip.as_str()),
-                        ) {
-                            let ud = udp_user_data as *mut c_void;
-                            cb(
-                                uuid_c.as_ptr(),
-                                name_c.as_ptr(),
-                                port,
-                                battery,
-                                dt_c.as_ptr(),
-                                ip_c.as_ptr(),
-                                ud,
-                            );
-                        }
-                    },
-                )
-                    as Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>
-            });
-            let udp_err_user_data = user_data as usize;
-            let on_udp_err = on_tcp_error.map(|cb| {
-                Arc::new(move |error: String| {
-                    if let Ok(err_c) = std::ffi::CString::new(error.as_str()) {
-                        let ud = udp_err_user_data as *mut c_void;
-                        cb(err_c.as_ptr(), ud);
-                    }
-                }) as Arc<dyn Fn(String) + Send + Sync>
-            });
-
-            match crate::network::start_udp_listener(udp_port, on_udp_cb, on_udp_err) {
-                Ok(running) => {
-                    if let Ok(mut state) = network_state.lock() {
-                        state.udp_handle = Some(crate::network::UdpListenerHandle { running });
-                    }
-                    log::info!("网络变化: UDP 监听器已启动");
-                }
-                Err(e) => {
-                    log::warn!("网络变化: 启动 UDP 监听器失败: {}", e);
-                }
-            }
-        } else {
-            log::info!("网络变化: UDP 监听器已在运行，跳过");
-        }
-    }
-
     // 自动启动已知设备扫描（用于网络恢复后自动重连）
     ctx.get_mut()
         .unwrap()
@@ -379,11 +181,11 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
         .start_known_device_scanner(ctx_ptr as usize);
 }
 
-/// 高层统一启动接口：一次完成 TCP/UDP、发送队列、心跳调度、离线检测、
-/// 已知设备扫描、重连状态机、mDNS 广告与发现的启动。
+/// 高层统一启动接口：一次完成 TCP、发送队列、心跳调度、离线检测、
+/// 已知设备扫描、重连状态机的启动。
 /// 返回发送队列句柄（正整数，供入队使用），失败返回 0。
 /// 注意：本机身份（uuid/name/battery/device_type）写入 broadcast_info；
-/// pubkey 用于 mDNS 广告 TXT。
+/// 设备发现由 nrc_periodic_broadcast 启动的 TCP 扫描负责。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_start_core(
     ctx_ptr: *mut c_void,
@@ -392,7 +194,7 @@ pub unsafe extern "C" fn nrc_start_core(
     battery: i32,
     device_type: *const c_char,
     tcp_port: u16,
-    pubkey: *const c_char,
+    _pubkey: *const c_char,
     heartbeat_interval_ms: u64,
     offline_timeout_sec: i64,
     offline_check_interval_ms: u64,
@@ -411,7 +213,7 @@ pub unsafe extern "C" fn nrc_start_core(
 
     // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
     if start_tcp_server_impl(ctx_ptr, tcp_port) != 0 {
-        // TCP 绑定失败不阻塞其他组件：发送队列/心跳/mDNS 照常启动，
+        // TCP 绑定失败不阻塞其他组件：发送队列/心跳照常启动，
         // 出站发送由发送队列 worker 独立负责，网络恢复后重连状态机会补建连接
         log::warn!("nrc_start_core: TCP 服务器启动失败，继续启动其他组件");
     }
@@ -457,23 +259,6 @@ pub unsafe extern "C" fn nrc_start_core(
             reconnect_interval_secs,
             reconnect_max_retries,
         );
-    }
-
-    // mDNS 广告 + 发现
-    if super::mdns::start_mdns_advertiser_impl(
-        ctx_ptr,
-        uuid,
-        name,
-        tcp_port,
-        pubkey,
-        device_type,
-        battery,
-    ) != 0
-    {
-        log::warn!("nrc_start_core: mDNS 广告启动失败");
-    }
-    if super::mdns::start_mdns_discovery_impl(ctx_ptr) != 0 {
-        log::warn!("nrc_start_core: mDNS 发现启动失败");
     }
 
     queue_handle

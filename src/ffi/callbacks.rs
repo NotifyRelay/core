@@ -27,16 +27,6 @@ pub extern "C" fn nrc_set_on_state_query_cb(
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_set_on_heartbeat_udp_cb(
-    ctx_ptr: *mut c_void,
-    cb: crate::router::OnHeartbeatUdpCb,
-) {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.router.on_heartbeat_udp = cb;
-    });
-}
-
-#[no_mangle]
 pub extern "C" fn nrc_set_on_device_timeout_cb(
     ctx_ptr: *mut c_void,
     cb: crate::router::OnDeviceTimeoutCb,
@@ -74,11 +64,11 @@ pub extern "C" fn nrc_set_on_tcp_error_cb(ctx_ptr: *mut c_void, cb: crate::route
 }
 
 #[no_mangle]
-pub extern "C" fn nrc_set_on_mdns_discovered_cb(
+pub extern "C" fn nrc_set_on_device_discovered_cb(
     ctx_ptr: *mut c_void,
-    cb: crate::router::OnMdnsDiscoveredCb,
+    cb: crate::router::OnDeviceDiscoveredCb,
 ) {
     with_ctx(ctx_ptr, |ctx| {
-        ctx.router.on_mdns_discovered = cb;
+        ctx.router.on_device_discovered = cb;
     });
 }

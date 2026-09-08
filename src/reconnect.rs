@@ -111,12 +111,13 @@ impl ReconnectState {
                         for uuid in &uuids {
                             // 跳过本机自身（重连目标中不应包含本机）
                             let is_self = {
-                                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                                ctx.get_mut()
-                                    .unwrap()
-                                    .broadcast_info
-                                    .as_ref()
-                                    .map(|b| b.uuid == *uuid)
+                                // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
+                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                                ctx.lock()
+                                    .ok()
+                                    .and_then(|g| {
+                                        g.broadcast_info.as_ref().map(|b| b.uuid == *uuid)
+                                    })
                                     .unwrap_or(false)
                             };
                             if is_self {
@@ -129,10 +130,13 @@ impl ReconnectState {
                             // 不依赖 TCP 会话：协议连接均为短连接（session 随连接关闭立即移除），
                             // 用 tcp.is_connected 判定会永远失败，导致无限重复握手。
                             let connected = {
-                                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                                let guard = ctx.get_mut().unwrap();
-                                let timed_out = guard.heartbeat.check_timeouts(RECENT_SEEN_SECS);
-                                !timed_out.contains(uuid)
+                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                                match ctx.lock() {
+                                    Ok(guard) => {
+                                        guard.heartbeat.is_recently_seen(uuid, RECENT_SEEN_SECS)
+                                    }
+                                    Err(_) => false,
+                                }
                             };
 
                             if connected {
@@ -180,15 +184,16 @@ impl ReconnectState {
                         log::info!("重连: 尝试连接 uuid={}, ip={}", uuid, ip);
                         // 携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示
                         let handshake_msg = {
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            let guard = ctx.get_mut().unwrap();
+                            // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            let Ok(guard) = ctx.lock() else {
+                                continue;
+                            };
                             let local_uuid = guard
                                 .broadcast_info
                                 .as_ref()
                                 .map(|i| i.uuid.clone())
                                 .unwrap_or_default();
-                            let local_pub =
-                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default();
                             let local_battery = guard
                                 .broadcast_info
                                 .as_ref()
@@ -201,16 +206,10 @@ impl ReconnectState {
                                 .unwrap_or_default();
                             let local_ip =
                                 crate::ffi::utils::get_local_ip_impl().unwrap_or_default();
-                            codec::encode_handshake(
-                                &local_uuid,
-                                &local_pub,
-                                &local_ip,
-                                local_battery,
-                                &dt,
-                            )
+                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt)
                         };
 
-                        let resp = crate::network::oneshot_send_receive(
+                        let resp = crate::network::oneshot_send_receive_bin(
                             &handshake_msg,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
@@ -218,8 +217,8 @@ impl ReconnectState {
                         );
                         if resp.is_some() {
                             // 握手成功即视为在线：记录心跳时间，避免短连接协议下无限重复握手
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            if let Ok(guard) = ctx.get_mut() {
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            if let Ok(mut guard) = ctx.lock() {
                                 guard.heartbeat.record(&uuid);
                             }
                         }

@@ -21,35 +21,11 @@ pub type OnDataCb = Option<
     ),
 >;
 
-pub type OnHeartbeatUdpCb = Option<
-    extern "C" fn(
-        *const c_char,
-        *const c_char,
-        u16,
-        i32,
-        *const c_char,
-        *const c_char,
-        *mut c_void,
-    ),
->;
-
-pub type OnMdnsDiscoveredCb = Option<
-    extern "C" fn(
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        u16,
-        i32, // battery（正=充电，负=放电，-101=未知）
-        *const c_char,
-        *mut c_void,
-    ),
->;
-
 /// 状态查询回调（心跳线程锁外调用）：
 /// 参数为 (device_uuid, feature_id, is_media, user_data)，返回状态码：
 /// 0 = 该会话在平台上不存在（引擎应移除会话，不发任何包）
 /// 1 = 存在且无变更（引擎保活）
-/// 2 = 存在且有变更（平台会随后通过 `nrc_push_*`(is_query=1) 推送新状态）
+/// 2 = 存在且有变更（平台会随后通过 `nrc_push_*`(is_query=1)` 推送新状态）
 pub type OnStateQueryCb =
     Option<extern "C" fn(*const c_char, *const c_char, i32, *mut c_void) -> i32>;
 
@@ -59,14 +35,25 @@ pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char
 pub type OnDeviceDisconnectedCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 pub type OnTcpErrorCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
+pub type OnDeviceDiscoveredCb = Option<
+    extern "C" fn(
+        *const c_char, // device_uuid
+        *const c_char, // name_b64
+        u16,           // port
+        i32,           // battery
+        *const c_char, // device_type
+        *const c_char, // ip
+        *mut c_void,   // user_data
+    ),
+>;
+
 pub struct Router {
     pub user_data: *mut c_void,
     pub on_pairing: OnPairingCb,
     pub on_data: OnDataCb,
     pub on_state_query: OnStateQueryCb,
 
-    pub on_heartbeat_udp: OnHeartbeatUdpCb,
-    pub on_mdns_discovered: OnMdnsDiscoveredCb,
+    pub on_device_discovered: OnDeviceDiscoveredCb,
     pub on_device_timeout: OnDeviceTimeoutCb,
     pub on_device_connected: OnDeviceConnectedCb,
     pub on_device_disconnected: OnDeviceDisconnectedCb,
@@ -80,8 +67,7 @@ impl Router {
             on_pairing: None,
             on_data: None,
             on_state_query: None,
-            on_heartbeat_udp: None,
-            on_mdns_discovered: None,
+            on_device_discovered: None,
             on_device_timeout: None,
             on_device_connected: None,
             on_device_disconnected: None,

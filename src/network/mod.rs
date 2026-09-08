@@ -1,36 +1,35 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::io::BufReader;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use threadpool::ThreadPool;
 
-use crate::heartbeat;
-use crate::protocol::codec;
+use crate::protocol::binary_codec;
+use crate::protocol::header::MessageType;
 
 /// 回调类型
 type ConnectedCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 type DisconnectedCallback = Arc<dyn Fn(String) + Send + Sync>;
-type MessageCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+/// 消息回调: (uuid, msg_type, payload)
+type MessageCallback = Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>;
 type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
-
-/// UDP 心跳回调（新增 String 参数为源 IP）
-type UdpHeartbeatCallback = Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>;
 
 /// TCP 会话状态
 pub struct TcpSession {
     pub stream: TcpStream,
     pub uuid: String,
     pub ip: String,
-    pub buffer: String,
+    /// 所属连接标识：同一 uuid 重连后旧连接退出时，
+    /// 据此判断会话是否已属于新连接（避免误删新会话/误报断开）
+    pub conn_id: u64,
 }
 
-/// UDP 监听器状态
-pub struct UdpListenerHandle {
-    pub running: Arc<Mutex<bool>>,
-}
+/// 连接标识自增序列（每个 TCP 连接唯一）
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// TCP 服务器状态
 pub struct TcpServerState {
@@ -38,9 +37,10 @@ pub struct TcpServerState {
     pub sessions: HashMap<String, TcpSession>,
     pub running: bool,
     pub port: u16,
-    pub udp_handle: Option<UdpListenerHandle>,
     /// 本机 uuid（运行期动态更新，用于 TCP 层拒绝自我连接）
     pub local_uuid: String,
+    /// 广播信息副本（供发现请求响应使用）
+    pub broadcast_info: Option<crate::BroadcastInfo>,
 }
 
 impl TcpServerState {
@@ -50,16 +50,15 @@ impl TcpServerState {
             sessions: HashMap::new(),
             running: false,
             port: 0,
-            udp_handle: None,
             local_uuid: String::new(),
+            broadcast_info: None,
         }
     }
 
-    /// 向指定设备发送消息
-    pub fn send_to_device(&mut self, uuid: &str, message: &str) -> bool {
+    /// 向指定设备发送二进制帧
+    pub fn send_to_device(&mut self, uuid: &str, data: &[u8]) -> bool {
         if let Some(session) = self.sessions.get_mut(uuid) {
-            let data = format!("{}\n", message);
-            match session.stream.write_all(data.as_bytes()) {
+            match binary_codec::write_frame(&mut session.stream, data[0], &data[5..]) {
                 Ok(_) => true,
                 Err(e) => {
                     log::error!("发送消息失败 uuid={}, error={}", uuid, e);
@@ -72,13 +71,30 @@ impl TcpServerState {
         }
     }
 
-    /// 广播消息到所有连接的设备
-    pub fn broadcast(&mut self, message: &str) {
-        let data = format!("{}\n", message);
+    /// 通过已有 TCP 会话发送二进制帧（优先复用连接）
+    /// 返回 Ok(true) 表示通过已有会话发送，Ok(false) 表示会话不存在（需 fallback）
+    pub fn send_through_session(&mut self, uuid: &str, data: &[u8]) -> Result<bool, ()> {
+        if let Some(session) = self.sessions.get_mut(uuid) {
+            match binary_codec::write_frame(&mut session.stream, data[0], &data[5..]) {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    log::warn!("通过已有会话发送失败 uuid={}, error={}, 移除会话", uuid, e);
+                    self.sessions.remove(uuid);
+                    Err(())
+                }
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 广播二进制帧到所有连接的设备
+    pub fn broadcast(&mut self, data: &[u8]) {
         let uuids: Vec<String> = self.sessions.keys().cloned().collect();
         for uuid in uuids {
             if let Some(session) = self.sessions.get_mut(&uuid) {
-                if let Err(e) = session.stream.write_all(data.as_bytes()) {
+                if let Err(e) = binary_codec::write_frame(&mut session.stream, data[0], &data[5..])
+                {
                     log::error!("广播消息失败 uuid={}, error={}", uuid, e);
                 }
             }
@@ -178,6 +194,13 @@ pub fn set_local_uuid(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
     }
 }
 
+/// 同步广播信息到 TCP 服务器状态（供发现请求响应使用）
+pub fn set_broadcast_info(state: Arc<Mutex<TcpServerState>>, info: Option<crate::BroadcastInfo>) {
+    if let Ok(mut s) = state.lock() {
+        s.broadcast_info = info;
+    }
+}
+
 /// 接受连接循环
 fn accept_loop(
     state: Arc<Mutex<TcpServerState>>,
@@ -229,9 +252,9 @@ fn accept_loop(
     }
 }
 
-/// 处理单个连接
+/// 处理单个连接（二进制帧协议）
 fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     addr: SocketAddr,
     state: Arc<Mutex<TcpServerState>>,
     on_connected: Option<ConnectedCallback>,
@@ -245,110 +268,203 @@ fn handle_connection(
 
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
-    let mut buffer = String::new();
-    let mut uuid = String::new();
 
-    match reader.read_line(&mut buffer) {
-        Ok(0) => return,
-        Ok(_) => {
-            let line = buffer.trim().to_string();
-            buffer.clear();
-
-            if let Some(f) = codec::decode_handshake(&line) {
-                uuid = f.uuid.to_string();
-            } else if let Some(pos) = line.find(':') {
-                let rest = &line[pos + 1..];
-                if let Some(end) = rest.find(':') {
-                    uuid = rest[..end].to_string();
-                } else if !rest.is_empty() {
-                    uuid = rest.to_string();
-                }
-            }
-
-            if uuid.is_empty() {
-                log::warn!("无法从消息中提取 UUID: {}", &line[..line.len().min(80)]);
-                return;
-            }
-
-            // 拒绝本机发起的自我连接（如已知设备中残留本机条目导致的重连循环）
-            // 本机 uuid 动态从 state 读取（运行期由 FFI 层同步，避免启动顺序导致为空）
-            let local_uuid = state
-                .lock()
-                .map(|s| s.local_uuid.clone())
-                .unwrap_or_default();
-            if !local_uuid.is_empty() && uuid == local_uuid {
-                return;
-            }
-
-            //log::info!("TCP连接已建立 uuid={}, ip={}", uuid, ip);
-            {
-                let mut state = state.lock().unwrap();
-                state.sessions.insert(
-                    uuid.clone(),
-                    TcpSession {
-                        stream: stream.try_clone().expect("克隆流失败"),
-                        uuid: uuid.clone(),
-                        ip: ip.clone(),
-                        buffer: String::new(),
-                    },
-                );
-            }
-
-            if let Some(ref cb) = on_connected {
-                cb(uuid.clone(), ip.clone());
-            }
-
-            if let Some(ref cb) = on_message {
-                cb(uuid.clone(), line);
-            }
-        }
+    // 读取第一帧（允许任意类型：HANDSHAKE / DATA / 配对 / 心跳 / 发现请求）
+    let (first_type, first_payload) = match binary_codec::read_frame(&mut reader) {
+        Ok(f) => f,
         Err(e) => {
-            log::error!("读取第一行失败: {}", e);
+            log::error!("读取第一帧失败: {}", e);
             if let Some(ref cb) = on_error {
                 cb(format!("读取失败: {}", e));
             }
             return;
         }
+    };
+
+    // 发现请求：解析请求并回复本机发现响应，然后关闭连接
+    if first_type == MessageType::DISCOVERY_REQUEST {
+        let request_text = match std::str::from_utf8(&first_payload) {
+            Ok(s) => s.trim(),
+            Err(_) => {
+                log::warn!("DISCOVERY_REQUEST payload 非 UTF-8");
+                return;
+            }
+        };
+        // 从请求中解析发送方信息，记录IP映射
+        if let Some((peer_uuid, _name_b64, _port, _battery, _device_type)) =
+            crate::protocol::codec::decode_discovery_request(request_text)
+        {
+            if !peer_uuid.is_empty() && !ip.is_empty() {
+                log::debug!("TCP扫描发现: uuid={}, ip={}", peer_uuid, ip);
+            }
+        }
+        // 生成本机发现响应
+        if let Ok(s) = state.lock() {
+            if let Some(ref info) = s.broadcast_info {
+                let response = crate::protocol::codec::encode_discovery_response(
+                    &info.uuid,
+                    &info.name_b64,
+                    crate::protocol::codec::DEFAULT_TCP_PORT,
+                    info.battery,
+                    &info.device_type,
+                );
+                let resp_frame =
+                    binary_codec::encode_pairing_frame(MessageType::DISCOVERY_RESPONSE, &response);
+                use std::io::Write;
+                let _ = stream.write_all(&resp_frame);
+                let _ = stream.flush();
+            }
+        }
+        return;
     }
 
+    // 根据消息类型提取 UUID
+    let uuid = match first_type {
+        MessageType::HANDSHAKE => match binary_codec::decode_handshake_frame(&first_payload) {
+            Some(h) => h.uuid,
+            None => {
+                log::warn!("HANDSHAKE 帧解码失败");
+                return;
+            }
+        },
+        MessageType::HEARTBEAT => match binary_codec::decode_heartbeat_frame(&first_payload) {
+            Some(h) => h.uuid,
+            None => {
+                log::warn!("HEARTBEAT 帧解码失败");
+                return;
+            }
+        },
+        t if t >= 10 && t <= 200 => {
+            // DATA 帧: DATA_TYPE:uuid:pub_key:encrypted_data
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let parts: Vec<&str> = s.splitn(4, ':').collect();
+                    if parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else {
+                        log::warn!("DATA 帧 payload 格式错误");
+                        return;
+                    }
+                }
+                Err(_) => {
+                    log::warn!("DATA 帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        MessageType::PAIRING_INIT | MessageType::PAIRING_RESP => {
+            // 配对帧: uuid:...
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if !parts[0].is_empty() {
+                        parts[0].to_string()
+                    } else {
+                        log::warn!("配对帧 UUID 为空");
+                        return;
+                    }
+                }
+                Err(_) => {
+                    log::warn!("配对帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        MessageType::ACCEPT | MessageType::REJECT => {
+            // 控制帧: payload 就是 UUID
+            match std::str::from_utf8(&first_payload) {
+                Ok(s) => {
+                    let uuid = s.trim().to_string();
+                    if uuid.is_empty() {
+                        log::warn!("控制帧 UUID 为空");
+                        return;
+                    }
+                    uuid
+                }
+                Err(_) => {
+                    log::warn!("控制帧 payload 非 UTF-8");
+                    return;
+                }
+            }
+        }
+        _ => {
+            log::warn!("第一帧类型不支持: type={}", first_type);
+            return;
+        }
+    };
+
+    // 拒绝本机发起的自我连接
+    let local_uuid = state
+        .lock()
+        .map(|s| s.local_uuid.clone())
+        .unwrap_or_default();
+    if !local_uuid.is_empty() && uuid == local_uuid {
+        return;
+    }
+
+    // 注册会话（带本连接唯一标识，供退出时判定归属）
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut state = state.lock().unwrap();
+        state.sessions.insert(
+            uuid.clone(),
+            TcpSession {
+                stream: stream.try_clone().expect("克隆流失败"),
+                uuid: uuid.clone(),
+                ip: ip.clone(),
+                conn_id,
+            },
+        );
+    }
+
+    if let Some(ref cb) = on_connected {
+        cb(uuid.clone(), ip.clone());
+    }
+
+    // 回调第一帧
+    if let Some(ref cb) = on_message {
+        cb(uuid.clone(), first_type, first_payload);
+    }
+
+    // 持续读取二进制帧
     loop {
-        buffer.clear();
-        match reader.read_line(&mut buffer) {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = buffer.trim().to_string();
-                if !line.is_empty() {
-                    if let Some(data) = codec::decode_data_message(&line) {
-                        log::info!(
-                            "收到 TCP DATA: local_uuid={}, payload_len={}, from={}",
-                            data.local_uuid,
-                            data.encrypted_payload.len(),
-                            addr
-                        );
-                    }
-                    if let Some(ref cb) = on_message {
-                        cb(uuid.clone(), line);
-                    }
+        match binary_codec::read_frame(&mut reader) {
+            Ok((msg_type, payload)) => {
+                if let Some(ref cb) = on_message {
+                    cb(uuid.clone(), msg_type, payload);
                 }
             }
             Err(e) => {
-                log::error!("读取数据失败 uuid={}, error={}", uuid, e);
-                if let Some(ref cb) = on_error {
-                    cb(format!("读取失败: {}", e));
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    log::error!("读取数据失败 uuid={}, error={}", uuid, e);
+                    if let Some(ref cb) = on_error {
+                        cb(format!("读取失败: {}", e));
+                    }
                 }
                 break;
             }
         }
     }
 
-    {
+    // 仅当会话仍属于本连接时才移除并上报断开：
+    // 对端重连后新连接已覆盖同 uuid 会话，旧连接退出不得摘掉新会话
+    let still_owner = {
         let mut state = state.lock().unwrap();
-        state.sessions.remove(&uuid);
-    }
+        let owned = state
+            .sessions
+            .get(&uuid)
+            .map(|s| s.conn_id == conn_id)
+            .unwrap_or(false);
+        if owned {
+            state.sessions.remove(&uuid);
+        }
+        owned
+    };
 
-    //log::info!("TCP连接已断开 uuid={}", uuid);
-    if let Some(ref cb) = on_disconnected {
-        cb(uuid);
+    if still_owner {
+        if let Some(ref cb) = on_disconnected {
+            cb(uuid);
+        }
     }
 }
 
@@ -359,149 +475,13 @@ pub fn remove_device_session(state: Arc<Mutex<TcpServerState>>, uuid: &str) {
     }
 }
 
-/// UDP 广播端口
-const UDP_BROADCAST_PORT: u16 = 23334;
-
-/// 发送 UDP 广播消息（支持多子网）
-pub fn send_udp_broadcast(message: &str) -> Result<(), String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("绑定 UDP 失败: {}", e))?;
-    socket
-        .set_broadcast(true)
-        .map_err(|e| format!("设置广播失败: {}", e))?;
-
-    let data = message.as_bytes();
-
-    socket
-        .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
-        .map_err(|e| format!("有限广播失败: {}", e))?;
-
-    #[cfg(target_os = "android")]
-    {
-        send_to_all_subnets(&socket, data)?;
-    }
-
-    Ok(())
-}
-
-/// 向所有子网发送定向广播（Android/Linux）
-#[cfg(target_os = "android")]
-fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            return Err("getifaddrs 失败".to_string());
-        }
-
-        let mut ptr = ifaddrs;
-        while !ptr.is_null() {
-            let entry = &*ptr;
-
-            if !entry.ifa_addr.is_null() {
-                let addr = entry.ifa_addr;
-                if (*addr).sa_family == libc::AF_INET as libc::sa_family_t {
-                    let sockaddr = &*(addr as *const libc::sockaddr_in);
-                    let ip = Ipv4Addr::from(sin_addr_to_bytes(sockaddr.sin_addr));
-
-                    if !ip.is_loopback() && !ip.is_unspecified() {
-                        let ip_bytes = ip.octets();
-                        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
-                        let broadcast_addr =
-                            SocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
-
-                        if let Err(e) = socket.send_to(data, broadcast_addr) {
-                            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
-                        }
-                    }
-                }
-            }
-
-            ptr = (*entry).ifa_next;
-        }
-
-        libc::freeifaddrs(ifaddrs);
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
-    let s_addr = addr.s_addr;
-    [
-        (s_addr & 0xFF) as u8,
-        ((s_addr >> 8) & 0xFF) as u8,
-        ((s_addr >> 16) & 0xFF) as u8,
-        ((s_addr >> 24) & 0xFF) as u8,
-    ]
-}
-
-/// 启动 UDP 监听器，绑定到指定端口接收心跳广播
-pub fn start_udp_listener(
+/// Oneshot TCP 发送二进制帧并接收二进制帧响应
+pub fn oneshot_send_receive_bin(
+    payload: &[u8],
+    ip: &str,
     port: u16,
-    on_heartbeat: Option<UdpHeartbeatCallback>,
-    on_error: Option<ErrorCallback>,
-) -> Result<Arc<Mutex<bool>>, String> {
-    let addr = format!("0.0.0.0:{}", port);
-    let socket =
-        UdpSocket::bind(&addr).map_err(|e| format!("绑定 UDP 监听端口 {} 失败: {}", port, e))?;
-    socket
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|e| format!("设置 UDP 超时失败: {}", e))?;
-
-    let running = Arc::new(Mutex::new(true));
-    let running_clone = running.clone();
-
-    thread::spawn(move || {
-        let mut buf = [0u8; 2048];
-        loop {
-            let should_run = match running_clone.lock() {
-                Ok(r) => *r,
-                Err(_) => break,
-            };
-            if !should_run {
-                break;
-            }
-
-            match socket.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    let src_ip = src.ip().to_string();
-                    let line = match String::from_utf8_lossy(&buf[..n]).trim().to_string() {
-                        s if s.is_empty() => continue,
-                        s => s,
-                    };
-                    if let Some(ref cb) = on_heartbeat {
-                        if let Some((uuid, name_b64, hb_port, battery, device_type)) =
-                            heartbeat::parse_udp_heartbeat(&line)
-                        {
-                            cb(uuid, name_b64, hb_port, battery, device_type, src_ip);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // 超时和 EINTR(锁屏等信号中断)是正常的，继续循环
-                    if e.kind() != std::io::ErrorKind::WouldBlock
-                        && e.kind() != std::io::ErrorKind::TimedOut
-                        && e.kind() != std::io::ErrorKind::Interrupted
-                    {
-                        log::debug!("UDP 接收错误: {}", e);
-                        if let Some(ref cb) = on_error {
-                            cb(format!("UDP 接收错误: {}", e));
-                        }
-                    }
-                }
-            }
-        }
-        log::debug!("UDP 监听线程已退出");
-    });
-
-    log::info!("UDP 监听器已启动，端口 {}", port);
-    Ok(running)
-}
-
-/// Oneshot TCP 发送并接收响应，内部通过 process_line 处理响应
-pub fn oneshot_send_receive(payload: &str, ip: &str, port: u16, timeout_ms: u32) -> Option<String> {
+    timeout_ms: u32,
+) -> Option<(u8, Vec<u8>)> {
     let addr = format!("{}:{}", ip, port);
     let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
     let stream =
@@ -512,22 +492,13 @@ pub fn oneshot_send_receive(payload: &str, ip: &str, port: u16, timeout_ms: u32)
     stream
         .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
         .ok()?;
-    let mut writer = &stream;
-    writer.write_all(format!("{}\n", payload).as_bytes()).ok()?;
-    writer.flush().ok()?;
+    binary_codec::write_frame(&mut &stream, payload[0], &payload[5..]).ok()?;
     let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let trimmed = line.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    binary_codec::read_frame(&mut reader).ok()
 }
 
-/// Oneshot TCP 发送（不等待响应）
-pub fn oneshot_send_only(payload: &str, ip: &str, port: u16, timeout_ms: u32) -> bool {
+/// Oneshot TCP 发送二进制帧（不等待响应）
+pub fn oneshot_send_only(payload: &[u8], ip: &str, port: u16, timeout_ms: u32) -> bool {
     let addr = format!("{}:{}", ip, port);
     let sock_addr = match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a,
@@ -547,13 +518,133 @@ pub fn oneshot_send_only(payload: &str, ip: &str, port: u16, timeout_ms: u32) ->
     stream
         .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
         .ok();
-    let data = format!("{}\n", payload);
     let mut writer = &stream;
-    if writer.write_all(data.as_bytes()).is_err() || writer.flush().is_err() {
+    if binary_codec::write_frame(&mut writer, payload[0], &payload[5..]).is_err() {
         log::debug!("oneshot_send_only: 写入失败 addr={}", addr);
         return false;
     }
     true
+}
+
+/// 获取本机局域网IP段的所有IP地址
+pub fn get_local_subnet_ips() -> Vec<String> {
+    use std::net::Ipv4Addr;
+
+    let mut ips = Vec::new();
+
+    // 获取本机IP地址
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    let octets = ip.octets();
+                    // 生成同子网的所有IP（/24子网），排除本机自身（避免自我扫描）
+                    for i in 1..=254 {
+                        if octets[3] == i {
+                            continue;
+                        }
+                        let subnet_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], i);
+                        ips.push(subnet_ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 如果无法获取本机IP，返回默认的C类网络
+    if ips.is_empty() {
+        for i in 1..=254 {
+            ips.push(format!("192.168.1.{}", i));
+        }
+    }
+
+    ips
+}
+
+/// 单 IP 扫描超时（毫秒）：局域网内连接/响应均为毫秒级，超时过长会拖慢整轮扫描
+const SCAN_SINGLE_TIMEOUT_MS: u32 = 1200;
+
+/// TCP扫描发现：向指定IP发送发现请求并解析响应
+/// 返回 (uuid, name_b64, port, battery, device_type)
+pub fn tcp_scan_discover_single(
+    ip: &str,
+    discovery_request: &str,
+    timeout_ms: u32,
+) -> Option<(String, String, u16, i32, String)> {
+    use crate::protocol::{binary_codec, header::MessageType};
+
+    let addr = format!("{}:{}", ip, crate::protocol::codec::DEFAULT_TCP_PORT);
+    let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
+
+    // 尝试TCP连接
+    let stream =
+        TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)).ok()?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
+        .ok()?;
+
+    // 发送发现请求（二进制帧格式）
+    let frame =
+        binary_codec::encode_pairing_frame(MessageType::DISCOVERY_REQUEST, discovery_request);
+    {
+        let mut writer = &stream;
+        use std::io::Write;
+        writer.write_all(&frame).ok()?;
+        writer.flush().ok()?;
+    }
+
+    // 读取响应（二进制帧格式）
+    let mut reader = BufReader::new(&stream);
+    let (_msg_type, payload) = binary_codec::read_frame(&mut reader).ok()?;
+
+    // 解析响应
+    let response_text = std::str::from_utf8(&payload).ok()?;
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    crate::protocol::codec::decode_discovery_response(trimmed)
+}
+
+/// TCP扫描发现：并发扫描局域网IP段
+pub fn tcp_scan_discover_all(
+    discovery_request: &str,
+    on_device_discovered: Option<
+        Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>,
+    >,
+) {
+    let ips = get_local_subnet_ips();
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // 并发上限：一轮扫描需控制在发现周期内（多数 IP 为瞬时拒绝），移动端同时限制线程数
+    let pool_size = (parallelism * 8).clamp(8, 96);
+
+    let pool = threadpool::ThreadPool::new(pool_size);
+    let on_discovered = on_device_discovered;
+
+    for ip in ips {
+        let request = discovery_request.to_string();
+        let cb = on_discovered.clone();
+
+        pool.execute(move || {
+            if let Some((uuid, name_b64, port, battery, device_type)) =
+                tcp_scan_discover_single(&ip, &request, SCAN_SINGLE_TIMEOUT_MS)
+            {
+                if let Some(ref cb) = cb {
+                    cb(uuid, name_b64, port, battery, device_type, ip);
+                }
+            }
+        });
+    }
+
+    // 等待所有扫描完成
+    pool.join();
 }
 
 #[cfg(test)]
@@ -563,7 +654,9 @@ mod tests {
     #[test]
     fn test_send_to_device_not_connected() {
         let mut state = TcpServerState::new();
-        let result = state.send_to_device("test-uuid", "test message");
+        // 构造一个最小二进制帧: type=0xFF, length=0
+        let frame = vec![0xFF, 0, 0, 0, 0];
+        let result = state.send_to_device("test-uuid", &frame);
         assert!(!result);
     }
 

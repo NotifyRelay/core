@@ -12,7 +12,6 @@ mod discovery;
 pub mod ffi;
 mod filter;
 mod heartbeat;
-mod mdns;
 mod models;
 mod network;
 mod persistence;
@@ -25,7 +24,11 @@ mod state_merge;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use zeroize::Zeroize;
+
+pub(crate) const PAIRING_SESSION_TTL: Duration = Duration::from_secs(300);
+pub(crate) const MAX_PAIRING_SESSIONS: usize = 128;
 
 pub struct DeviceState {
     pub peer_lt_pub: Option<String>,
@@ -38,33 +41,29 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub audio: Arc<Mutex<audio_stream::AudioStreamState>>,
     pub network: network::NetworkState,
-    pub mdns: mdns::MdnsState,
     pub dedup: dedup::DedupState,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
     pub filter: ffi::filter::FilterState,
     /// 设备运行时状态统一注册表
     pub registry: device_registry::DeviceRegistry,
-    pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
-    pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
-    pub pairing_ctx: Option<PairingContext>,
-    pub expected_pairing_code: Option<String>,
+    /// 按对端 uuid 隔离的配对会话：
+    /// 并发配对（同时对多个设备发起/响应）时互不覆盖，
+    /// ACCEPT 只能命中同一对端的 SPAKE2 会话与 K_s
+    pub pairing_sessions: HashMap<String, PairingSession>,
     /// 配对码生成（接收端/初始生成端）
     pub pairing_code: Option<String>,
     /// 配对码过期时间
     pub pairing_code_expiry: Option<Instant>,
     pub broadcast_info: Option<BroadcastInfo>,
     pub broadcast_handle: Option<BroadcastHandle>,
-    /// UUID → IP 映射（从 UDP 心跳源地址、TCP 连接等收集）
+    /// UUID → IP 映射（从 TCP 连接等收集）
     pub device_ips: Mutex<HashMap<String, String>>,
     // 新增字段
     /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳）
     pub heartbeat_scheduler: u64,
     /// 调度器持有的每设备 HeartbeatHandle（跨轮次持久，由调度线程维护）
     pub heartbeat_scheduler_handles: HashMap<String, heartbeat::HeartbeatHandle>,
-    /// 心跳模式：false=广播主用（UDP 广播兼发现+心跳，不启动每设备心跳）；
-    /// true=TCP 备用（锁屏/WLAN直连 时每设备 TCP 定向心跳）
-    pub heartbeat_tcp_backup: AtomicBool,
     pub offline_detector_handle: u64,
     pub sender_queue: u64,
     pub reconnect_state: u64,
@@ -99,6 +98,51 @@ pub struct PairingContext {
     pub peer_lt_pub: Option<String>,
 }
 
+/// 单个对端的配对会话（prover / verifier / K_s / 配对上下文 / 期望配对码）
+///
+/// K_s 仅用于加解密长期公钥 lt_pub 的一次传输：配对完成后清零，
+/// 数据通道密钥统一由「本机长期私钥 × 对端长期公钥 → ECDH + HKDF」派生，
+/// 与重连路径（process_handshake）保持一致。
+pub struct PairingSession {
+    pub prover: Option<crypto::spake2::Spake2ProverSession>,
+    pub verifier: Option<crypto::spake2::Spake2VerifierSession>,
+    pub session_key: Option<[u8; 32]>,
+    pub pairing_ctx: Option<PairingContext>,
+    pub expected_code: Option<String>,
+    pub expires_at: Instant,
+}
+
+impl PairingSession {
+    pub(crate) fn refresh_expiry(&mut self) {
+        self.expires_at = Instant::now() + PAIRING_SESSION_TTL;
+    }
+}
+
+impl Default for PairingSession {
+    fn default() -> Self {
+        Self {
+            prover: None,
+            verifier: None,
+            session_key: None,
+            pairing_ctx: None,
+            expected_code: None,
+            expires_at: Instant::now() + PAIRING_SESSION_TTL,
+        }
+    }
+}
+
+impl Drop for PairingSession {
+    fn drop(&mut self) {
+        if let Some(key) = self.session_key.as_mut() {
+            key.zeroize();
+        }
+        if let Some(code) = self.expected_code.as_mut() {
+            code.zeroize();
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct BroadcastInfo {
     pub uuid: String,
     pub name_b64: String,
@@ -119,24 +163,19 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             audio: Arc::new(Mutex::new(audio_stream::AudioStreamState::new())),
             network: network::NetworkState::new(),
-            mdns: mdns::MdnsState::new(),
             dedup: dedup::DedupState::new(),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),
             filter: ffi::filter::FilterState::new(),
             registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
-            spake2_prover: None,
-            spake2_verifier: None,
-            pairing_ctx: None,
-            expected_pairing_code: None,
+            pairing_sessions: HashMap::new(),
             pairing_code: None,
             pairing_code_expiry: None,
             broadcast_info: None,
             broadcast_handle: None,
             heartbeat_scheduler: 0,
             heartbeat_scheduler_handles: HashMap::new(),
-            heartbeat_tcp_backup: AtomicBool::new(false),
             offline_detector_handle: 0,
             sender_queue: 0,
             reconnect_state: 0,
@@ -151,6 +190,32 @@ impl CoreContext {
             pending_device_deletions: Vec::new(),
             db_override: None,
         }
+    }
+
+    /// 获取或新建未完成配对会话，并统一执行过期清理与全局数量限制。
+    pub(crate) fn pairing_session_mut(&mut self, uuid: &str) -> &mut PairingSession {
+        self.prune_expired_pairing_sessions();
+        if !self.pairing_sessions.contains_key(uuid)
+            && self.pairing_sessions.len() >= MAX_PAIRING_SESSIONS
+        {
+            if let Some(oldest) = self
+                .pairing_sessions
+                .iter()
+                .min_by_key(|(_, session)| session.expires_at)
+                .map(|(uuid, _)| uuid.clone())
+            {
+                self.pairing_sessions.remove(&oldest);
+            }
+        }
+        let session = self.pairing_sessions.entry(uuid.to_string()).or_default();
+        session.refresh_expiry();
+        session
+    }
+
+    pub(crate) fn prune_expired_pairing_sessions(&mut self) {
+        let now = Instant::now();
+        self.pairing_sessions
+            .retain(|_, session| session.expires_at > now);
     }
 
     /// 指定持久化库路径构造（测试隔离用：每个测试注入独立库文件）

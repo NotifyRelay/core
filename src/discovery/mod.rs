@@ -77,12 +77,11 @@ impl DiscoveryState {
                     for (uuid, ip) in known_list {
                         // 跳过本机自身（已知设备中不应包含本机）
                         let is_self = {
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            ctx.get_mut()
-                                .unwrap()
-                                .broadcast_info
-                                .as_ref()
-                                .map(|b| b.uuid == uuid)
+                            // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            ctx.lock()
+                                .ok()
+                                .and_then(|g| g.broadcast_info.as_ref().map(|b| b.uuid == uuid))
                                 .unwrap_or(false)
                         };
                         if is_self {
@@ -93,10 +92,13 @@ impl DiscoveryState {
                         // 不依赖 TCP 会话：协议连接均为短连接（session 随连接关闭立即移除），
                         // 用 tcp.is_connected 判定会永远失败，导致每轮扫描无限重复握手。
                         let connected = {
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            let guard = ctx.get_mut().unwrap();
-                            let timed_out = guard.heartbeat.check_timeouts(RECENT_SEEN_SECS);
-                            !timed_out.contains(&uuid)
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            match ctx.lock() {
+                                Ok(guard) => {
+                                    guard.heartbeat.is_recently_seen(&uuid, RECENT_SEEN_SECS)
+                                }
+                                Err(_) => false,
+                            }
                         };
 
                         if connected {
@@ -105,35 +107,31 @@ impl DiscoveryState {
                         has_offline = true;
 
                         // 尝试握手建立连接（携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示）
-                        let (local_uuid, local_pub, local_battery, local_ip) = {
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            let guard = ctx.get_mut().unwrap();
+                        let (local_uuid, local_battery, local_ip) = {
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            let Ok(guard) = ctx.lock() else {
+                                continue;
+                            };
                             let bi = guard.broadcast_info.as_ref();
                             (
                                 bi.map(|i| i.uuid.clone()).unwrap_or_default(),
-                                guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                                 bi.map(|i| i.battery).unwrap_or(0),
                                 crate::ffi::utils::get_local_ip_impl().unwrap_or_default(),
                             )
                         };
                         let dt = {
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            ctx.get_mut()
-                                .unwrap()
-                                .broadcast_info
-                                .as_ref()
-                                .map(|i| i.device_type.clone())
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            ctx.lock()
+                                .ok()
+                                .and_then(|g| {
+                                    g.broadcast_info.as_ref().map(|i| i.device_type.clone())
+                                })
                                 .unwrap_or_default()
                         };
-                        let handshake = codec::encode_handshake(
-                            &local_uuid,
-                            &local_pub,
-                            &local_ip,
-                            local_battery,
-                            &dt,
-                        );
+                        let handshake =
+                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt);
 
-                        let resp = network::oneshot_send_receive(
+                        let resp = network::oneshot_send_receive_bin(
                             &handshake,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
@@ -141,8 +139,8 @@ impl DiscoveryState {
                         );
                         if resp.is_some() {
                             // 握手成功即视为在线：记录心跳时间，避免短连接协议下每轮扫描重复握手
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            if let Ok(guard) = ctx.get_mut() {
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            if let Ok(mut guard) = ctx.lock() {
                                 guard.heartbeat.record(&uuid);
                             }
                         }
