@@ -133,9 +133,7 @@ impl ReconnectState {
                                 let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
                                 match ctx.lock() {
                                     Ok(guard) => {
-                                        let timed_out =
-                                            guard.heartbeat.check_timeouts(RECENT_SEEN_SECS);
-                                        !timed_out.contains(uuid)
+                                        guard.heartbeat.is_recently_seen(uuid, RECENT_SEEN_SECS)
                                     }
                                     Err(_) => false,
                                 }

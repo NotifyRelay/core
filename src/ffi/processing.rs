@@ -8,10 +8,10 @@ use crate::{
     SafeContext,
 };
 
-use super::send::do_send;
+use super::send::do_send_via_network;
 
 fn fire_pairing_cb(
-    ctx: &mut SafeContext,
+    ctx: &SafeContext,
     uuid: &str,
     msg_type: &str,
     data: &str,
@@ -19,7 +19,9 @@ fn fire_pairing_cb(
     extra: &str,
 ) {
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(g) = ctx.lock() else {
+            return;
+        };
         (g.router.on_pairing, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -38,9 +40,11 @@ fn fire_pairing_cb(
     }
 }
 
-fn fire_data_cb(ctx: &mut SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
+fn fire_data_cb(ctx: &SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(g) = ctx.lock() else {
+            return;
+        };
         (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -74,7 +78,7 @@ fn frame_sender_uuid(msg_type: u8, payload: &[u8]) -> Option<String> {
 /// session_uuid：帧所属 TCP 会话的 uuid（oneshot 直连场景为 None）；
 /// 非 None 时校验帧内声明的 uuid 与会话一致，防止跨会话冒用对端身份
 pub(crate) fn process_frame(
-    ctx: &mut SafeContext,
+    ctx: &SafeContext,
     session_uuid: Option<&str>,
     msg_type: u8,
     payload: &[u8],
@@ -112,7 +116,7 @@ pub(crate) fn process_frame(
     }
 }
 
-fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let hs = match binary_codec::decode_handshake_frame(payload) {
         Some(h) => h,
         None => {
@@ -122,29 +126,19 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     };
 
     let uuid_str = hs.uuid.clone();
-    let is_self = ctx
-        .get_mut()
-        .unwrap()
-        .broadcast_info
-        .as_ref()
-        .map(|b| b.uuid == uuid_str)
-        .unwrap_or(false);
-    if is_self {
-        return 0;
-    }
-
-    let already_paired = ctx
-        .get_mut()
-        .unwrap()
-        .crypto
-        .device_keys
-        .contains_key(&uuid_str);
-
     // 重连 HANDSHAKE 不再明文携带长期公钥；仅使用配对阶段锁定的 remote_pub_key 派生，
     // 使长期 ECDH 密钥严格绑定到经配对码(SPAKE2)认证的身份，杜绝链路劫持替换公钥。
-    let (local_key, locked_remote) = {
-        let guard = ctx.get_mut().unwrap();
+    let (is_self, already_paired, local_key, locked_remote) = {
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
         (
+            guard
+                .broadcast_info
+                .as_ref()
+                .map(|b| b.uuid == uuid_str)
+                .unwrap_or(false),
+            guard.crypto.device_keys.contains_key(&uuid_str),
             guard.crypto.local_key.clone(),
             guard
                 .crypto
@@ -154,6 +148,9 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 .unwrap_or_default(),
         )
     };
+    if is_self {
+        return 0;
+    }
 
     if already_paired {
         if locked_remote.is_empty() {
@@ -166,7 +163,9 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 let aes_key = hkdf::derive_session_key(&shared);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
                 {
-                    let guard = ctx.get_mut().unwrap();
+                    let Ok(mut guard) = ctx.lock() else {
+                        return -1;
+                    };
                     guard.crypto.device_keys.insert(
                         uuid_str.clone(),
                         crate::crypto::DeviceKeyEntry {
@@ -181,7 +180,9 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     }
 
     let ip = {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
         let ip_from_ips = guard
             .device_ips
             .lock()
@@ -216,19 +217,18 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     .to_string();
 
     if already_paired {
-        let _ = ctx
-            .get_mut()
-            .unwrap()
-            .discovery
-            .add_known_device(&uuid_str, &ip);
-        let (local_uuid, local_pub, local_battery, local_type) = {
-            let guard = ctx.get_mut().unwrap();
+        let (local_uuid, local_pub, local_battery, local_type, network) = {
+            let Ok(guard) = ctx.lock() else {
+                return -1;
+            };
+            guard.discovery.add_known_device(&uuid_str, &ip);
             let bi = guard.broadcast_info.as_ref();
             (
                 bi.map(|b| b.uuid.clone()).unwrap_or_default(),
                 guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                 bi.map(|b| b.battery).unwrap_or(0),
                 bi.map(|b| b.device_type.clone()).unwrap_or_default(),
+                guard.network.tcp.clone(),
             )
         };
         let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
@@ -240,7 +240,7 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 local_battery,
                 &local_type,
             );
-            do_send(&ctx.get_mut().unwrap(), &uuid_str, &accept);
+            do_send_via_network(&network, &uuid_str, &accept);
             log::info!("配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT", uuid_str);
         }
     }
@@ -256,7 +256,7 @@ fn process_handshake(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     0
 }
 
-fn process_pairing_init(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_pairing_init(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let text = match std::str::from_utf8(payload) {
         Ok(s) => s,
         Err(_) => {
@@ -278,9 +278,11 @@ fn process_pairing_init(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     let device_type = parts[4];
 
     {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
         // 配对会话按发起方 uuid 隔离：多个设备同时发起配对时互不覆盖
-        let session = guard.pairing_sessions.entry(uuid.to_string()).or_default();
+        let session = guard.pairing_session_mut(uuid);
         session.pairing_ctx = Some(crate::PairingContext {
             peer_uuid: uuid.to_string(),
             peer_spake2_pub: spake2_pub.to_string(),
@@ -299,7 +301,7 @@ fn process_pairing_init(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     0
 }
 
-fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_pairing_resp(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let text = match std::str::from_utf8(payload) {
         Ok(s) => s,
         Err(_) => {
@@ -327,8 +329,11 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     //
     // 会话按对端 uuid 取用：平台端 PAIRING_RESP 携带的 uuid 语义不统一
     // （Android 传发起方 uuid、PC 传本机 uuid），未命中时退回唯一持有 prover 的会话。
-    let (session_id, peer_lt_pub, ks) = {
-        let guard = ctx.get_mut().unwrap();
+    let (session_id, prover) = {
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
+        guard.prune_expired_pairing_sessions();
         let key = if guard.pairing_sessions.contains_key(uuid) {
             uuid.to_string()
         } else {
@@ -346,48 +351,59 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
             }
         };
         if key.is_empty() {
-            (String::new(), None, None)
+            (String::new(), None)
         } else if let Some(session) = guard.pairing_sessions.get_mut(&key) {
-            match session.prover.take() {
-                Some(s) => match spake2::prover_complete(s, spake2_pub) {
-                    Ok(shared) => {
-                        let k = hkdf::derive_session_key(&shared);
-                        match aes::decrypt(&k, enc_lt_pub) {
-                            Ok(bytes) => (
-                                key,
-                                Some(String::from_utf8_lossy(&bytes).to_string()),
-                                Some(k),
-                            ),
-                            Err(e) => {
-                                log::error!("处理 PAIRING_RESP: 对端 lt_pub 解密失败: {}", e);
-                                (key, None, Some(k))
-                            }
-                        }
-                    }
+            (key, session.prover.take())
+        } else {
+            (String::new(), None)
+        }
+    };
+
+    let (peer_lt_pub, mut ks) = match prover {
+        Some(prover) => match spake2::prover_complete(prover, spake2_pub) {
+            Ok(shared) => {
+                let k = hkdf::derive_session_key(&shared);
+                match aes::decrypt(&k, enc_lt_pub) {
+                    Ok(bytes) => (Some(String::from_utf8_lossy(&bytes).to_string()), Some(k)),
                     Err(e) => {
-                        log::error!("处理 PAIRING_RESP: SPAKE2 prover 完成失败: {}", e);
-                        (key, None, None)
+                        log::error!("处理 PAIRING_RESP: 对端 lt_pub 解密失败: {}", e);
+                        (None, Some(k))
                     }
-                },
-                None => {
-                    log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
-                    (key, None, None)
                 }
             }
-        } else {
-            (String::new(), None, None)
+            Err(e) => {
+                log::error!("处理 PAIRING_RESP: SPAKE2 prover 完成失败: {}", e);
+                (None, None)
+            }
+        },
+        None => {
+            log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
+            (None, None)
         }
     };
 
     if !session_id.is_empty() {
-        let guard = ctx.get_mut().unwrap();
-        let session = guard.pairing_sessions.entry(session_id).or_default();
-        session.session_key = ks;
-        session.pairing_ctx = Some(crate::PairingContext {
-            peer_uuid: uuid.to_string(),
-            peer_spake2_pub: spake2_pub.to_string(),
-            peer_lt_pub: peer_lt_pub.clone(),
-        });
+        let Ok(mut guard) = ctx.lock() else {
+            if let Some(key) = ks.as_mut() {
+                crate::crypto::zeroize_key(key);
+            }
+            return -1;
+        };
+        if let Some(session) = guard.pairing_sessions.get_mut(&session_id) {
+            if let Some(previous) = session.session_key.as_mut() {
+                crate::crypto::zeroize_key(previous);
+            }
+            session.session_key = ks;
+            session.pairing_ctx = Some(crate::PairingContext {
+                peer_uuid: uuid.to_string(),
+                peer_spake2_pub: spake2_pub.to_string(),
+                peer_lt_pub: peer_lt_pub.clone(),
+            });
+            session.refresh_expiry();
+        }
+    }
+    if let Some(key) = ks.as_mut() {
+        crate::crypto::zeroize_key(key);
     }
 
     let data = serde_json::json!({
@@ -410,7 +426,7 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     0
 }
 
-fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
     // ACCEPT 负载格式：uuid:enc_lt_pub（enc_lt_pub 为 AES(K_s) 密文，与 encode_accept 对应）
     let (uuid, enc_lt) = match std::str::from_utf8(payload) {
         Ok(s) => {
@@ -433,11 +449,14 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     // 配对流程判定：接收方在 nrc_send_pairing_resp 已完成 verifier 并暂存 K_s。
     // K_s 按 ACCEPT 发送方 uuid 取用，确保命中同一对端的配对会话
     let ks = {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
+        guard.prune_expired_pairing_sessions();
         guard
             .pairing_sessions
-            .get_mut(&uuid)
-            .and_then(|s| s.session_key.take())
+            .remove(&uuid)
+            .and_then(|mut session| session.session_key.take())
     };
 
     let mut success = false;
@@ -452,14 +471,17 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 // 数据通道密钥由长期 ECDH 派生（与重连路径 process_handshake 一致），
                 // K_s 仅用于本次长期公钥传输；派生失败时回落 K_s，保证两端对称
                 let (b64, key_bytes) = {
-                    let guard = ctx.get_mut().unwrap();
+                    let Ok(guard) = ctx.lock() else {
+                        crate::crypto::zeroize_key(&mut aes_key);
+                        return -1;
+                    };
                     match guard.crypto.derive_session_key(&remote_lt) {
                         Some(k) => (base64::engine::general_purpose::STANDARD.encode(k), Some(k)),
                         None => {
                             log::error!("处理消息: ECDH 派生会话密钥失败，回落使用 K_s");
                             (
                                 base64::engine::general_purpose::STANDARD.encode(aes_key),
-                                Some(aes_key),
+                                None,
                             )
                         }
                     }
@@ -467,7 +489,9 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                 // K_s 使命完成，清零，避免长期驻留内存
                 crate::crypto::zeroize_key(&mut aes_key);
                 {
-                    let guard = ctx.get_mut().unwrap();
+                    let Ok(mut guard) = ctx.lock() else {
+                        return -1;
+                    };
                     guard.crypto.device_keys.insert(
                         uuid.clone(),
                         crate::crypto::DeviceKeyEntry {
@@ -476,8 +500,6 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                             aes_key_bytes: key_bytes,
                         },
                     );
-                    // 仅结束该对端的配对会话，不影响与其他设备的并发配对
-                    guard.pairing_sessions.remove(&uuid);
                 }
                 success = true;
                 let target_uuid = uuid.clone();
@@ -495,7 +517,7 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                     }
                 };
                 if !delay_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let ctx_ptr = ctx as *mut SafeContext as usize;
+                    let ctx_ptr = ctx as *const SafeContext as usize;
                     let _ = std::thread::Builder::new()
                         .name("auto-applist".to_string())
                         .spawn(move || {
@@ -536,7 +558,9 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         // 已配对设备重连走的是正常路径（密钥由 HANDSHAKE 重派生），
         // 这里仅为排查保留 debug 级日志，避免平台端日志桥接产生告警
         log::debug!("处理消息: ACCEPT 时 SPAKE2 会话密钥缺失(已配对设备重连场景，跳过密钥更新)");
-        let g = ctx.get_mut().unwrap();
+        let Ok(g) = ctx.lock() else {
+            return -1;
+        };
         cb_lt_pub = g
             .crypto
             .device_keys
@@ -559,18 +583,29 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
 
     {
         let ack = codec::encode_ack(&uuid);
-        let guard = ctx.get_mut().unwrap();
-        do_send(guard, &uuid, &ack);
+        let network = match ctx.lock() {
+            Ok(guard) => guard.network.tcp.clone(),
+            Err(_) => return -1,
+        };
+        do_send_via_network(&network, &uuid, &ack);
     }
     0
 }
 
-fn process_reject(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let uuid = match std::str::from_utf8(payload) {
         Ok(s) => s.trim(),
         Err(_) => return -1,
     };
     let uuid = uuid.to_string();
+
+    let network = match ctx.lock() {
+        Ok(mut guard) => {
+            guard.pairing_sessions.remove(&uuid);
+            guard.network.tcp.clone()
+        }
+        Err(_) => return -1,
+    };
 
     fire_pairing_cb(
         ctx,
@@ -590,13 +625,12 @@ fn process_reject(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     );
     {
         let ack = codec::encode_ack(&uuid);
-        let guard = ctx.get_mut().unwrap();
-        do_send(guard, &uuid, &ack);
+        do_send_via_network(&network, &uuid, &ack);
     }
     0
 }
 
-fn process_heartbeat(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
+fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let hb = match binary_codec::decode_heartbeat_frame(payload) {
         Some(h) => h,
         None => {
@@ -605,7 +639,11 @@ fn process_heartbeat(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         }
     };
 
-    ctx.get_mut().unwrap().heartbeat.record(&hb.uuid);
+    let Ok(mut guard) = ctx.lock() else {
+        return -1;
+    };
+    guard.heartbeat.record(&hb.uuid);
+    drop(guard);
     let name_decoded = String::from_utf8(
         base64::engine::general_purpose::STANDARD
             .decode(&hb.name)
@@ -614,7 +652,9 @@ fn process_heartbeat(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     .unwrap_or(hb.name.clone());
 
     {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
         let ip = guard
             .device_ips
             .lock()
@@ -651,7 +691,7 @@ fn process_heartbeat(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     0
 }
 
-fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
+fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // DATA 消息 payload 格式: DATA_TYPE:uuid:pub_key:encrypted_data
     let text = match std::str::from_utf8(payload) {
         Ok(s) => s,
@@ -671,7 +711,9 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     let encrypted_payload = parts[3];
 
     let key_arr = {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
         guard.crypto.get_aes_key(local_uuid)
     };
     let key_arr = match key_arr {
@@ -719,7 +761,7 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
             Ok(v) => {
                 if let Some(fid) = v.get("feature").and_then(|x| x.as_str()) {
                     // local_uuid 为请求方（原接收端）；本机作为发送方标记对应会话重发 FULL
-                    crate::state_merge::apply_resync_request(&mut *ctx, &local_uuid, fid);
+                    crate::state_merge::apply_resync_request(ctx, local_uuid, fid);
                 }
             }
             Err(e) => {
@@ -732,7 +774,7 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // 超级岛 / 媒体：交给状态合并引擎
     if msg_type == MessageType::MEDIA_SESSION || msg_type == MessageType::FEATURE_STATUS {
         let is_media = msg_type == MessageType::MEDIA_SESSION;
-        crate::state_merge::handle_state_message(&mut *ctx, local_uuid, is_media, &plaintext);
+        crate::state_merge::handle_state_message(ctx, local_uuid, is_media, &plaintext);
         return 0;
     }
 
@@ -817,4 +859,57 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
 
     fire_data_cb(ctx, local_uuid, cb_type, &processed_text);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CoreContext, MAX_PAIRING_SESSIONS};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn incomplete_pairing_sessions_remain_bounded_under_many_requests() {
+        let ctx = Mutex::new(CoreContext::new());
+
+        for index in 0..(MAX_PAIRING_SESSIONS * 4) {
+            let payload = format!("peer-{index}:spake:{index}:50:desktop");
+            assert_eq!(process_pairing_init(&ctx, payload.as_bytes()), 0);
+            assert!(ctx.lock().unwrap().pairing_sessions.len() <= MAX_PAIRING_SESSIONS);
+        }
+
+        let guard = ctx.lock().unwrap();
+        assert_eq!(guard.pairing_sessions.len(), MAX_PAIRING_SESSIONS);
+        assert!(guard
+            .pairing_sessions
+            .contains_key(&format!("peer-{}", MAX_PAIRING_SESSIONS * 4 - 1)));
+    }
+
+    #[test]
+    fn expired_pairing_sessions_are_pruned_by_new_requests() {
+        let ctx = Mutex::new(CoreContext::new());
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.pairing_session_mut("expired").expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+
+        assert_eq!(
+            process_pairing_init(&ctx, b"current:spake:127.0.0.1:50:desktop"),
+            0
+        );
+
+        let guard = ctx.lock().unwrap();
+        assert!(!guard.pairing_sessions.contains_key("expired"));
+        assert!(guard.pairing_sessions.contains_key("current"));
+    }
+
+    #[test]
+    fn reject_removes_the_matching_pairing_session() {
+        let ctx = Mutex::new(CoreContext::new());
+        ctx.lock().unwrap().pairing_session_mut("peer");
+
+        assert_eq!(process_reject(&ctx, b"peer"), 0);
+        assert!(!ctx.lock().unwrap().pairing_sessions.contains_key("peer"));
+    }
 }

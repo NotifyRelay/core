@@ -38,6 +38,15 @@ impl HeartbeatState {
             .collect()
     }
 
+    /// UUID 只有在已记录心跳且记录仍位于在线窗口内时才视为在线。
+    pub fn is_recently_seen(&self, uuid: &str, timeout_sec: i64) -> bool {
+        let now = now_sec();
+        self.last_seen
+            .get(uuid)
+            .map(|&ts| now.saturating_sub(ts) <= timeout_sec)
+            .unwrap_or(false)
+    }
+
     pub fn remove(&mut self, uuid: &str) {
         self.last_seen.remove(uuid);
     }
@@ -395,5 +404,19 @@ impl HeartbeatScheduler {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recently_seen_requires_an_existing_record() {
+        let mut state = HeartbeatState::new();
+        assert!(!state.is_recently_seen("missing", 15));
+
+        state.record("peer");
+        assert!(state.is_recently_seen("peer", 15));
     }
 }

@@ -7,6 +7,7 @@ use base64::Engine;
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use zeroize::Zeroize;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceKeyEntry {
@@ -25,9 +26,7 @@ pub struct KeyStoreData {
 
 /// 清零会话密钥（SPAKE2 的 K_s 仅用于传输长期公钥，用完即清）
 pub fn zeroize_key(key: &mut [u8; 32]) {
-    for b in key.iter_mut() {
-        *b = 0;
-    }
+    key.zeroize();
 }
 
 pub struct CryptoState {

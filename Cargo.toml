@@ -31,7 +31,7 @@ strsim = "0.11"
 parking_lot = "0.12"
 threadpool = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+zeroize = "1"
 
 [dev-dependencies]
 env_logger = "0.11"
-

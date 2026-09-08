@@ -586,7 +586,7 @@ pub fn enqueue_resync_request(
 
 /// 发送端收到重同步请求：标记对应发送会话 `force_full_next`，
 /// 下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致）。
-pub fn apply_resync_request(ctx: &mut SafeContext, requester_uuid: &str, feature_id: &str) {
+pub fn apply_resync_request(ctx: &SafeContext, requester_uuid: &str, feature_id: &str) {
     if let Ok(mut g) = ctx.lock() {
         g.state_merge
             .handle_resend_request(requester_uuid, feature_id);
@@ -596,7 +596,7 @@ pub fn apply_resync_request(ctx: &mut SafeContext, requester_uuid: &str, feature
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
 /// 并在需要时回 ACK。返回 true 表示该消息已被引擎消费（无需再走通用 on_data）。
 pub fn handle_state_message(
-    ctx: &mut SafeContext,
+    ctx: &SafeContext,
     uuid: &str,
     is_media: bool,
     plaintext: &str,
@@ -617,13 +617,17 @@ pub fn handle_state_message(
             .unwrap_or("")
             .to_string();
         {
-            let g = ctx.get_mut().unwrap();
+            let Ok(mut g) = ctx.lock() else {
+                return false;
+            };
             g.state_merge.handle_ack(uuid, &fid, &hash);
         }
         return true;
     }
     let (fid, full, is_end, need_full) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(mut g) = ctx.lock() else {
+            return false;
+        };
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
             Some(r) => r,
             None => return false,
@@ -636,7 +640,9 @@ pub fn handle_state_message(
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(g) = ctx.lock() else {
+            return false;
+        };
         (g.router.on_data, g.router.user_data)
     };
     if let Some(cb_fn) = cb {
@@ -650,9 +656,9 @@ pub fn handle_state_message(
     // 无前文时不发 ACK，让发送端超时后强制发全量
     if !is_media && !is_end && !need_full {
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
-            let g = ctx.get_mut().unwrap();
-            if g.sender_queue != 0 {
-                let q = unsafe { &*(crate::ffi::handle::get(g.sender_queue) as *mut SenderQueue) };
+            let queue_handle = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
+            if queue_handle != 0 {
+                let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
                 let ack = json!({
                     "type": "SI_ACK",
                     "device": uuid,
@@ -681,7 +687,7 @@ pub fn handle_state_message(
         // 向实际远端发送方发送重同步请求：对端收到后标记其发送会话 force_full_next，
         // 下个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致），
         // 避免仅依赖本地状态导致接收端始终无法解码对端 DELTA
-        let qh = ctx.get_mut().ok().map(|g| g.sender_queue).unwrap_or(0);
+        let qh = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
         if qh != 0 {
             enqueue_resync_request(qh, uuid, &fid, is_media);
         }
@@ -982,11 +988,11 @@ mod tests {
     #[test]
     fn test_media_need_full_enqueues_resync_request() {
         use crate::ffi::handle as hdl;
-        let mut ctx = Mutex::new(CoreContext::new());
+        let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
         {
-            let g = ctx.get_mut().unwrap();
+            let mut g = ctx.lock().unwrap();
             g.sender_queue = qh;
         }
         let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };
@@ -1002,7 +1008,7 @@ mod tests {
 
         // 接收路径：注入无基线 DELTA（对端媒体基线丢失）→ 应请求对端重发 FULL
         let delta = r#"{"type":"delta","changes":{"title":"x"}}"#;
-        let consumed = handle_state_message(&mut ctx, "peer", true, delta);
+        let consumed = handle_state_message(&ctx, "peer", true, delta);
         assert!(consumed);
         assert_eq!(
             q.pending_count(),
@@ -1021,7 +1027,7 @@ mod tests {
     #[test]
     fn test_resync_request_triggers_full_resend() {
         use crate::ffi::handle as hdl;
-        let mut ctx = Mutex::new(CoreContext::new());
+        let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
         let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };

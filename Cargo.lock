@@ -1023,6 +1023,7 @@ dependencies = [
  "threadpool",
  "uuid",
  "webrtc-util",
+ "zeroize",
 ]
 
 [[package]]

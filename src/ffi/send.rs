@@ -20,7 +20,16 @@ use super::common::{encode_name_b64, from_cstr, with_ctx};
 
 /// 通过已建立的 TCP 会话发送消息
 pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, data: &[u8]) -> bool {
-    match ctx.network.tcp.lock() {
+    do_send_via_network(&ctx.network.tcp, uuid, data)
+}
+
+/// 仅持有 TCP 状态锁执行发送；调用方无需在网络 I/O 期间持有 CoreContext 锁。
+pub(crate) fn do_send_via_network(
+    network: &Arc<std::sync::Mutex<crate::network::TcpServerState>>,
+    uuid: &str,
+    data: &[u8],
+) -> bool {
+    match network.lock() {
         Ok(mut tcp) => {
             if let Some(session) = tcp.sessions.get_mut(uuid) {
                 if let Err(e) = session.stream.write_all(data) {
@@ -42,12 +51,7 @@ pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, data: &[u8]) -> bool {
 }
 
 /// 通过 Oneshot TCP 发送，并处理响应
-fn oneshot_send_and_process(
-    ctx: &mut crate::SafeContext,
-    ip: &str,
-    port: u16,
-    payload: &[u8],
-) -> i32 {
+fn oneshot_send_and_process(ctx: &crate::SafeContext, ip: &str, port: u16, payload: &[u8]) -> i32 {
     let resp = crate::network::oneshot_send_receive_bin(payload, ip, port, 5000);
     match resp {
         Some((msg_type, payload)) => {
@@ -87,14 +91,16 @@ pub unsafe extern "C" fn nrc_send_handshake(
     }
 
     // 否则通过 oneshot 发送到 target_ip:port
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
     oneshot_send_and_process(ctx, &ti, port, &msg)
 }
 
 /// 发送配对结果回调并清理临时状态
-fn fire_pairing_result(ctx: &mut SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
+fn fire_pairing_result(ctx: &SafeContext, target_uuid: &str, success: i32, error_msg: &str) {
     let (cb, ud) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(mut g) = ctx.lock() else {
+            return;
+        };
         // 只清理该对端的配对会话，不影响与其他设备的并发配对
         g.pairing_sessions.remove(target_uuid);
         (g.router.on_pairing, g.router.user_data)
@@ -137,26 +143,26 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
 
     let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
+    let (prover, spake2_pub) = spake2::generate_prover_session(&code);
+    let ctx_ref = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
 
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-    let (ctx_ref, target_ip) = {
-        let guard = ctx.get_mut().unwrap();
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let target_ip = {
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
         // 配对会话按目标 uuid 隔离：prover 与期望配对码绑定到本次发起的对端
-        let session = guard.pairing_sessions.entry(tu.clone()).or_default();
+        let session = guard.pairing_session_mut(&tu);
         session.expected_code = Some(code.clone());
-        let (prover, spake2_pub) = spake2::generate_prover_session(&code);
         session.prover = Some(prover);
-        let msg = codec::encode_pairing_init(&lu, &spake2_pub, &local_ip, battery, &dt);
 
-        let target = guard
+        guard
             .device_ips
             .lock()
             .ok()
             .and_then(|ips| ips.get(&tu).cloned())
             .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
-            .unwrap_or_default();
-
-        (msg, target)
+            .unwrap_or_default()
     };
 
     if target_ip.is_empty() {
@@ -213,7 +219,11 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
     super::processing::process_frame(ctx, None, resp.0, &resp.1);
 
     let (ks, peer_lt_pub) = {
-        let g = ctx.get_mut().unwrap();
+        let Ok(mut g) = ctx.lock() else {
+            fire_pairing_result(ctx, &tu, 0, "context_lock_failed");
+            return -1;
+        };
+        g.prune_expired_pairing_sessions();
         match g.pairing_sessions.get_mut(&tu) {
             Some(s) => (
                 s.session_key.take(),
@@ -225,31 +235,38 @@ pub unsafe extern "C" fn nrc_send_pairing_init(
 
     if let (Some(mut aes_key), Some(lt_pub)) = (ks, peer_lt_pub) {
         log::info!("配对发起: SPAKE2 密钥协商成功，发送 ACCEPT");
-        let local_pub_b64 = ctx
-            .get_mut()
-            .unwrap()
-            .crypto
-            .local_pub_key_b64
-            .clone()
-            .unwrap_or_default();
+        let (local_pub_b64, derived_key) = {
+            let Ok(guard) = ctx.lock() else {
+                crate::crypto::zeroize_key(&mut aes_key);
+                fire_pairing_result(ctx, &tu, 0, "context_lock_failed");
+                return -1;
+            };
+            (
+                guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
+                guard.crypto.derive_session_key(&lt_pub),
+            )
+        };
         // 用 K_s 加密本机 lt_pub，避免明文传输（K_s 仅用于本次公钥传输）
         let enc_lt = aes::encrypt(&aes_key, local_pub_b64.as_bytes()).unwrap_or_default();
         // 数据通道密钥由长期 ECDH 派生（与重连路径一致），K_s 不再作为会话密钥；
         // 派生失败（本机长期私钥缺失/对端公钥非法）时回落 K_s，保证两端仍对称可用
-        let (b64, key_bytes) = match ctx.get_mut().unwrap().crypto.derive_session_key(&lt_pub) {
+        let (b64, key_bytes) = match derived_key {
             Some(k) => (base64::engine::general_purpose::STANDARD.encode(k), Some(k)),
             None => {
                 log::error!("配对发起: ECDH 派生会话密钥失败，回落使用 K_s");
                 (
                     base64::engine::general_purpose::STANDARD.encode(aes_key),
-                    Some(aes_key),
+                    None,
                 )
             }
         };
         // K_s 使命完成，清零，避免长期驻留内存
         crate::crypto::zeroize_key(&mut aes_key);
         {
-            let guard = ctx.get_mut().unwrap();
+            let Ok(mut guard) = ctx.lock() else {
+                fire_pairing_result(ctx, &tu, 0, "context_lock_failed");
+                return -1;
+            };
             guard.crypto.device_keys.insert(
                 tu.clone(),
                 crate::crypto::DeviceKeyEntry {
@@ -347,9 +364,12 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
     let i = unsafe { from_cstr(ip).to_string() };
     let d = unsafe { from_cstr(device_type).to_string() };
 
-    let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
     let target_uuid = {
-        let guard = ctx.get_mut().unwrap();
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
+        guard.prune_expired_pairing_sessions();
         resolve_pairing_resp_target(&guard, &u)
     };
     let target_uuid = match target_uuid {
@@ -361,32 +381,48 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
     let local_ip = super::utils::get_local_ip_impl().unwrap_or_else(|| i.clone());
     // 接收方在此完成 SPAKE2 verifier，得到会话密钥 K_s（与发起方对称），
     // 并用 K_s 加密本机 lt_pub，避免明文传输；K_s 暂存供后续 ACCEPT 解密复用。
-    let msg = {
-        let guard = ctx.get_mut().unwrap();
-        let session = guard
-            .pairing_sessions
-            .entry(target_uuid.clone())
-            .or_default();
-        let (verifier, spake2_pub) = spake2::generate_verifier_session(&code);
-        let peer_spake2_pub = session
+    let peer_spake2_pub = {
+        let Ok(mut guard) = ctx.lock() else {
+            return -1;
+        };
+        let Some(session) = guard.pairing_sessions.get_mut(&target_uuid) else {
+            return -1;
+        };
+        session
             .pairing_ctx
             .as_ref()
             .map(|c| c.peer_spake2_pub.clone())
-            .unwrap_or_default();
-        match spake2::verifier_complete(verifier, &peer_spake2_pub) {
-            Ok(shared) => {
-                let ks = hkdf::derive_session_key(&shared);
-                let enc_lt = aes::encrypt(&ks, l.as_bytes()).unwrap_or_default();
-                // K_s 与 verifier 均绑定到该对端会话，避免与其他配对互相覆盖
-                session.session_key = Some(ks);
-                session.verifier = None;
-                codec::encode_pairing_resp(&u, &spake2_pub, &enc_lt, &local_ip, battery, &d)
+            .unwrap_or_default()
+    };
+    let (verifier, spake2_pub) = spake2::generate_verifier_session(&code);
+    let msg = match spake2::verifier_complete(verifier, &peer_spake2_pub) {
+        Ok(shared) => {
+            let mut ks = hkdf::derive_session_key(&shared);
+            let enc_lt = aes::encrypt(&ks, l.as_bytes()).unwrap_or_default();
+            let stored = match ctx.lock() {
+                Ok(mut guard) => match guard.pairing_sessions.get_mut(&target_uuid) {
+                    Some(session) => {
+                        if let Some(mut previous) = session.session_key.replace(ks) {
+                            crate::crypto::zeroize_key(&mut previous);
+                        }
+                        session.verifier = None;
+                        session.refresh_expiry();
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            // session_key 中保留受控副本；清除本地 K_s 临时值。
+            crate::crypto::zeroize_key(&mut ks);
+            if !stored {
+                return -1;
             }
-            Err(e) => {
-                log::error!("发送 PAIRING_RESP: SPAKE2 verifier 完成失败: {}", e);
-                session.verifier = None;
-                Vec::new()
-            }
+            codec::encode_pairing_resp(&u, &spake2_pub, &enc_lt, &local_ip, battery, &d)
+        }
+        Err(e) => {
+            log::error!("发送 PAIRING_RESP: SPAKE2 verifier 完成失败: {}", e);
+            Vec::new()
         }
     };
     if msg.is_empty() {
@@ -394,9 +430,11 @@ pub unsafe extern "C" fn nrc_send_pairing_resp(
         return -1;
     }
 
-    with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &target_uuid, &msg);
-    });
+    let network = match ctx.lock() {
+        Ok(guard) => guard.network.tcp.clone(),
+        Err(_) => return -1,
+    };
+    do_send_via_network(&network, &target_uuid, &msg);
     0
 }
 
@@ -434,9 +472,18 @@ pub unsafe extern "C" fn nrc_send_accept(
 #[no_mangle]
 pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_char) {
     let u = unsafe { from_cstr(uuid).to_string() };
-    with_ctx(ctx_ptr, |ctx| {
-        do_send(ctx, &u, &codec::encode_reject(&u));
-    });
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let network = match ctx.lock() {
+        Ok(mut guard) => {
+            guard.pairing_sessions.remove(&u);
+            guard.network.tcp.clone()
+        }
+        Err(_) => return,
+    };
+    do_send_via_network(&network, &u, &codec::encode_reject(&u));
 }
 
 const BROADCAST_INTERVAL_MS: u64 = 10000; // TCP扫描发现间隔：10秒（需小于未认证在线窗口，避免列表闪烁）

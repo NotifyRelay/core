@@ -24,7 +24,11 @@ mod state_merge;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use zeroize::Zeroize;
+
+pub(crate) const PAIRING_SESSION_TTL: Duration = Duration::from_secs(300);
+pub(crate) const MAX_PAIRING_SESSIONS: usize = 128;
 
 pub struct DeviceState {
     pub peer_lt_pub: Option<String>,
@@ -99,13 +103,43 @@ pub struct PairingContext {
 /// K_s 仅用于加解密长期公钥 lt_pub 的一次传输：配对完成后清零，
 /// 数据通道密钥统一由「本机长期私钥 × 对端长期公钥 → ECDH + HKDF」派生，
 /// 与重连路径（process_handshake）保持一致。
-#[derive(Default)]
 pub struct PairingSession {
     pub prover: Option<crypto::spake2::Spake2ProverSession>,
     pub verifier: Option<crypto::spake2::Spake2VerifierSession>,
     pub session_key: Option<[u8; 32]>,
     pub pairing_ctx: Option<PairingContext>,
     pub expected_code: Option<String>,
+    pub expires_at: Instant,
+}
+
+impl PairingSession {
+    pub(crate) fn refresh_expiry(&mut self) {
+        self.expires_at = Instant::now() + PAIRING_SESSION_TTL;
+    }
+}
+
+impl Default for PairingSession {
+    fn default() -> Self {
+        Self {
+            prover: None,
+            verifier: None,
+            session_key: None,
+            pairing_ctx: None,
+            expected_code: None,
+            expires_at: Instant::now() + PAIRING_SESSION_TTL,
+        }
+    }
+}
+
+impl Drop for PairingSession {
+    fn drop(&mut self) {
+        if let Some(key) = self.session_key.as_mut() {
+            key.zeroize();
+        }
+        if let Some(code) = self.expected_code.as_mut() {
+            code.zeroize();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -156,6 +190,32 @@ impl CoreContext {
             pending_device_deletions: Vec::new(),
             db_override: None,
         }
+    }
+
+    /// 获取或新建未完成配对会话，并统一执行过期清理与全局数量限制。
+    pub(crate) fn pairing_session_mut(&mut self, uuid: &str) -> &mut PairingSession {
+        self.prune_expired_pairing_sessions();
+        if !self.pairing_sessions.contains_key(uuid)
+            && self.pairing_sessions.len() >= MAX_PAIRING_SESSIONS
+        {
+            if let Some(oldest) = self
+                .pairing_sessions
+                .iter()
+                .min_by_key(|(_, session)| session.expires_at)
+                .map(|(uuid, _)| uuid.clone())
+            {
+                self.pairing_sessions.remove(&oldest);
+            }
+        }
+        let session = self.pairing_sessions.entry(uuid.to_string()).or_default();
+        session.refresh_expiry();
+        session
+    }
+
+    pub(crate) fn prune_expired_pairing_sessions(&mut self) {
+        let now = Instant::now();
+        self.pairing_sessions
+            .retain(|_, session| session.expires_at > now);
     }
 
     /// 指定持久化库路径构造（测试隔离用：每个测试注入独立库文件）

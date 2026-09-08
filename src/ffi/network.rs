@@ -4,8 +4,6 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-
 use crate::SafeContext;
 
 use super::common::from_cstr;
@@ -56,26 +54,29 @@ pub(crate) fn start_tcp_server_impl(ctx_ptr: *mut c_void, port: u16) -> i32 {
         }
     }) as Arc<dyn Fn(String, String) + Send + Sync>);
 
-    let on_disconnected_cb = on_disconnected.map(|cb| {
+    let on_disconnected_cb = {
         let ctx_usize = ctx_ptr as usize;
-        Arc::new(move |uuid: String| {
-            // TCP 断开：登记断开状态
-            if let Ok(guard) = unsafe { &*(ctx_usize as *mut crate::SafeContext) }.lock() {
+        Some(Arc::new(move |uuid: String| {
+            // TCP 断开：登记断开状态，并清理该连接遗留的未完成配对会话。
+            if let Ok(mut guard) = unsafe { &*(ctx_usize as *const crate::SafeContext) }.lock() {
                 guard.registry.mark_disconnected(&uuid);
+                guard.pairing_sessions.remove(&uuid);
             }
-            if let Ok(uuid_c) = CString::new(uuid.as_str()) {
-                let ud = user_data_usize as *mut c_void;
-                cb(uuid_c.as_ptr(), ud);
+            if let Some(cb) = on_disconnected {
+                if let Ok(uuid_c) = CString::new(uuid.as_str()) {
+                    let ud = user_data_usize as *mut c_void;
+                    cb(uuid_c.as_ptr(), ud);
+                }
             }
-        }) as Arc<dyn Fn(String) + Send + Sync>
-    });
+        }) as Arc<dyn Fn(String) + Send + Sync>)
+    };
 
     let on_message_cb = {
         let ctx_usize = ctx_ptr as usize;
         Some(
             Arc::new(move |uuid: String, msg_type: u8, payload: Vec<u8>| {
                 let ctx_ptr = ctx_usize as *mut c_void;
-                let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
                 // 传入会话 uuid：帧内声明的发送方必须与之相同，否则丢弃
                 super::processing::process_frame(ctx, Some(&uuid), msg_type, &payload);
             }) as Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>,
