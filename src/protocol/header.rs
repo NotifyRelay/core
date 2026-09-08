@@ -22,6 +22,7 @@ impl MessageType {
     pub const ACCEPT: u8 = 244;
     pub const REJECT: u8 = 245;
     pub const ACK: u8 = 246;
+    pub const RESYNC_REQUEST: u8 = 247; // 接收端缺失基线时向发送方请求重发 FULL
     pub const DISCOVERY_REQUEST: u8 = 250;
     pub const DISCOVERY_RESPONSE: u8 = 251;
 }

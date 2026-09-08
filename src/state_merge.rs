@@ -67,6 +67,20 @@ impl StateMerge {
         format!("{}|{}", device_uuid, feature_id)
     }
 
+    /// 发送端收到重同步请求时调用：标记对应发送会话 `force_full_next`，
+    /// 下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致）。
+    pub fn handle_resend_request(&mut self, remote_uuid: &str, feature_id: &str) {
+        let key = StateMerge::key(remote_uuid, feature_id);
+        if let Some(s) = self.senders.get_mut(&key) {
+            s.force_full_next = true;
+            log::debug!(
+                "[state_merge] 收到重同步请求,标记 force_full_next uuid={} fid={}",
+                remote_uuid,
+                feature_id
+            );
+        }
+    }
+
     fn compute_feature_id(full: &Value) -> String {
         // 平台端必须注入稳定的 featureIdOverride（sbn.key），内容变化不再产生新会话；
         // 缺失时返回空串，不做内容哈希兜底
@@ -539,6 +553,46 @@ fn fill_empty_fields(s: &str) -> String {
     serde_json::to_string(&obj).unwrap_or_default()
 }
 
+/// 接收端缺失基线后，向实际远端发送方请求重发 FULL。
+///
+/// 通过对端发送队列投递 `DATA_STATE_RESEND` 帧；对端收到后标记其发送会话
+/// `force_full_next`，下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致），
+/// 避免仅依赖本地状态导致接收端始终无法解码对端 DELTA。
+pub fn enqueue_resync_request(
+    queue_handle: u64,
+    remote_uuid: &str,
+    feature_id: &str,
+    is_media: bool,
+) {
+    if queue_handle == 0 {
+        return;
+    }
+    let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *const SenderQueue) };
+    let payload = json!({
+        "type": "RESEND_FULL",
+        "feature": feature_id,
+        "media": is_media,
+    })
+    .to_string();
+    q.enqueue(SendItem {
+        device_uuid: remote_uuid.to_string(),
+        header: "DATA_STATE_RESEND".to_string(),
+        plaintext: payload,
+        dedup_key: None,
+        retries_left: 0,
+        coalesce_key: None,
+    });
+}
+
+/// 发送端收到重同步请求：标记对应发送会话 `force_full_next`，
+/// 下一个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致）。
+pub fn apply_resync_request(ctx: &mut SafeContext, requester_uuid: &str, feature_id: &str) {
+    if let Ok(mut g) = ctx.lock() {
+        g.state_merge
+            .handle_resend_request(requester_uuid, feature_id);
+    }
+}
+
 /// 在接收路径处理超级岛 / 媒体消息：合并为全量后通过既有 `on_data` 回调交给平台，
 /// 并在需要时回 ACK。返回 true 表示该消息已被引擎消费（无需再走通用 on_data）。
 pub fn handle_state_message(
@@ -619,21 +673,36 @@ pub fn handle_state_message(
         }
     } else if need_full {
         log::debug!(
-            "[state_merge] 无前文,跳过ACK等待发送端超时重发全量 uuid={} fid={}",
+            "[state_merge] 无前文基线,向远端发送方请求重发 FULL uuid={} fid={} media={}",
             uuid,
-            fid
+            fid,
+            is_media
         );
-        // 媒体 need_full 时，设置 force_full_next 确保下次推送时发送全量
+        // 向实际远端发送方发送重同步请求：对端收到后标记其发送会话 force_full_next，
+        // 下个心跳 tick 即重发 FULL（与 ACK 超时恢复路径一致），
+        // 避免仅依赖本地状态导致接收端始终无法解码对端 DELTA
+        let qh = ctx.get_mut().ok().map(|g| g.sender_queue).unwrap_or(0);
+        if qh != 0 {
+            enqueue_resync_request(qh, uuid, &fid, is_media);
+        }
+        // 兼容：本机后续推送该 feature 时发送全量，便于对端重建基线
         if is_media {
-            let g = ctx.get_mut().unwrap();
-            let key = StateMerge::key(uuid, &fid);
-            if let Some(s) = g.state_merge.senders.get_mut(&key) {
-                s.force_full_next = true;
-                log::debug!(
-                    "[state_merge] 媒体 need_full,设置 force_full_next uuid={} fid={}",
-                    uuid,
-                    fid
-                );
+            if let Ok(mut g) = ctx.lock() {
+                let key = StateMerge::key(uuid, &fid);
+                g.state_merge
+                    .senders
+                    .entry(key)
+                    .or_insert_with(|| SenderState {
+                        device_uuid: uuid.to_string(),
+                        feature_id: fid.clone(),
+                        is_media,
+                        last_full: String::new(),
+                        last_hash: String::new(),
+                        pending_ack: None,
+                        force_full_next: false,
+                        last_push: Instant::now(),
+                    })
+                    .force_full_next = true;
             }
         }
     }
@@ -692,6 +761,9 @@ impl Default for StateMerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CoreContext;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
 
     fn si_full(title: &str, text: &str) -> String {
         json!({
@@ -905,5 +977,82 @@ mod tests {
         assert!(!s.force_full_next);
         // 验证 pending_ack 已重新建立
         assert!(s.pending_ack.is_some());
+    }
+
+    #[test]
+    fn test_media_need_full_enqueues_resync_request() {
+        use crate::ffi::handle as hdl;
+        let mut ctx = Mutex::new(CoreContext::new());
+        let queue = Box::new(SenderQueue::new());
+        let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
+        {
+            let g = ctx.get_mut().unwrap();
+            g.sender_queue = qh;
+        }
+        let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };
+
+        // 先建立 peer 的媒体发送会话（FULL 入队）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t1", "c1"), false, false);
+        }
+        let before = q.pending_count();
+        assert_eq!(before, 1);
+
+        // 接收路径：注入无基线 DELTA（对端媒体基线丢失）→ 应请求对端重发 FULL
+        let delta = r#"{"type":"delta","changes":{"title":"x"}}"#;
+        let consumed = handle_state_message(&mut ctx, "peer", true, delta);
+        assert!(consumed);
+        assert_eq!(
+            q.pending_count(),
+            before + 1,
+            "缺失基线应向远端发送方投递重同步请求"
+        );
+        let items = q.test_drain_plaintexts();
+        assert!(
+            items
+                .iter()
+                .any(|p| { p.contains("\"type\":\"RESEND_FULL\"") && p.contains("media_global") }),
+            "重同步请求应携带着 media 特征（feature=media_global）发往对端"
+        );
+    }
+
+    #[test]
+    fn test_resync_request_triggers_full_resend() {
+        use crate::ffi::handle as hdl;
+        let mut ctx = Mutex::new(CoreContext::new());
+        let queue = Box::new(SenderQueue::new());
+        let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
+        let q = unsafe { &*(hdl::get(qh) as *const SenderQueue) };
+
+        // 建立 peer 的媒体发送会话（带基线）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t1", "c1"), false, false);
+        }
+        q.test_drain_plaintexts(); // 清空基线推送产生的 FULL
+
+        // 收到 peer 的重同步请求 → 标记 force_full_next
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge.handle_resend_request("peer", MEDIA_KEY);
+        }
+
+        // 后续推送应发送 FULL（而非 DELTA）
+        {
+            let mut g = ctx.lock().unwrap();
+            g.state_merge
+                .push_state(q, "peer", true, &si_full("t2", "c2"), false, false);
+        }
+        let items = q.test_drain_plaintexts();
+        assert!(
+            items.iter().any(|p| {
+                // 媒体 FULL 帧的 type 为 MEDIA_PLAY（见 build_full_wire）；重同步后应重发全量而非 delta
+                p.contains("\"type\":\"MEDIA_PLAY\"") && !p.contains("\"type\":\"delta\"")
+            }),
+            "重同步后应重发 FULL (MEDIA_PLAY)"
+        );
     }
 }
