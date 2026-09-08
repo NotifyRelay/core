@@ -242,12 +242,15 @@ impl SenderQueue {
             Err(_) => return,
         };
 
-        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
 
         if send_ok {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    ctx.get_mut().unwrap().dedup.mark_sent(key);
+                    // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+                    if let Ok(mut guard) = ctx.lock() {
+                        guard.dedup.mark_sent(key);
+                    }
                 }
             }
             // 发送成功：清除该设备的失败退避状态
@@ -306,7 +309,9 @@ impl SenderQueue {
         } else {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
-                    ctx.get_mut().unwrap().dedup.clear_pending(key);
+                    if let Ok(mut guard) = ctx.lock() {
+                        guard.dedup.clear_pending(key);
+                    }
                 }
             }
             if Self::is_media_header(&item.header) && !Self::is_media_end_packet(&item.plaintext) {
@@ -326,9 +331,12 @@ impl SenderQueue {
     }
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
-        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
         let (key_arr, local_uuid) = {
-            let guard = ctx.get_mut().unwrap();
+            // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+            let Ok(guard) = ctx.lock() else {
+                return Err(());
+            };
             let key = guard.crypto.get_aes_key(&item.device_uuid);
             let uuid = guard
                 .broadcast_info
@@ -359,7 +367,9 @@ impl SenderQueue {
 
         // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
         let ip = {
-            let guard = ctx.get_mut().unwrap();
+            let Ok(guard) = ctx.lock() else {
+                return Ok(false);
+            };
             guard
                 .device_ips
                 .lock()

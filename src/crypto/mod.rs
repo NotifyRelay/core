@@ -23,6 +23,13 @@ pub struct KeyStoreData {
     pub devices: HashMap<String, DeviceKeyEntry>,
 }
 
+/// 清零会话密钥（SPAKE2 的 K_s 仅用于传输长期公钥，用完即清）
+pub fn zeroize_key(key: &mut [u8; 32]) {
+    for b in key.iter_mut() {
+        *b = 0;
+    }
+}
+
 pub struct CryptoState {
     pub local_key: Option<SecretKey>,
     pub local_pub_key_b64: Option<String>,
@@ -53,6 +60,17 @@ impl CryptoState {
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&key_bytes);
         Some(key_arr)
+    }
+
+    /// 由「本机长期私钥 × 对端长期公钥」派生数据通道会话密钥（ECDH + HKDF）。
+    ///
+    /// 配对完成与重连重派生共用此路径，保证两端、各阶段得到的 AES 密钥一致；
+    /// SPAKE2 协商出的 K_s 只用于传输长期公钥，不作为数据密钥。
+    pub fn derive_session_key(&self, remote_pub_key: &str) -> Option<[u8; 32]> {
+        let local = self.local_key.as_ref()?;
+        ecdh::compute_shared_secret(local, remote_pub_key)
+            .ok()
+            .map(|shared| hkdf::derive_session_key(&shared))
     }
 
     /// 存储设备密钥并预解码 AES key

@@ -131,28 +131,26 @@ impl HeartbeatHandle {
                     let msg =
                         codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
                     let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                    let sent = if let Ok(mut tcp) = net.lock() {
-                        match tcp.send_through_session(&uuid, &msg) {
-                            Ok(true) => true, // 通过已有会话发送成功
-                            Ok(false) => {
-                                // 无已有会话，fallback 到 oneshot
-                                if !ip_str.is_empty() {
-                                    network::oneshot_send_only(&msg, &ip_str, port, 3000)
-                                } else {
-                                    false
-                                }
-                            }
-                            Err(()) => {
-                                // 会话写入失败（已移除），fallback 到 oneshot
-                                if !ip_str.is_empty() {
-                                    network::oneshot_send_only(&msg, &ip_str, port, 3000)
-                                } else {
-                                    false
-                                }
+                    // 独立作用域：只在此获取 net 锁并保存会话发送结果，
+                    // 锁在离开作用域后立即释放，避免下面耗时的 oneshot（最长 3s 建连）
+                    // 阻塞 TcpServerState 的其他操作（新连接登记、会话清理等）
+                    let session_result = {
+                        let Ok(mut tcp) = net.lock() else {
+                            thread::sleep(Duration::from_millis(next_interval_ms));
+                            continue;
+                        };
+                        tcp.send_through_session(&uuid, &msg)
+                    };
+                    let sent = match session_result {
+                        Ok(true) => true, // 通过已有会话发送成功
+                        // 无会话 / 会话写入失败：fallback 到 oneshot（锁已释放）
+                        Ok(false) | Err(()) => {
+                            if !ip_str.is_empty() {
+                                network::oneshot_send_only(&msg, &ip_str, port, 3000)
+                            } else {
+                                false
                             }
                         }
-                    } else {
-                        false
                     };
 
                     if sent {
@@ -222,9 +220,13 @@ pub fn start_offline_detector(
                 break;
             }
 
-            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
             let (timeouts, on_timeout_cb, user_data) = {
-                let guard = ctx.get_mut().unwrap();
+                // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+                let Ok(guard) = ctx.lock() else {
+                    thread::sleep(Duration::from_millis(check_interval_ms));
+                    continue;
+                };
                 let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
                 let cb = guard.router.on_device_timeout;
                 let ud = guard.router.user_data;
@@ -239,12 +241,17 @@ pub fn start_offline_detector(
                     }
                 }
                 {
-                    let guard = ctx.get_mut().unwrap();
+                    let Ok(mut guard) = ctx.lock() else {
+                        continue;
+                    };
                     guard.heartbeat.remove(uuid);
                     guard.registry.mark_disconnected(uuid);
-                    if let Ok(mut tcp) = guard.network.tcp.lock() {
-                        tcp.remove_session(uuid);
-                    }
+                    // 单语句内完成内部锁获取与调用：避免 MutexGuard 经由 deref 临时量的借用生命周期不足
+                    let _ = guard
+                        .network
+                        .tcp
+                        .lock()
+                        .map(|mut tcp| tcp.remove_session(uuid));
                 }
             }
 
@@ -279,10 +286,11 @@ impl HeartbeatScheduler {
 
                 // 每轮工作在一个块内完成，避免长期持有 ctx 锁（MutexGuard 临时量随块结束释放）
                 {
-                    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                    let guard = match ctx.get_mut() {
-                        Ok(g) => g,
-                        Err(_) => break,
+                    // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+                    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                    let Ok(mut guard) = ctx.lock() else {
+                        thread::sleep(Duration::from_millis(interval_ms));
+                        continue;
                     };
 
                     // 本机身份参数来自 broadcast_info（由 FFI 写入）

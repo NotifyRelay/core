@@ -56,6 +56,7 @@ pub fn data_header_to_type(header: &str) -> u8 {
         "DATA_FTP" => MessageType::FTP,
         "DATA_STATUS" => MessageType::DEVICE_STATUS,
         "DATA_APP_LAUNCH" => MessageType::RELAY_APPLICATION,
+        "DATA_STATE_RESEND" => MessageType::RESYNC_REQUEST,
         _ => 0xFF,
     }
 }
@@ -74,6 +75,7 @@ pub fn type_to_data_header(msg_type: u8) -> &'static str {
         MessageType::FTP => "DATA_FTP",
         MessageType::DEVICE_STATUS => "DATA_STATUS",
         MessageType::RELAY_APPLICATION => "DATA_APP_LAUNCH",
+        MessageType::RESYNC_REQUEST => "DATA_STATE_RESEND",
         _ => "DATA_UNKNOWN",
     }
 }
@@ -128,15 +130,19 @@ pub fn decode_handshake_frame(payload: &[u8]) -> Option<ProtoHandshake> {
 
 // ==================== DATA 消息帧 ====================
 
-/// 编码 DATA 消息为二进制帧（payload 已加密）
+/// 编码 DATA 消息为二进制帧（payload 已加密），保留调用方给定的 wire header
+///
+/// `DATA_ICON_REQUEST` 与 `DATA_ICON_RESPONSE` 共用 `PACKAGE_INFO` 消息类型，
+/// 仅靠 msg_type 无法区分方向；此处把原始 header 写入负载，
+/// 使接收端能把图标响应派发为 `IconResponse` 而非 `IconRequest`。
 pub fn encode_data_frame(
+    header: &str,
     msg_type: u8,
     local_uuid: &str,
     local_pub_key: &str,
     encrypted_payload: &str,
 ) -> Vec<u8> {
     // DATA 消息的 payload 格式: DATA_TYPE:uuid:pub_key:encrypted_data
-    let header = type_to_data_header(msg_type);
     let data_payload = format!(
         "{}:{}:{}:{}",
         header, local_uuid, local_pub_key, encrypted_payload

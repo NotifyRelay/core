@@ -51,8 +51,47 @@ fn fire_data_cb(ctx: &mut SafeContext, uuid: &str, msg_type: &str, plaintext: &s
     }
 }
 
+/// 提取帧内声明的发送方 uuid；无法判定的控制帧（ACK / REJECT 负载为对端 uuid）返回 None
+fn frame_sender_uuid(msg_type: u8, payload: &[u8]) -> Option<String> {
+    match msg_type {
+        MessageType::HANDSHAKE => binary_codec::decode_handshake_frame(payload).map(|h| h.uuid),
+        MessageType::HEARTBEAT => binary_codec::decode_heartbeat_frame(payload).map(|h| h.uuid),
+        t if t >= 10 && t <= 200 => std::str::from_utf8(payload)
+            .ok()
+            .and_then(|s| s.splitn(4, ':').nth(1).map(|v| v.to_string())),
+        // 配对帧与 ACCEPT：首段即发送方 uuid
+        MessageType::PAIRING_INIT | MessageType::PAIRING_RESP | MessageType::ACCEPT => {
+            std::str::from_utf8(payload)
+                .ok()
+                .and_then(|s| s.splitn(2, ':').next().map(|v| v.trim().to_string()))
+                .filter(|u| !u.is_empty())
+        }
+        _ => None,
+    }
+}
+
 /// 处理二进制帧（硬切换，不再支持文本协议）
-pub(crate) fn process_frame(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
+/// session_uuid：帧所属 TCP 会话的 uuid（oneshot 直连场景为 None）；
+/// 非 None 时校验帧内声明的 uuid 与会话一致，防止跨会话冒用对端身份
+pub(crate) fn process_frame(
+    ctx: &mut SafeContext,
+    session_uuid: Option<&str>,
+    msg_type: u8,
+    payload: &[u8],
+) -> i32 {
+    if let Some(session) = session_uuid {
+        if let Some(frame_uuid) = frame_sender_uuid(msg_type, payload) {
+            if frame_uuid != session {
+                log::warn!(
+                    "处理消息: 丢弃 uuid 与会话不一致的帧 session={}, frame={}, type={}",
+                    session,
+                    frame_uuid,
+                    msg_type
+                );
+                return -1;
+            }
+        }
+    }
     match msg_type {
         MessageType::HANDSHAKE => process_handshake(ctx, payload),
         MessageType::PAIRING_INIT => process_pairing_init(ctx, payload),
@@ -64,6 +103,7 @@ pub(crate) fn process_frame(ctx: &mut SafeContext, msg_type: u8, payload: &[u8])
             log::debug!("处理消息: 收到 ACK");
             0
         }
+        MessageType::RESYNC_REQUEST => process_data(ctx, msg_type, payload),
         t if t >= 10 && t <= 200 => process_data(ctx, t, payload),
         _ => {
             log::warn!("处理消息: 未知消息类型 type={}", msg_type);
@@ -225,7 +265,8 @@ fn process_pairing_init(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         }
     };
     // 配对消息 payload 格式: uuid:spake2_pub:ip:battery:device_type
-    let parts: Vec<&str> = text.split(':').collect();
+    // 限定 5 段：device_type 允许包含冒号（对端传入，未做转义）
+    let parts: Vec<&str> = text.splitn(5, ':').collect();
     if parts.len() < 5 {
         log::error!("处理消息: PAIRING_INIT 字段不足");
         return -1;
@@ -238,7 +279,9 @@ fn process_pairing_init(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
 
     {
         let guard = ctx.get_mut().unwrap();
-        guard.pairing_ctx = Some(crate::PairingContext {
+        // 配对会话按发起方 uuid 隔离：多个设备同时发起配对时互不覆盖
+        let session = guard.pairing_sessions.entry(uuid.to_string()).or_default();
+        session.pairing_ctx = Some(crate::PairingContext {
             peer_uuid: uuid.to_string(),
             peer_spake2_pub: spake2_pub.to_string(),
             peer_lt_pub: None,
@@ -266,7 +309,8 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
     };
     // 配对消息 payload 格式: uuid:spake2_pub:enc_lt_pub:ip:battery:device_type
     // enc_lt_pub 为接收方用 K_s 加密的本机长期公钥；此处用 K_s 解密
-    let parts: Vec<&str> = text.split(':').collect();
+    // 限定 6 段：device_type 允许包含冒号（对端传入，未做转义）
+    let parts: Vec<&str> = text.splitn(6, ':').collect();
     if parts.len() < 6 {
         log::error!("处理消息: PAIRING_RESP 字段不足");
         return -1;
@@ -280,36 +324,66 @@ fn process_pairing_resp(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
 
     // 发起方在此完成 SPAKE2 prover，得到会话密钥 K_s，并用其解密对端 lt_pub；
     // K_s 暂存供后续 ACCEPT 加密复用（两端推导出的 K_s 对称一致）
-    let (peer_lt_pub, ks) = {
+    //
+    // 会话按对端 uuid 取用：平台端 PAIRING_RESP 携带的 uuid 语义不统一
+    // （Android 传发起方 uuid、PC 传本机 uuid），未命中时退回唯一持有 prover 的会话。
+    let (session_id, peer_lt_pub, ks) = {
         let guard = ctx.get_mut().unwrap();
-        let session = guard.spake2_prover.take();
-        if let Some(s) = session {
-            match spake2::prover_complete(s, spake2_pub) {
-                Ok(shared) => {
-                    let k = hkdf::derive_session_key(&shared);
-                    match aes::decrypt(&k, enc_lt_pub) {
-                        Ok(bytes) => (Some(String::from_utf8_lossy(&bytes).to_string()), Some(k)),
-                        Err(e) => {
-                            log::error!("处理 PAIRING_RESP: 对端 lt_pub 解密失败: {}", e);
-                            (None, Some(k))
+        let key = if guard.pairing_sessions.contains_key(uuid) {
+            uuid.to_string()
+        } else {
+            let mut with_prover: Vec<String> = guard
+                .pairing_sessions
+                .iter()
+                .filter(|(_, s)| s.prover.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+            if with_prover.len() == 1 {
+                with_prover.pop().unwrap_or_default()
+            } else {
+                log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
+                String::new()
+            }
+        };
+        if key.is_empty() {
+            (String::new(), None, None)
+        } else if let Some(session) = guard.pairing_sessions.get_mut(&key) {
+            match session.prover.take() {
+                Some(s) => match spake2::prover_complete(s, spake2_pub) {
+                    Ok(shared) => {
+                        let k = hkdf::derive_session_key(&shared);
+                        match aes::decrypt(&k, enc_lt_pub) {
+                            Ok(bytes) => (
+                                key,
+                                Some(String::from_utf8_lossy(&bytes).to_string()),
+                                Some(k),
+                            ),
+                            Err(e) => {
+                                log::error!("处理 PAIRING_RESP: 对端 lt_pub 解密失败: {}", e);
+                                (key, None, Some(k))
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    log::error!("处理 PAIRING_RESP: SPAKE2 prover 完成失败: {}", e);
-                    (None, None)
+                    Err(e) => {
+                        log::error!("处理 PAIRING_RESP: SPAKE2 prover 完成失败: {}", e);
+                        (key, None, None)
+                    }
+                },
+                None => {
+                    log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
+                    (key, None, None)
                 }
             }
         } else {
-            log::error!("处理 PAIRING_RESP: 缺少 SPAKE2 prover 会话");
-            (None, None)
+            (String::new(), None, None)
         }
     };
 
-    {
+    if !session_id.is_empty() {
         let guard = ctx.get_mut().unwrap();
-        guard.spake2_session_key = ks;
-        guard.pairing_ctx = Some(crate::PairingContext {
+        let session = guard.pairing_sessions.entry(session_id).or_default();
+        session.session_key = ks;
+        session.pairing_ctx = Some(crate::PairingContext {
             peer_uuid: uuid.to_string(),
             peer_spake2_pub: spake2_pub.to_string(),
             peer_lt_pub: peer_lt_pub.clone(),
@@ -356,22 +430,42 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
         }
     };
 
-    // 配对流程判定：接收方在 nrc_send_pairing_resp 已完成 verifier 并暂存 K_s（spake2_session_key）
+    // 配对流程判定：接收方在 nrc_send_pairing_resp 已完成 verifier 并暂存 K_s。
+    // K_s 按 ACCEPT 发送方 uuid 取用，确保命中同一对端的配对会话
     let ks = {
         let guard = ctx.get_mut().unwrap();
-        guard.spake2_session_key.take()
+        guard
+            .pairing_sessions
+            .get_mut(&uuid)
+            .and_then(|s| s.session_key.take())
     };
 
     let mut success = false;
     let mut pairing_flow = false;
     let mut cb_lt_pub = String::new();
-    if let Some(aes_key) = ks {
+    if let Some(mut aes_key) = ks {
         pairing_flow = true;
         match aes::decrypt(&aes_key, &enc_lt) {
             Ok(bytes) => {
                 let remote_lt = String::from_utf8_lossy(&bytes).to_string();
                 cb_lt_pub = remote_lt.clone();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
+                // 数据通道密钥由长期 ECDH 派生（与重连路径 process_handshake 一致），
+                // K_s 仅用于本次长期公钥传输；派生失败时回落 K_s，保证两端对称
+                let (b64, key_bytes) = {
+                    let guard = ctx.get_mut().unwrap();
+                    match guard.crypto.derive_session_key(&remote_lt) {
+                        Some(k) => (base64::engine::general_purpose::STANDARD.encode(k), Some(k)),
+                        None => {
+                            log::error!("处理消息: ECDH 派生会话密钥失败，回落使用 K_s");
+                            (
+                                base64::engine::general_purpose::STANDARD.encode(aes_key),
+                                Some(aes_key),
+                            )
+                        }
+                    }
+                };
+                // K_s 使命完成，清零，避免长期驻留内存
+                crate::crypto::zeroize_key(&mut aes_key);
                 {
                     let guard = ctx.get_mut().unwrap();
                     guard.crypto.device_keys.insert(
@@ -379,23 +473,26 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                         crate::crypto::DeviceKeyEntry {
                             remote_pub_key: remote_lt.clone(),
                             aes_key_b64: b64,
-                            aes_key_bytes: Some(aes_key),
+                            aes_key_bytes: key_bytes,
                         },
                     );
-                    guard.spake2_prover = None;
-                    guard.spake2_verifier = None;
-                    guard.pairing_ctx = None;
-                    guard.expected_pairing_code = None;
+                    // 仅结束该对端的配对会话，不影响与其他设备的并发配对
+                    guard.pairing_sessions.remove(&uuid);
                 }
                 success = true;
                 let target_uuid = uuid.clone();
                 {
-                    let g = ctx.get_mut().unwrap();
-                    g.discovery.add_known_device(&target_uuid, "");
+                    // 与扫描回调、后台线程统一通过 lock() 取锁
+                    if let Ok(g) = ctx.lock() {
+                        g.discovery.add_known_device(&target_uuid, "");
+                    }
                 }
                 let delay_pending = {
-                    let g = ctx.get_mut().unwrap();
-                    g.applist_delay_pending.clone()
+                    match ctx.lock() {
+                        Ok(g) => g.applist_delay_pending.clone(),
+                        // 取锁失败（极低概率）：按未挂起来处理，仍尝试触发一次应用列表拉取
+                        Err(_) => std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    }
                 };
                 if !delay_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     let ctx_ptr = ctx as *mut SafeContext as usize;
@@ -403,8 +500,9 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
                         .name("auto-applist".to_string())
                         .spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(3));
-                            let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-                            if let Ok(g) = ctx.get_mut() {
+                            // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
+                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                            if let Ok(g) = ctx.lock() {
                                 if g.sender_queue != 0 {
                                     let q = unsafe {
                                         &*(crate::ffi::handle::get(g.sender_queue)
@@ -435,7 +533,9 @@ fn process_accept(ctx: &mut SafeContext, payload: &[u8]) -> i32 {
             }
         }
     } else {
-        log::warn!("处理消息: ACCEPT 时 SPAKE2 会话密钥缺失(已配对设备重连场景，跳过密钥更新)");
+        // 已配对设备重连走的是正常路径（密钥由 HANDSHAKE 重派生），
+        // 这里仅为排查保留 debug 级日志，避免平台端日志桥接产生告警
+        log::debug!("处理消息: ACCEPT 时 SPAKE2 会话密钥缺失(已配对设备重连场景，跳过密钥更新)");
         let g = ctx.get_mut().unwrap();
         cb_lt_pub = g
             .crypto
@@ -565,6 +665,8 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
         log::error!("处理消息: DATA 字段不足");
         return -1;
     }
+    // parts[0] 为 wire header（DATA_XXX），用于区分共用同一 msg_type 的请求/响应方向
+    let wire_header = parts[0];
     let local_uuid = parts[1];
     let encrypted_payload = parts[3];
 
@@ -596,7 +698,13 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
         }
     };
     let plaintext = String::from_utf8_lossy(&plain).to_string();
-    let data_header = binary_codec::type_to_data_header(msg_type);
+    // 以对端写入的 wire header 为准：DATA_ICON_REQUEST / DATA_ICON_RESPONSE
+    // 共用 PACKAGE_INFO 类型，仅 header 能还原真实方向
+    let data_header = if wire_header.is_empty() {
+        binary_codec::type_to_data_header(msg_type)
+    } else {
+        wire_header
+    };
 
     log::debug!(
         "处理消息: 解密 DATA header={}, uuid={}, 密文长度={}",
@@ -604,6 +712,22 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
         local_uuid,
         encrypted_payload.len()
     );
+
+    // 重同步请求：接收端缺失基线时主动请求发送方重发 FULL
+    if msg_type == MessageType::RESYNC_REQUEST {
+        match serde_json::from_str::<serde_json::Value>(&plaintext) {
+            Ok(v) => {
+                if let Some(fid) = v.get("feature").and_then(|x| x.as_str()) {
+                    // local_uuid 为请求方（原接收端）；本机作为发送方标记对应会话重发 FULL
+                    crate::state_merge::apply_resync_request(&mut *ctx, &local_uuid, fid);
+                }
+            }
+            Err(e) => {
+                log::error!("处理消息: 重同步请求 JSON 解析失败: {}", e);
+            }
+        }
+        return 0;
+    }
 
     // 超级岛 / 媒体：交给状态合并引擎
     if msg_type == MessageType::MEDIA_SESSION || msg_type == MessageType::FEATURE_STATUS {
@@ -615,7 +739,13 @@ fn process_data(ctx: &mut SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     let cb_type = match msg_type {
         MessageType::NOTIFICATION => "NOTIFICATION",
         MessageType::MEDIA_SESSION => "MEDIAPLAY",
-        MessageType::PACKAGE_INFO => "ICON_REQUEST",
+        MessageType::PACKAGE_INFO => {
+            if data_header == "DATA_ICON_RESPONSE" {
+                "ICON_RESPONSE"
+            } else {
+                "ICON_REQUEST"
+            }
+        }
         MessageType::SYNC_SEARCH_APP => "APP_LIST_REQUEST",
         MessageType::SYNC_SEARCH_APP_RESPONSE => "APP_LIST_RESPONSE",
         MessageType::MEDIA_SESSION_CONTROL => "MEDIA_CONTROL",

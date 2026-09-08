@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -22,7 +23,13 @@ pub struct TcpSession {
     pub stream: TcpStream,
     pub uuid: String,
     pub ip: String,
+    /// 所属连接标识：同一 uuid 重连后旧连接退出时，
+    /// 据此判断会话是否已属于新连接（避免误删新会话/误报断开）
+    pub conn_id: u64,
 }
+
+/// 连接标识自增序列（每个 TCP 连接唯一）
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// TCP 服务器状态
 pub struct TcpServerState {
@@ -395,7 +402,8 @@ fn handle_connection(
         return;
     }
 
-    // 注册会话
+    // 注册会话（带本连接唯一标识，供退出时判定归属）
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut state = state.lock().unwrap();
         state.sessions.insert(
@@ -404,6 +412,7 @@ fn handle_connection(
                 stream: stream.try_clone().expect("克隆流失败"),
                 uuid: uuid.clone(),
                 ip: ip.clone(),
+                conn_id,
             },
         );
     }
@@ -437,13 +446,25 @@ fn handle_connection(
         }
     }
 
-    {
+    // 仅当会话仍属于本连接时才移除并上报断开：
+    // 对端重连后新连接已覆盖同 uuid 会话，旧连接退出不得摘掉新会话
+    let still_owner = {
         let mut state = state.lock().unwrap();
-        state.sessions.remove(&uuid);
-    }
+        let owned = state
+            .sessions
+            .get(&uuid)
+            .map(|s| s.conn_id == conn_id)
+            .unwrap_or(false);
+        if owned {
+            state.sessions.remove(&uuid);
+        }
+        owned
+    };
 
-    if let Some(ref cb) = on_disconnected {
-        cb(uuid);
+    if still_owner {
+        if let Some(ref cb) = on_disconnected {
+            cb(uuid);
+        }
     }
 }
 

@@ -128,4 +128,7 @@ pub unsafe extern "C" fn nrc_update_heartbeat_scheduler_params(
             b.device_type = d;
         }
     }
+    // 同步到 TCP 层：发现请求响应携带的广播信息取自该副本，
+    // 更新后必须回写，否则对端扫描到的名称/电量/设备类型停留在启动时的旧值
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
 }

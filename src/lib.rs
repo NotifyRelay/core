@@ -43,13 +43,10 @@ pub struct CoreContext {
     pub filter: ffi::filter::FilterState,
     /// 设备运行时状态统一注册表
     pub registry: device_registry::DeviceRegistry,
-    pub spake2_prover: Option<crypto::spake2::Spake2ProverSession>,
-    pub spake2_verifier: Option<crypto::spake2::Spake2VerifierSession>,
-    /// SPAKE2 协商出的会话密钥 K_s([u8;32])，配对阶段暂存：
-    /// 用于 AES 加密/解密长期公钥 lt_pub，RESULT 后清零，避免长期驻留。
-    pub spake2_session_key: Option<[u8; 32]>,
-    pub pairing_ctx: Option<PairingContext>,
-    pub expected_pairing_code: Option<String>,
+    /// 按对端 uuid 隔离的配对会话：
+    /// 并发配对（同时对多个设备发起/响应）时互不覆盖，
+    /// ACCEPT 只能命中同一对端的 SPAKE2 会话与 K_s
+    pub pairing_sessions: HashMap<String, PairingSession>,
     /// 配对码生成（接收端/初始生成端）
     pub pairing_code: Option<String>,
     /// 配对码过期时间
@@ -97,6 +94,20 @@ pub struct PairingContext {
     pub peer_lt_pub: Option<String>,
 }
 
+/// 单个对端的配对会话（prover / verifier / K_s / 配对上下文 / 期望配对码）
+///
+/// K_s 仅用于加解密长期公钥 lt_pub 的一次传输：配对完成后清零，
+/// 数据通道密钥统一由「本机长期私钥 × 对端长期公钥 → ECDH + HKDF」派生，
+/// 与重连路径（process_handshake）保持一致。
+#[derive(Default)]
+pub struct PairingSession {
+    pub prover: Option<crypto::spake2::Spake2ProverSession>,
+    pub verifier: Option<crypto::spake2::Spake2VerifierSession>,
+    pub session_key: Option<[u8; 32]>,
+    pub pairing_ctx: Option<PairingContext>,
+    pub expected_code: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct BroadcastInfo {
     pub uuid: String,
@@ -124,11 +135,7 @@ impl CoreContext {
             filter: ffi::filter::FilterState::new(),
             registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
-            spake2_prover: None,
-            spake2_verifier: None,
-            spake2_session_key: None,
-            pairing_ctx: None,
-            expected_pairing_code: None,
+            pairing_sessions: HashMap::new(),
             pairing_code: None,
             pairing_code_expiry: None,
             broadcast_info: None,

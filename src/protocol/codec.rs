@@ -16,14 +16,8 @@ pub fn encode_pairing_init(
             uuid, spake2_pub, ip, battery, device_type
         )
     } else {
-        format!(
-            "{}:{}:{}:{}:{}",
-            uuid,
-            spake2_pub,
-            ip,
-            battery.abs(),
-            device_type
-        )
+        // 负数电量（放电）需保留负号：解析端按 i32 解析，abs() 会把 -1 变成 1
+        format!("{}:{}:{}:{}:{}", uuid, spake2_pub, ip, battery, device_type)
     };
     binary_codec::encode_pairing_frame(MessageType::PAIRING_INIT, &payload)
 }
@@ -44,14 +38,10 @@ pub fn encode_pairing_resp(
             uuid, spake2_pub, lt_pub, ip, battery, device_type
         )
     } else {
+        // 同 encode_pairing_init：负数电量保留负号（abs() 会丢失符号）
         format!(
             "{}:{}:{}:{}:{}:{}",
-            uuid,
-            spake2_pub,
-            lt_pub,
-            ip,
-            battery.abs(),
-            device_type
+            uuid, spake2_pub, lt_pub, ip, battery, device_type
         )
     };
     binary_codec::encode_pairing_frame(MessageType::PAIRING_RESP, &payload)
@@ -101,7 +91,15 @@ pub fn encode_data_message(
     encrypted_payload: &str,
 ) -> Vec<u8> {
     let msg_type = binary_codec::data_header_to_type(header);
-    binary_codec::encode_data_frame(msg_type, local_uuid, local_pub_key, encrypted_payload)
+    // 保留调用方给定的 header：DATA_ICON_RESPONSE 与 DATA_ICON_REQUEST 共用
+    // PACKAGE_INFO 类型，只有 header 能区分请求/响应方向
+    binary_codec::encode_data_frame(
+        header,
+        msg_type,
+        local_uuid,
+        local_pub_key,
+        encrypted_payload,
+    )
 }
 
 /// 编码发现请求（格式同UDP广播：uuid:name_b64:port:battery:device_type）
