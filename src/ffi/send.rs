@@ -486,7 +486,73 @@ pub unsafe extern "C" fn nrc_send_reject(ctx_ptr: *mut c_void, uuid: *const c_ch
     do_send_via_network(&network, &u, &codec::encode_reject(&u));
 }
 
-const BROADCAST_INTERVAL_MS: u64 = 10000; // TCP扫描发现间隔：10秒（需小于未认证在线窗口，避免列表闪烁）
+/// UDP 广播发现周期：2秒。
+///
+/// 防回归说明：设备发现早期即为 UDP 广播（2s 周期）。曾因移动网络下对 /24 网段做
+/// 254 个 IP 并发 TCP 全段扫描、持续抢占蜂窝空口与系统 conntrack 表项，导致同设备其他
+/// 应用网络异常，才切换到 TCP 扫描；现恢复 UDP 广播。移动网络（蜂窝）下无局域网广播域，
+/// UDP 广播不可达属预期行为，设备间连接仍由心跳 / known_device_scanner 等定向 TCP 通道
+/// 负责，请勿为「移动网络下也能发现」改回全段 TCP 扫描（防回归）。
+const BROADCAST_INTERVAL_MS: u64 = 2000;
+
+/// 统一处理「发现到的设备」：登记注册表、记录 device_ips，并触发平台 on_device_discovered 回调。
+/// UDP 广播发现路径与（保留的）TCP 发现请求应答路径共用同一消费链，保证发现结果上抛语义一致。
+/// 仅在发现线程中调用，必须通过 ctx.lock() 取锁（不得用 get_mut() 绕过互斥）。
+fn consume_discovered_device(
+    ctx_ref: &SafeContext,
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+    ip: &str,
+) {
+    let Ok(guard) = ctx_ref.lock() else {
+        return;
+    };
+    // 跳过本机自身：UDP 广播可能回环到本机监听端口，避免自我登记为远程设备
+    if guard
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid == uuid)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // 名称 base64 解码（与心跳路径一致），失败回退原串
+    let name = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(name_b64)
+            .unwrap_or_default(),
+    )
+    .unwrap_or_else(|_| name_b64.to_string());
+    // 设备状态统一由 core 维护：登记注册表并刷新 last_seen（在线判定唯一依据）
+    guard
+        .registry
+        .upsert(uuid, &name, ip, port, battery, device_type);
+    // 记录发现来源 IP 到内部映射：配对发起（nrc_send_pairing_init）等出站操作依赖该表解析目标 IP
+    if let Ok(mut ips) = guard.device_ips.lock() {
+        ips.insert(uuid.to_string(), ip.to_string());
+    }
+    let (cb, user_data) = (guard.router.on_device_discovered, guard.router.user_data);
+    // 回调前释放锁：平台端回调内可能再次调用 core 接口（如拉取设备快照）
+    drop(guard);
+    if let Some(f) = cb {
+        let c_uuid = CString::new(uuid).unwrap_or_default();
+        let c_name = CString::new(name).unwrap_or_default();
+        let c_type = CString::new(device_type).unwrap_or_default();
+        let c_ip = CString::new(ip).unwrap_or_default();
+        f(
+            c_uuid.as_ptr(),
+            c_name.as_ptr(),
+            port,
+            battery,
+            c_type.as_ptr(),
+            c_ip.as_ptr(),
+            user_data,
+        );
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn nrc_periodic_broadcast(
@@ -555,105 +621,117 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
 
             match thread::Builder::new()
                 .name("periodic-discovery".to_string())
-                .spawn(move || loop {
-                    if !r.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let discovery_request = {
-                        // 后台线程：与扫描回调一样通过 lock() 取锁，
-                        // 避免裸指针 + get_mut() 绕过互斥导致 CoreContext 数据竞争
-                        let ctx = unsafe { &*(ctx_usize as *const SafeContext) };
-                        let Ok(guard) = ctx.lock() else {
-                            thread::sleep(Duration::from_millis(500));
-                            continue;
-                        };
-                        match &guard.broadcast_info {
-                            Some(i) => codec::encode_discovery_request(
-                                &i.uuid,
-                                &i.name_b64,
-                                codec::DEFAULT_TCP_PORT,
-                                i.battery,
-                                &i.device_type,
-                            ),
-                            None => {
-                                thread::sleep(Duration::from_millis(500));
-                                continue;
-                            }
+                .spawn(move || {
+                    // UDP 广播发现线程：
+                    // - 以 BROADCAST_INTERVAL_MS 为周期广播本机发现信息（发送 socket）；
+                    // - 其余时间分片监听 UDP 广播端口，收到对端广播即解析并走统一消费链
+                    //   （registry 登记 / device_ips 记录 / on_device_discovered 回调）。
+                    // 移动网络（蜂窝）下无局域网广播域，广播不可达属预期，勿改回全段 TCP 扫描。
+                    let sender = match crate::network::create_udp_broadcast_socket() {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            log::warn!("UDP 广播发现: 创建发送 socket 失败: {}", e);
+                            None
                         }
                     };
+                    // 监听 socket 绑定失败（如端口被其他实例占用）时不阻塞广播发送，退化为仅发送
+                    let listener = match crate::network::bind_udp_discovery_listener() {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            log::warn!("UDP 广播发现: 绑定监听端口失败（退化为仅发送）: {}", e);
+                            None
+                        }
+                    };
+                    if sender.is_none() && listener.is_none() {
+                        return;
+                    }
 
-                    // TCP扫描发现：回调闭包仅捕获 ctx_usize（usize 是 Send+Sync），
-                    // 每次回调时从上下文读取 on_device_discovered 和 user_data
-                    let scan_ctx = ctx_usize;
-                    // 扫描耗时必须计入周期：一轮「扫描 + 等待」若超过未认证在线窗口
-                    // （DEFAULT_UNAUTHED_ONLINE_MS = 20s），设备会在两次扫描之间被判定离线而闪烁。
-                    // 这里按剩余时间补眠，使整轮稳定落在 BROADCAST_INTERVAL_MS 内
-                    let scan_started = Instant::now();
-                    crate::network::tcp_scan_discover_all(
-                        &discovery_request,
-                        Some(Arc::new(
-                            move |uuid, name_b64, port, battery, device_type, ip| {
-                                let ctx_ref = unsafe { &*(scan_ctx as *const SafeContext) };
-                                let Ok(guard) = ctx_ref.lock() else {
-                                    return;
+                    // 首次进入循环即广播一次，缩短平台开启发现后的首个发现周期
+                    let mut last_broadcast = Instant::now()
+                        .checked_sub(Duration::from_millis(BROADCAST_INTERVAL_MS))
+                        .unwrap_or_else(Instant::now);
+                    let mut buf = [0u8; 2048];
+
+                    loop {
+                        if !r.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        // 1) 到点广播本机发现信息
+                        if let Some(sock) = sender.as_ref() {
+                            if last_broadcast.elapsed()
+                                >= Duration::from_millis(BROADCAST_INTERVAL_MS)
+                            {
+                                let msg = {
+                                    // 后台线程统一走 lock() 取锁，避免裸指针 + get_mut()
+                                    // 绕过互斥导致 CoreContext 数据竞争
+                                    let ctx = unsafe { &*(ctx_usize as *const SafeContext) };
+                                    let Ok(guard) = ctx.lock() else {
+                                        continue;
+                                    };
+                                    match &guard.broadcast_info {
+                                        Some(i) => codec::encode_discovery_request(
+                                            &i.uuid,
+                                            &i.name_b64,
+                                            codec::DEFAULT_TCP_PORT,
+                                            i.battery,
+                                            &i.device_type,
+                                        ),
+                                        None => String::new(),
+                                    }
                                 };
-                                // 跳过本机自身：扫描会覆盖本机所在 IP，避免自我登记为远程设备
-                                if guard
-                                    .broadcast_info
-                                    .as_ref()
-                                    .map(|b| b.uuid == uuid)
-                                    .unwrap_or(false)
-                                {
-                                    return;
+                                if !msg.is_empty() {
+                                    if let Err(e) =
+                                        crate::network::send_udp_discovery_broadcast(sock, &msg)
+                                    {
+                                        log::debug!("UDP 广播发现: 发送失败: {}", e);
+                                    }
                                 }
-                                // 名称 base64 解码（与心跳路径一致），失败回退原串
-                                let name = String::from_utf8(
-                                    base64::engine::general_purpose::STANDARD
-                                        .decode(&name_b64)
-                                        .unwrap_or_default(),
-                                )
-                                .unwrap_or(name_b64);
-                                // 设备状态统一由 core 维护：登记注册表并刷新 last_seen（在线判定唯一依据）
-                                guard.registry.upsert(
-                                    &uuid,
-                                    &name,
-                                    &ip,
-                                    port,
-                                    battery,
-                                    &device_type,
-                                );
-                                // 记录扫描到的 IP 到内部映射：
-                                // 该表原本仅由「TCP 连接建立」写入，而扫描走发现请求短连接不建立会话，
-                                // 缺失会导致配对发起（nrc_send_pairing_init）等出站操作解析不到目标 IP
-                                if let Ok(mut ips) = guard.device_ips.lock() {
-                                    ips.insert(uuid.clone(), ip.clone());
+                                last_broadcast = Instant::now();
+                            }
+                        }
+
+                        // 2) 分片监听对端广播（读超时 100ms，兼顾定时广播的及时性）
+                        if let Some(sock) = listener.as_ref() {
+                            match sock.recv_from(&mut buf) {
+                                Ok((n, src)) => {
+                                    let line = match std::str::from_utf8(&buf[..n]) {
+                                        Ok(s) => s.trim().to_string(),
+                                        Err(_) => continue,
+                                    };
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some((uuid, name_b64, port, battery, device_type)) =
+                                        codec::decode_discovery_request(&line)
+                                    {
+                                        if !uuid.is_empty() {
+                                            let ctx_ref =
+                                                unsafe { &*(ctx_usize as *const SafeContext) };
+                                            consume_discovered_device(
+                                                ctx_ref,
+                                                &uuid,
+                                                &name_b64,
+                                                port,
+                                                battery,
+                                                &device_type,
+                                                &src.ip().to_string(),
+                                            );
+                                        }
+                                    }
                                 }
-                                let (cb, user_data) =
-                                    (guard.router.on_device_discovered, guard.router.user_data);
-                                // 回调前释放锁：平台端回调内可能再次调用 core 接口（如拉取设备快照）
-                                drop(guard);
-                                if let Some(f) = cb {
-                                    let c_uuid = CString::new(uuid).unwrap_or_default();
-                                    let c_name = CString::new(name).unwrap_or_default();
-                                    let c_type = CString::new(device_type).unwrap_or_default();
-                                    let c_ip = CString::new(ip).unwrap_or_default();
-                                    f(
-                                        c_uuid.as_ptr(),
-                                        c_name.as_ptr(),
-                                        port,
-                                        battery,
-                                        c_type.as_ptr(),
-                                        c_ip.as_ptr(),
-                                        user_data,
-                                    );
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut
+                                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(e) => {
+                                    log::debug!("UDP 广播发现: 接收错误: {}", e);
                                 }
-                            },
-                        )),
-                    );
-                    let elapsed = scan_started.elapsed();
-                    if elapsed < Duration::from_millis(BROADCAST_INTERVAL_MS) {
-                        thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS) - elapsed);
+                            }
+                        } else {
+                            // 无监听 socket 时退避，避免忙等
+                            thread::sleep(Duration::from_millis(100));
+                        }
                     }
                 }) {
                 Ok(_) => {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -295,7 +295,7 @@ fn handle_connection(
             crate::protocol::codec::decode_discovery_request(request_text)
         {
             if !peer_uuid.is_empty() && !ip.is_empty() {
-                log::debug!("TCP扫描发现: uuid={}, ip={}", peer_uuid, ip);
+                log::debug!("收到 TCP 发现请求: uuid={}, ip={}", peer_uuid, ip);
             }
         }
         // 生成本机发现响应
@@ -526,125 +526,98 @@ pub fn oneshot_send_only(payload: &[u8], ip: &str, port: u16, timeout_ms: u32) -
     true
 }
 
-/// 获取本机局域网IP段的所有IP地址
-pub fn get_local_subnet_ips() -> Vec<String> {
-    use std::net::Ipv4Addr;
+/// UDP 广播发现端口（与 TCP 数据端口 codec::DEFAULT_TCP_PORT=23333 并存）。
+/// 所有设备均监听该端口，并周期向该端口广播自身发现信息。
+pub const UDP_BROADCAST_PORT: u16 = 23334;
 
-    let mut ips = Vec::new();
+/// 创建 UDP 广播发送 socket（绑定临时端口并开启广播）。
+/// 与监听 socket 分离，避免向广播地址发送的包回环到自身监听路径。
+pub fn create_udp_broadcast_socket() -> Result<UdpSocket, String> {
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("创建 UDP 广播发送 socket 失败: {}", e))?;
+    socket
+        .set_broadcast(true)
+        .map_err(|e| format!("设置 UDP 广播失败: {}", e))?;
+    Ok(socket)
+}
 
-    // 获取本机IP地址
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                if let std::net::IpAddr::V4(ip) = addr.ip() {
-                    let octets = ip.octets();
-                    // 生成同子网的所有IP（/24子网），排除本机自身（避免自我扫描）
-                    for i in 1..=254 {
-                        if octets[3] == i {
-                            continue;
+/// 创建 UDP 广播发现监听 socket（绑定 UDP_BROADCAST_PORT，接收其他设备的广播）。
+/// 设置 100ms 读超时，使发现线程可在「定时广播」与「持续监听」之间及时切换。
+pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
+    let addr = format!("0.0.0.0:{}", UDP_BROADCAST_PORT);
+    let socket = UdpSocket::bind(&addr)
+        .map_err(|e| format!("绑定 UDP 发现监听端口 {} 失败: {}", UDP_BROADCAST_PORT, e))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|e| format!("设置 UDP 监听读超时失败: {}", e))?;
+    Ok(socket)
+}
+
+/// 发送 UDP 广播发现消息：
+/// 1. 先向 255.255.255.255 有限广播；
+/// 2. Android 下再向各非回环 IPv4 网卡的子网广播地址各发一次（部分 ROM 忽略有限广播）。
+pub fn send_udp_discovery_broadcast(socket: &UdpSocket, message: &str) -> Result<(), String> {
+    let data = message.as_bytes();
+    socket
+        .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
+        .map_err(|e| format!("UDP 有限广播失败: {}", e))?;
+    #[cfg(target_os = "android")]
+    send_to_all_subnets(socket, data)?;
+    Ok(())
+}
+
+/// 向所有非回环 IPv4 子网发送定向广播（Android/Linux）
+#[cfg(target_os = "android")]
+fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr};
+
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return Err("getifaddrs 失败".to_string());
+        }
+
+        let mut ptr = ifaddrs;
+        while !ptr.is_null() {
+            let entry = &*ptr;
+
+            if !entry.ifa_addr.is_null() {
+                let addr = entry.ifa_addr;
+                if (*addr).sa_family == libc::AF_INET as libc::sa_family_t {
+                    let sockaddr = &*(addr as *const libc::sockaddr_in);
+                    let ip = Ipv4Addr::from(sin_addr_to_bytes(sockaddr.sin_addr));
+
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        let ip_bytes = ip.octets();
+                        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
+                        let broadcast_addr =
+                            StdSocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
+
+                        if let Err(e) = socket.send_to(data, broadcast_addr) {
+                            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
                         }
-                        let subnet_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], i);
-                        ips.push(subnet_ip.to_string());
                     }
                 }
             }
+
+            ptr = (*entry).ifa_next;
         }
+
+        libc::freeifaddrs(ifaddrs);
     }
 
-    // 如果无法获取本机IP，返回默认的C类网络
-    if ips.is_empty() {
-        for i in 1..=254 {
-            ips.push(format!("192.168.1.{}", i));
-        }
-    }
-
-    ips
+    Ok(())
 }
 
-/// 单 IP 扫描超时（毫秒）：局域网内连接/响应均为毫秒级，超时过长会拖慢整轮扫描
-const SCAN_SINGLE_TIMEOUT_MS: u32 = 1200;
-
-/// TCP扫描发现：向指定IP发送发现请求并解析响应
-/// 返回 (uuid, name_b64, port, battery, device_type)
-pub fn tcp_scan_discover_single(
-    ip: &str,
-    discovery_request: &str,
-    timeout_ms: u32,
-) -> Option<(String, String, u16, i32, String)> {
-    use crate::protocol::{binary_codec, header::MessageType};
-
-    let addr = format!("{}:{}", ip, crate::protocol::codec::DEFAULT_TCP_PORT);
-    let sock_addr = addr.parse::<std::net::SocketAddr>().ok()?;
-
-    // 尝试TCP连接
-    let stream =
-        TcpStream::connect_timeout(&sock_addr, Duration::from_millis(timeout_ms as u64)).ok()?;
-
-    stream
-        .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(timeout_ms as u64)))
-        .ok()?;
-
-    // 发送发现请求（二进制帧格式）
-    let frame =
-        binary_codec::encode_pairing_frame(MessageType::DISCOVERY_REQUEST, discovery_request);
-    {
-        let mut writer = &stream;
-        use std::io::Write;
-        writer.write_all(&frame).ok()?;
-        writer.flush().ok()?;
-    }
-
-    // 读取响应（二进制帧格式）
-    let mut reader = BufReader::new(&stream);
-    let (_msg_type, payload) = binary_codec::read_frame(&mut reader).ok()?;
-
-    // 解析响应
-    let response_text = std::str::from_utf8(&payload).ok()?;
-    let trimmed = response_text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    crate::protocol::codec::decode_discovery_response(trimmed)
-}
-
-/// TCP扫描发现：并发扫描局域网IP段
-pub fn tcp_scan_discover_all(
-    discovery_request: &str,
-    on_device_discovered: Option<
-        Arc<dyn Fn(String, String, u16, i32, String, String) + Send + Sync>,
-    >,
-) {
-    let ips = get_local_subnet_ips();
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    // 并发上限：一轮扫描需控制在发现周期内（多数 IP 为瞬时拒绝），移动端同时限制线程数
-    let pool_size = (parallelism * 8).clamp(8, 96);
-
-    let pool = threadpool::ThreadPool::new(pool_size);
-    let on_discovered = on_device_discovered;
-
-    for ip in ips {
-        let request = discovery_request.to_string();
-        let cb = on_discovered.clone();
-
-        pool.execute(move || {
-            if let Some((uuid, name_b64, port, battery, device_type)) =
-                tcp_scan_discover_single(&ip, &request, SCAN_SINGLE_TIMEOUT_MS)
-            {
-                if let Some(ref cb) = cb {
-                    cb(uuid, name_b64, port, battery, device_type, ip);
-                }
-            }
-        });
-    }
-
-    // 等待所有扫描完成
-    pool.join();
+#[cfg(target_os = "android")]
+unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
+    let s_addr = addr.s_addr;
+    [
+        (s_addr & 0xFF) as u8,
+        ((s_addr >> 8) & 0xFF) as u8,
+        ((s_addr >> 16) & 0xFF) as u8,
+        ((s_addr >> 24) & 0xFF) as u8,
+    ]
 }
 
 #[cfg(test)]

@@ -145,8 +145,3 @@ pub fn encode_discovery_response(
 ) -> String {
     encode_discovery_request(uuid, name_b64, port, battery, device_type)
 }
-
-/// 解码发现响应
-pub fn decode_discovery_response(line: &str) -> Option<(String, String, u16, i32, String)> {
-    decode_discovery_request(line)
-}

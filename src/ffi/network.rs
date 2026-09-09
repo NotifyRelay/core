@@ -185,7 +185,7 @@ pub unsafe extern "C" fn nrc_on_network_changed(ctx_ptr: *mut c_void, local_ip: 
 /// 已知设备扫描、重连状态机的启动。
 /// 返回发送队列句柄（正整数，供入队使用），失败返回 0。
 /// 注意：本机身份（uuid/name/battery/device_type）写入 broadcast_info；
-/// 设备发现由 nrc_periodic_broadcast 启动的 TCP 扫描负责。
+/// 设备发现由 nrc_periodic_broadcast 启动的 UDP 广播负责。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_start_core(
     ctx_ptr: *mut c_void,
