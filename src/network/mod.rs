@@ -616,7 +616,9 @@ fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
         let broadcast_addr = StdSocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
 
         if let Err(e) = socket.send_to(data, broadcast_addr) {
-            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
+            // 169.254.x.x 等未获取到地址/无网络的网卡上广播必然失败（Windows 报 os error 10051），
+            // 属预期情况，仅记 debug 避免刷屏。
+            log::debug!("向子网 {} 广播失败: {}", broadcast, e);
         }
     }
 
