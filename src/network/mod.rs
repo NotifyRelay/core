@@ -543,10 +543,29 @@ pub fn create_udp_broadcast_socket() -> Result<UdpSocket, String> {
 
 /// 创建 UDP 广播发现监听 socket（绑定 UDP_BROADCAST_PORT，接收其他设备的广播）。
 /// 设置 100ms 读超时，使发现线程可在「定时广播」与「持续监听」之间及时切换。
+///
+/// 显式开启 SO_REUSEADDR：网络变化时平台会 stopDiscovery→startDiscovery 立刻重启发现线程，
+/// 旧线程的监听 socket 可能尚未释放，若不允许地址复用，新线程绑定会失败并永久退化为
+/// 「仅发送」（此后收不到任何对端广播，表现为对端全部离线）。
 pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
-    let addr = format!("0.0.0.0:{}", UDP_BROADCAST_PORT);
-    let socket = UdpSocket::bind(&addr)
+    let addr = format!("0.0.0.0:{}", UDP_BROADCAST_PORT)
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("解析 UDP 发现监听地址失败: {}", e))?;
+
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| format!("创建 UDP 发现监听 socket 失败: {}", e))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| format!("设置 UDP 监听地址复用失败: {}", e))?;
+    socket
+        .bind(&addr.into())
         .map_err(|e| format!("绑定 UDP 发现监听端口 {} 失败: {}", UDP_BROADCAST_PORT, e))?;
+
+    let socket: UdpSocket = socket.into();
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|e| format!("设置 UDP 监听读超时失败: {}", e))?;
@@ -555,69 +574,53 @@ pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
 
 /// 发送 UDP 广播发现消息：
 /// 1. 先向 255.255.255.255 有限广播；
-/// 2. Android 下再向各非回环 IPv4 网卡的子网广播地址各发一次（部分 ROM 忽略有限广播）。
+/// 2. 再向各非回环 IPv4 网卡的子网广播地址各发一次
+///    （部分 Android ROM 与多网卡 Windows 会忽略有限广播，仅走默认路由那个接口）。
+///
+/// 两类广播相互独立：有限广播失败（Android 上默认路由为蜂窝/存在多网卡时返回
+/// `Network is unreachable` 属常见情况）不得短路子网定向广播，否则设备将一条发现
+/// 报文都发不出，对端永久看不到本机。
 pub fn send_udp_discovery_broadcast(socket: &UdpSocket, message: &str) -> Result<(), String> {
     let data = message.as_bytes();
-    socket
+    let limited = socket
         .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
-        .map_err(|e| format!("UDP 有限广播失败: {}", e))?;
-    #[cfg(target_os = "android")]
-    send_to_all_subnets(socket, data)?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| format!("UDP 有限广播失败: {}", e));
+
+    if let Err(e) = &limited {
+        log::debug!("UDP 广播发现: 有限广播失败，改由子网定向广播兜底: {}", e);
+    }
+    send_to_all_subnets(socket, data)
 }
 
-/// 向所有非回环 IPv4 子网发送定向广播（Android/Linux）
-#[cfg(target_os = "android")]
+/// 向所有非回环 IPv4 网卡的子网广播地址各发一次（PC 与 Android 共用同一份跨平台实现）。
+/// 部分 Android ROM 与多网卡 Windows 会忽略 255.255.255.255 有限广播，仅走默认路由接口，
+/// 补发子网定向广播可覆盖其余网卡。
 fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr};
 
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            return Err("getifaddrs 失败".to_string());
+    let interfaces =
+        local_ip_address::list_afinet_netifas().map_err(|e| format!("枚举本机网卡失败: {}", e))?;
+
+    for (_name, ip) in interfaces {
+        let ip = match ip {
+            IpAddr::V4(v4) => v4,
+            IpAddr::V6(_) => continue,
+        };
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
         }
 
-        let mut ptr = ifaddrs;
-        while !ptr.is_null() {
-            let entry = &*ptr;
+        let ip_bytes = ip.octets();
+        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
+        let broadcast_addr = StdSocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
 
-            if !entry.ifa_addr.is_null() {
-                let addr = entry.ifa_addr;
-                if (*addr).sa_family == libc::AF_INET as libc::sa_family_t {
-                    let sockaddr = &*(addr as *const libc::sockaddr_in);
-                    let ip = Ipv4Addr::from(sin_addr_to_bytes(sockaddr.sin_addr));
-
-                    if !ip.is_loopback() && !ip.is_unspecified() {
-                        let ip_bytes = ip.octets();
-                        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
-                        let broadcast_addr =
-                            StdSocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
-
-                        if let Err(e) = socket.send_to(data, broadcast_addr) {
-                            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
-                        }
-                    }
-                }
-            }
-
-            ptr = (*entry).ifa_next;
+        if let Err(e) = socket.send_to(data, broadcast_addr) {
+            log::warn!("向子网 {} 广播失败: {}", broadcast, e);
         }
-
-        libc::freeifaddrs(ifaddrs);
     }
 
     Ok(())
-}
-
-#[cfg(target_os = "android")]
-unsafe fn sin_addr_to_bytes(addr: libc::in_addr) -> [u8; 4] {
-    let s_addr = addr.s_addr;
-    [
-        (s_addr & 0xFF) as u8,
-        ((s_addr >> 8) & 0xFF) as u8,
-        ((s_addr >> 16) & 0xFF) as u8,
-        ((s_addr >> 24) & 0xFF) as u8,
-    ]
 }
 
 #[cfg(test)]
