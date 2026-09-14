@@ -691,6 +691,61 @@ fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
     0
 }
 
+/// 模型往返归一化，并检测模型是否静默丢弃了字段。
+///
+/// serde 默认忽略模型未声明的字段，因此「反序列化成功」并不等于「数据完整」：
+/// 一旦出现「成功但有损」的往返，既有的 `.ok()` 兜底与日志都不会触发。
+/// issue #5 即由此而来——`DATA_ICON_RESPONSE` 被 `IconRequest` 归一化后
+/// `iconData` 被无声丢弃，跨端图标同步全程失效且无任何告警。
+///
+/// 此处比对往返前后的顶层字段集合，只要出现非 null 字段丢失，就告警并
+/// 回退透传原始报文，避免同类问题（如未来新增字段）再次无声发生。
+fn normalize_or_keep<T>(plaintext: &str) -> String
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let Ok(parsed) = serde_json::from_str::<T>(plaintext) else {
+        // 反序列化失败：透传原文（与既有兜底行为一致）
+        return plaintext.to_string();
+    };
+    let Ok(roundtrip) = serde_json::to_string(&parsed) else {
+        return plaintext.to_string();
+    };
+
+    let before = serde_json::from_str::<serde_json::Value>(plaintext).ok();
+    let after = serde_json::from_str::<serde_json::Value>(&roundtrip).ok();
+    let lost = lost_non_null_fields(before.as_ref(), after.as_ref());
+    if lost.is_empty() {
+        return roundtrip;
+    }
+
+    log::warn!(
+        "处理消息: 模型 {} 往返丢弃字段 {:?}，回退透传原文",
+        std::any::type_name::<T>(),
+        lost
+    );
+    plaintext.to_string()
+}
+
+/// 取出往返后被丢弃的顶层字段名（仅统计原值非 null 且往返后整体消失的字段，
+/// 避免把 `skip_serializing_if = "Option::is_none"` 对显式 null 的正常省略误判为丢字段）
+fn lost_non_null_fields(
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let (Some(before), Some(after)) = (
+        before.and_then(|v| v.as_object()),
+        after.and_then(|v| v.as_object()),
+    ) else {
+        return Vec::new();
+    };
+    before
+        .iter()
+        .filter(|(key, value)| !value.is_null() && !after.contains_key(*key))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
 fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // DATA 消息 payload 格式: DATA_TYPE:uuid:pub_key:encrypted_data
     let text = match std::str::from_utf8(payload) {
@@ -812,10 +867,15 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.clone())
         }
-        MessageType::PACKAGE_INFO => serde_json::from_str::<crate::models::IconRequest>(&plaintext)
-            .ok()
-            .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or(plaintext.clone()),
+        // DATA_ICON_REQUEST / DATA_ICON_RESPONSE 共用 PACKAGE_INFO，必须按 wire header
+        // 选择模型：响应侧用 IconRequest 归一化会把 iconData/icons/missing 静默丢弃
+        MessageType::PACKAGE_INFO => {
+            if data_header == "DATA_ICON_RESPONSE" {
+                normalize_or_keep::<crate::models::IconResponse>(&plaintext)
+            } else {
+                normalize_or_keep::<crate::models::IconRequest>(&plaintext)
+            }
+        }
         MessageType::SYNC_SEARCH_APP => {
             serde_json::from_str::<crate::models::AppListRequest>(&plaintext)
                 .ok()
@@ -865,6 +925,7 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::{CoreContext, MAX_PAIRING_SESSIONS};
+    use std::os::raw::{c_char, c_void};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -911,5 +972,180 @@ mod tests {
 
         assert_eq!(process_reject(&ctx, b"peer"), 0);
         assert!(!ctx.lock().unwrap().pairing_sessions.contains_key("peer"));
+    }
+
+    // ===== 图标数据通道全链路（issue #5 回归）=====
+
+    const TEST_REMOTE_UUID: &str = "remote-icon-uuid";
+    const TEST_AES_KEY: [u8; 32] = [7u8; 32];
+
+    /// on_data 回调捕获容器：(cb_type, plaintext)
+    type DataEvents = Mutex<Vec<(String, String)>>;
+    static DATA_EVENTS: DataEvents = Mutex::new(Vec::new());
+
+    /// 测试串行锁：回调容器为进程级静态，并行执行会互相串扰事件
+    static ICON_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn icon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        ICON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    extern "C" fn capture_data_cb(
+        _uuid: *const c_char,
+        msg_type: *const c_char,
+        plaintext: *const c_char,
+        _user_data: *mut c_void,
+    ) {
+        use std::ffi::CStr;
+        let read = |p: *const c_char| -> String {
+            if p.is_null() {
+                return String::new();
+            }
+            unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        DATA_EVENTS
+            .lock()
+            .unwrap()
+            .push((read(msg_type), read(plaintext)));
+    }
+
+    /// 构造与本机对端密钥匹配的测试上下文，并注册 on_data 捕获回调
+    fn ctx_with_data_cb() -> SafeContext {
+        DATA_EVENTS.lock().unwrap().clear();
+        let ctx = Mutex::new(CoreContext::new());
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.crypto.set_device_key(
+                TEST_REMOTE_UUID.to_string(),
+                String::new(),
+                base64::engine::general_purpose::STANDARD.encode(TEST_AES_KEY),
+            );
+            guard.router.user_data = &DATA_EVENTS as *const DataEvents as *mut c_void;
+            guard.router.on_data = Some(capture_data_cb);
+        }
+        ctx
+    }
+
+    /// 以真实加密帧驱动 process_frame（DATA_TYPE:uuid:pub_key:encrypted）
+    fn drive_data_frame(ctx: &SafeContext, header: &str, plaintext: &str) -> i32 {
+        let encrypted = aes::encrypt(&TEST_AES_KEY, plaintext.as_bytes()).expect("加密失败");
+        let payload = format!("{}:{}:{}:{}", header, TEST_REMOTE_UUID, "", encrypted);
+        process_frame(ctx, None, MessageType::PACKAGE_INFO, payload.as_bytes())
+    }
+
+    fn take_events() -> Vec<(String, String)> {
+        std::mem::take(&mut *DATA_EVENTS.lock().unwrap())
+    }
+
+    /// 核心回归：DATA_ICON_RESPONSE 的 iconData 必须在全链路中存活到 on_data。
+    /// 修复前该分支用 IconRequest 归一化，反序列化「成功但有损」，iconData 被静默丢弃。
+    #[test]
+    fn icon_response_keeps_icon_data_through_full_chain() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let icon_b64 = "iVBORw0KGgoAAAANSUhEUg==";
+        let plaintext = format!(
+            r#"{{"type":"ICON_RESPONSE","packageName":"com.tencent.mobileqq","iconData":"{}","time":1730000000000}}"#,
+            icon_b64
+        );
+
+        assert_eq!(drive_data_frame(&ctx, "DATA_ICON_RESPONSE", &plaintext), 0);
+
+        let events = take_events();
+        assert_eq!(events.len(), 1, "应恰好触发一次 on_data 回调");
+        let (cb_type, forwarded) = &events[0];
+        assert_eq!(cb_type, "ICON_RESPONSE", "应按 wire header 派发为响应侧");
+        assert!(
+            forwarded.contains(icon_b64),
+            "iconData 不得在 core 内部被丢弃，实际转发内容: {}",
+            forwarded
+        );
+
+        // 下游解析器应能还原出完整图标（修复前恒为 {"icons":[],"missing":[]}）
+        let parsed: serde_json::Value =
+            serde_json::from_str(&crate::app_sync::parse_icon_response(forwarded)).unwrap();
+        assert_eq!(parsed["icons"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(parsed["icons"][0]["packageName"], "com.tencent.mobileqq");
+        assert_eq!(parsed["icons"][0]["iconData"], icon_b64);
+    }
+
+    /// 批量响应：icons 数组与 missing 字段同样不得被模型吞掉。
+    #[test]
+    fn icon_response_keeps_batch_icons_and_missing() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let plaintext = r#"{"type":"ICON_RESPONSE","icons":[{"packageName":"com.a","iconData":"AAA="},{"packageName":"com.b","iconData":"BBB="}],"missing":["com.c"],"time":1730000000000}"#;
+
+        assert_eq!(drive_data_frame(&ctx, "DATA_ICON_RESPONSE", plaintext), 0);
+
+        let events = take_events();
+        assert_eq!(events.len(), 1);
+        let (cb_type, forwarded) = &events[0];
+        assert_eq!(cb_type, "ICON_RESPONSE");
+        assert!(forwarded.contains("AAA=") && forwarded.contains("BBB="));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&crate::app_sync::parse_icon_response(forwarded)).unwrap();
+        assert_eq!(parsed["icons"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(parsed["missing"], serde_json::json!(["com.c"]));
+    }
+
+    /// 请求方向仍应派发为 ICON_REQUEST，且请求字段完好（确认按 header 分流未误伤）。
+    #[test]
+    fn icon_request_stays_request_direction() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let plaintext =
+            r#"{"type":"ICON_REQUEST","packageNames":["com.a","com.b"],"time":1730000000000}"#;
+
+        assert_eq!(drive_data_frame(&ctx, "DATA_ICON_REQUEST", plaintext), 0);
+
+        let events = take_events();
+        assert_eq!(events.len(), 1);
+        let (cb_type, forwarded) = &events[0];
+        assert_eq!(cb_type, "ICON_REQUEST");
+        let parsed: serde_json::Value = serde_json::from_str(forwarded).unwrap();
+        assert_eq!(
+            parsed["packageNames"],
+            serde_json::json!(["com.a", "com.b"])
+        );
+    }
+
+    /// 字段缩减兜底：模型未声明的字段不得被静默吞掉，而应告警并透传原文。
+    #[test]
+    fn unknown_fields_are_forwarded_verbatim() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let plaintext = r#"{"type":"ICON_RESPONSE","packageName":"com.a","iconData":"AAA=","futureField":"未来新增字段","time":1730000000000}"#;
+
+        assert_eq!(drive_data_frame(&ctx, "DATA_ICON_RESPONSE", plaintext), 0);
+
+        let events = take_events();
+        assert_eq!(events.len(), 1);
+        let (_, forwarded) = &events[0];
+        assert!(
+            forwarded.contains("未来新增字段"),
+            "模型未声明的字段应回退透传原文，实际转发内容: {}",
+            forwarded
+        );
+    }
+
+    /// 反序列化失败的报文沿用既有兜底：透传原文，不丢内容。
+    #[test]
+    fn malformed_icon_payload_is_passed_through() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        // time 缺失导致 IconResponse 反序列化失败
+        let plaintext = r#"{"type":"ICON_RESPONSE","packageName":"com.a","iconData":"AAA="}"#;
+
+        assert_eq!(drive_data_frame(&ctx, "DATA_ICON_RESPONSE", plaintext), 0);
+
+        let events = take_events();
+        assert_eq!(events.len(), 1);
+        let (_, forwarded) = &events[0];
+        assert_eq!(forwarded, plaintext);
     }
 }
