@@ -572,57 +572,19 @@ pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
     Ok(socket)
 }
 
-/// 发送 UDP 广播发现消息：
-/// 1. 先向 255.255.255.255 有限广播；
-/// 2. 再向各非回环 IPv4 网卡的子网广播地址各发一次
-///    （部分 Android ROM 与多网卡 Windows 会忽略有限广播，仅走默认路由那个接口）。
+/// 发送 UDP 广播发现消息：仅向 255.255.255.255 有限广播地址发送一条发现报文。
 ///
-/// 两类广播相互独立：有限广播失败（Android 上默认路由为蜂窝/存在多网卡时返回
-/// `Network is unreachable` 属常见情况）不得短路子网定向广播，否则设备将一条发现
-/// 报文都发不出，对端永久看不到本机。
+/// 已不再枚举网卡补发子网定向广播（x.x.x.255）：该做法在未接入网络的网卡（如 169.254.x.x
+/// 链路本地地址）上必然失败（Windows 报 os error 10051），既不产生任何有效发现，又会按
+/// 广播周期持续输出大量噪声日志，故整体移除；局域网发现由有限广播承担。
 pub fn send_udp_discovery_broadcast(socket: &UdpSocket, message: &str) -> Result<(), String> {
-    let data = message.as_bytes();
-    let limited = socket
-        .send_to(data, format!("255.255.255.255:{}", UDP_BROADCAST_PORT))
+    socket
+        .send_to(
+            message.as_bytes(),
+            format!("255.255.255.255:{}", UDP_BROADCAST_PORT),
+        )
         .map(|_| ())
-        .map_err(|e| format!("UDP 有限广播失败: {}", e));
-
-    if let Err(e) = &limited {
-        log::debug!("UDP 广播发现: 有限广播失败，改由子网定向广播兜底: {}", e);
-    }
-    send_to_all_subnets(socket, data)
-}
-
-/// 向所有非回环 IPv4 网卡的子网广播地址各发一次（PC 与 Android 共用同一份跨平台实现）。
-/// 部分 Android ROM 与多网卡 Windows 会忽略 255.255.255.255 有限广播，仅走默认路由接口，
-/// 补发子网定向广播可覆盖其余网卡。
-fn send_to_all_subnets(socket: &UdpSocket, data: &[u8]) -> Result<(), String> {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr};
-
-    let interfaces =
-        local_ip_address::list_afinet_netifas().map_err(|e| format!("枚举本机网卡失败: {}", e))?;
-
-    for (_name, ip) in interfaces {
-        let ip = match ip {
-            IpAddr::V4(v4) => v4,
-            IpAddr::V6(_) => continue,
-        };
-        if ip.is_loopback() || ip.is_unspecified() {
-            continue;
-        }
-
-        let ip_bytes = ip.octets();
-        let broadcast = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], 255);
-        let broadcast_addr = StdSocketAddr::new(IpAddr::V4(broadcast), UDP_BROADCAST_PORT);
-
-        if let Err(e) = socket.send_to(data, broadcast_addr) {
-            // 169.254.x.x 等未获取到地址/无网络的网卡上广播必然失败（Windows 报 os error 10051），
-            // 属预期情况，仅记 debug 避免刷屏。
-            log::debug!("向子网 {} 广播失败: {}", broadcast, e);
-        }
-    }
-
-    Ok(())
+        .map_err(|e| format!("UDP 有限广播失败: {}", e))
 }
 
 #[cfg(test)]
