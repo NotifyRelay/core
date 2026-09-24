@@ -110,9 +110,71 @@ impl SenderQueue {
         plaintext.contains("__END__") || plaintext.contains("\"terminate\":true")
     }
 
+    /// 队列项是否属于「已过期的实时状态」：发送前与入队前的统一判定。
+    ///
+    /// 非实时 header（通知/图标/控制等）与结束包一律不判过期；
+    /// 未携带 `ts` 的负载保守保留（旧格式/异常负载，不因字段缺失误丢）。
+    fn is_stale_realtime_item(it: &SendItem) -> bool {
+        if !Self::is_media_header(&it.header) || Self::is_media_end_packet(&it.plaintext) {
+            return false;
+        }
+        match crate::timestamp::extract_ts(&it.plaintext) {
+            Some(ts) => crate::timestamp::is_stale(ts, crate::timestamp::now_ms()),
+            None => false,
+        }
+    }
+
+    /// 清理指定设备 + header 下已过期的实时状态积压（FULL 与 DELTA 均适用）。
+    ///
+    /// 断线期间实时状态（超级岛 / 媒体）会持续入队，恢复后按序回放会造成"追逐"；
+    /// 此处按注入的 `ts` 丢弃超过 `STATE_MAX_AGE_MS` 的旧项。结束包不丢弃
+    /// （会话终止信号必须送达，否则对端卡片/岛残留）。
+    ///
+    /// 返回被丢弃条数：调用方据此把本次推送强制为 FULL，重建接收端基线
+    /// （丢弃 DELTA 可能使 `pics` 等真差量字段在接收端缺失，FULL 可一次性纠正）。
+    pub fn purge_stale_realtime(&self, device_uuid: &str, header: &str) -> usize {
+        if !Self::is_media_header(header) {
+            return 0;
+        }
+        let now = crate::timestamp::now_ms();
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let before = inner.items.len();
+        inner.items.retain(|it| {
+            if it.device_uuid != device_uuid || it.header != header {
+                return true;
+            }
+            if Self::is_media_end_packet(&it.plaintext) {
+                return true;
+            }
+            match crate::timestamp::extract_ts(&it.plaintext) {
+                Some(ts) => !crate::timestamp::is_stale(ts, now),
+                // 未携带 ts（旧格式/异常负载）：保守保留
+                None => true,
+            }
+        });
+        let dropped = before - inner.items.len();
+        if dropped > 0 {
+            log::debug!(
+                "发送队列: 清理过期实时状态积压 uuid={} header={}, 丢弃 {} 条",
+                device_uuid,
+                header,
+                dropped
+            );
+        }
+        dropped
+    }
+
     pub fn enqueue(&self, mut item: SendItem) {
         let is_media = Self::is_media_header(&item.header);
         let is_end = is_media && Self::is_media_end_packet(&item.plaintext);
+        // 实时状态统一补齐生成时刻 `ts`：state_merge 的主动推送已注入，
+        // 此处兜底覆盖保活/重发等旁路，保证接收端对所有实时包都能做时效判定。
+        if is_media && crate::timestamp::extract_ts(&item.plaintext).is_none() {
+            item.plaintext =
+                crate::timestamp::inject_ts(&item.plaintext, crate::timestamp::now_ms());
+        }
         // 媒体高频状态失败即弃（过期状态重发只会造成回放追赶）；
         // 但结束包必须可靠送达（否则对端媒体卡片/岛无法消失），与通知/控制一样重试。
         item.retries_left = if is_media && !is_end {
@@ -182,6 +244,16 @@ impl SenderQueue {
                             .busy_devices
                             .retain(|_, &mut ts| now.duration_since(ts).as_secs() < 30);
                         guard.device_cooldown.retain(|_, &mut until| until > now);
+
+                        // 发送前丢弃已过期的实时状态：设备长时间离线时队列会持续积压
+                        // 超级岛/媒体状态，恢复后即使没有新推送，worker 也会按序回放造成"追逐"。
+                        // 此处按注入的 `ts` 丢弃过期项（结束包保留，会话终止信号必须送达）。
+                        let before = guard.items.len();
+                        guard.items.retain(|it| !Self::is_stale_realtime_item(it));
+                        let dropped = before - guard.items.len();
+                        if dropped > 0 {
+                            log::debug!("发送队列: 发送前清理过期实时状态 {} 条", dropped);
+                        }
 
                         // 选取可发送项：同 dedup_key 不并发、同设备串行、冷却中的设备跳过
                         let idx = guard.items.iter().position(|it| {
@@ -359,7 +431,13 @@ impl SenderQueue {
             return Ok(false);
         }
 
-        let encrypted = match aes::encrypt(&key_arr, item.plaintext.as_bytes()) {
+        // DATA 通道统一使用绑定 core 版本的 AAD：跨 major.minor 时对端 AAD 不同，
+        // GCM 认证必然失败，即便公钥与密钥完全一致也无法通信。
+        let encrypted = match aes::encrypt_with_aad(
+            &key_arr,
+            item.plaintext.as_bytes(),
+            &crate::protocol::version::data_aad(),
+        ) {
             Ok(e) => e,
             Err(_) => return Ok(false),
         };
@@ -522,5 +600,94 @@ mod tests {
         let inner = q.inner.lock().unwrap();
         assert_eq!(inner.items.len(), 2);
         assert!(inner.items[0].coalesce_key.is_none());
+    }
+
+    #[test]
+    fn test_realtime_enqueue_injects_ts() {
+        let q = SenderQueue::new();
+        q.enqueue(item("dev1", "DATA_MEDIAPLAY", r#"{"title":"a"}"#));
+        let inner = q.inner.lock().unwrap();
+        let ts = crate::timestamp::extract_ts(&inner.items[0].plaintext);
+        assert!(ts.is_some_and(|t| t > 0), "实时状态入队应注入 ts");
+    }
+
+    #[test]
+    fn test_notification_enqueue_does_not_inject_ts() {
+        // 通知的 ts 由 FFI 入队路径注入；SenderQueue 本身只处理实时 header，
+        // 避免向图标/应用列表等严格模型通道注入未声明字段
+        let q = SenderQueue::new();
+        q.enqueue(item(
+            "dev1",
+            "DATA_ICON_REQUEST",
+            r#"{"packageNames":["a"]}"#,
+        ));
+        let inner = q.inner.lock().unwrap();
+        assert!(crate::timestamp::extract_ts(&inner.items[0].plaintext).is_none());
+    }
+
+    #[test]
+    fn test_is_stale_realtime_item_classification() {
+        let stale = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        let fresh = crate::timestamp::now_ms();
+        // 过期实时状态 → 判为过期
+        assert!(SenderQueue::is_stale_realtime_item(&item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            &format!(r#"{{"title":"a","ts":{}}}"#, stale)
+        )));
+        // 新鲜实时状态 → 不过期
+        assert!(!SenderQueue::is_stale_realtime_item(&item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            &format!(r#"{{"title":"a","ts":{}}}"#, fresh)
+        )));
+        // 结束包即便 ts 过期也保留
+        assert!(!SenderQueue::is_stale_realtime_item(&item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            &format!(
+                r#"{{"terminateValue":"__END__","terminate":true,"ts":{}}}"#,
+                stale
+            )
+        )));
+        // 非实时通道不判过期（通知的累积是有益的）
+        assert!(!SenderQueue::is_stale_realtime_item(&item(
+            "dev1",
+            "DATA_NOTIFICATION",
+            &format!(r#"{{"title":"a","ts":{}}}"#, stale)
+        )));
+        // 未携带 ts → 保守保留
+        assert!(!SenderQueue::is_stale_realtime_item(&item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"title":"a"}"#
+        )));
+    }
+
+    #[test]
+    fn test_purge_stale_realtime_scoped_to_device_and_header() {
+        let q = SenderQueue::new();
+        let stale = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        // 过期：dev1 + DATA_MEDIAPLAY（应被清理）
+        q.enqueue(item(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            &format!(r#"{{"changes":{{"title":"s"}},"ts":{}}}"#, stale),
+        ));
+        // 同 header 不同设备（不应被清理）
+        q.enqueue(item(
+            "dev2",
+            "DATA_MEDIAPLAY",
+            &format!(r#"{{"changes":{{"title":"s"}},"ts":{}}}"#, stale),
+        ));
+        // 同设备不同 header（不应被清理）
+        q.enqueue(item(
+            "dev1",
+            "DATA_SUPERISLAND",
+            &format!(r#"{{"changes":{{"title":"s"}},"ts":{}}}"#, stale),
+        ));
+        let dropped = q.purge_stale_realtime("dev1", "DATA_MEDIAPLAY");
+        assert_eq!(dropped, 1, "仅应清理目标设备与 header 的过期项");
+        assert_eq!(q.pending_count(), 2);
     }
 }

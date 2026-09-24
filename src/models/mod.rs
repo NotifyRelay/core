@@ -12,6 +12,13 @@ pub struct Notification {
     pub text: String,
     pub time: i64,
     pub is_locked: bool,
+    /// core 注入的生成时刻（毫秒 Unix 时间戳）。
+    ///
+    /// 通知为非实时通道，**只记录不丢弃**（断线期间的累积是有益的）；
+    /// 声明此字段是为了让 `ts` 在模型往返（反序列化 → 序列化）中存活，
+    /// 否则会被静默丢弃、平台端无法据其判断通知的新鲜度。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<i64>,
 }
 
 // ==================== DATA_MEDIAPLAY / DATA_SUPERISLAND ====================

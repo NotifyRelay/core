@@ -4,7 +4,7 @@ use base64::Engine;
 
 use crate::{
     crypto::{aes, ecdh, hkdf, spake2},
-    protocol::{binary_codec, codec, header::MessageType},
+    protocol::{binary_codec, codec, header::MessageType, version},
     SafeContext,
 };
 
@@ -152,6 +152,22 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
         return 0;
     }
 
+    // 版本兼容校验：仅比较 major.minor，patch 差异仍互通。
+    // 不兼容时拒绝握手（不自动 ACCEPT），避免两端在版本不一致时建立半可用连接。
+    if !version::is_compatible(&hs.core_version) {
+        log::warn!(
+            "处理消息: HANDSHAKE 版本不兼容，拒绝连接 uuid={}, 对端={}, 本机={}",
+            uuid_str,
+            if hs.core_version.is_empty() {
+                "<未携带>"
+            } else {
+                &hs.core_version
+            },
+            version::CORE_VERSION
+        );
+        return -1;
+    }
+
     if already_paired {
         if locked_remote.is_empty() {
             log::warn!(
@@ -264,18 +280,30 @@ fn process_pairing_init(ctx: &SafeContext, payload: &[u8]) -> i32 {
             return -1;
         }
     };
-    // 配对消息 payload 格式: uuid:spake2_pub:ip:battery:device_type
-    // 限定 5 段：device_type 允许包含冒号（对端传入，未做转义）
-    let parts: Vec<&str> = text.splitn(5, ':').collect();
-    if parts.len() < 5 {
+    // 配对消息 payload 格式: uuid:coreVersion:spake2_pub:ip:battery:device_type
+    // 限定 6 段：device_type 允许包含冒号（对端传入，未做转义）
+    let parts: Vec<&str> = text.splitn(6, ':').collect();
+    if parts.len() < 6 {
         log::error!("处理消息: PAIRING_INIT 字段不足");
         return -1;
     }
     let uuid = parts[0];
-    let spake2_pub = parts[1];
-    let ip = parts[2];
-    let battery: i32 = parts[3].trim_end_matches('+').parse().unwrap_or(0);
-    let device_type = parts[4];
+    let peer_version = parts[1];
+    let spake2_pub = parts[2];
+    let ip = parts[3];
+    let battery: i32 = parts[4].trim_end_matches('+').parse().unwrap_or(0);
+    let device_type = parts[5];
+
+    // 版本兼容校验：仅比较 major.minor，不兼容时拒绝配对
+    if !version::is_compatible(peer_version) {
+        log::warn!(
+            "处理消息: PAIRING_INIT 版本不兼容，拒绝配对 uuid={}, 对端={}, 本机={}",
+            uuid,
+            peer_version,
+            version::CORE_VERSION
+        );
+        return -1;
+    }
 
     {
         let Ok(mut guard) = ctx.lock() else {
@@ -309,20 +337,32 @@ fn process_pairing_resp(ctx: &SafeContext, payload: &[u8]) -> i32 {
             return -1;
         }
     };
-    // 配对消息 payload 格式: uuid:spake2_pub:enc_lt_pub:ip:battery:device_type
+    // 配对消息 payload 格式: uuid:coreVersion:spake2_pub:enc_lt_pub:ip:battery:device_type
     // enc_lt_pub 为接收方用 K_s 加密的本机长期公钥；此处用 K_s 解密
-    // 限定 6 段：device_type 允许包含冒号（对端传入，未做转义）
-    let parts: Vec<&str> = text.splitn(6, ':').collect();
-    if parts.len() < 6 {
+    // 限定 7 段：device_type 允许包含冒号（对端传入，未做转义）
+    let parts: Vec<&str> = text.splitn(7, ':').collect();
+    if parts.len() < 7 {
         log::error!("处理消息: PAIRING_RESP 字段不足");
         return -1;
     }
     let uuid = parts[0];
-    let spake2_pub = parts[1];
-    let enc_lt_pub = parts[2];
-    let ip = parts[3];
-    let battery: i32 = parts[4].trim_end_matches('+').parse().unwrap_or(0);
-    let device_type = parts[5];
+    let peer_version = parts[1];
+    let spake2_pub = parts[2];
+    let enc_lt_pub = parts[3];
+    let ip = parts[4];
+    let battery: i32 = parts[5].trim_end_matches('+').parse().unwrap_or(0);
+    let device_type = parts[6];
+
+    // 版本兼容校验：仅比较 major.minor，不兼容时拒绝配对（不消费 prover 会话）
+    if !version::is_compatible(peer_version) {
+        log::warn!(
+            "处理消息: PAIRING_RESP 版本不兼容，拒绝配对 uuid={}, 对端={}, 本机={}",
+            uuid,
+            peer_version,
+            version::CORE_VERSION
+        );
+        return -1;
+    }
 
     // 发起方在此完成 SPAKE2 prover，得到会话密钥 K_s，并用其解密对端 lt_pub；
     // K_s 暂存供后续 ACCEPT 加密复用（两端推导出的 K_s 对称一致）
@@ -427,24 +467,37 @@ fn process_pairing_resp(ctx: &SafeContext, payload: &[u8]) -> i32 {
 }
 
 fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
-    // ACCEPT 负载格式：uuid:enc_lt_pub（enc_lt_pub 为 AES(K_s) 密文，与 encode_accept 对应）
-    let (uuid, enc_lt) = match std::str::from_utf8(payload) {
+    // ACCEPT 负载格式：uuid:coreVersion:enc_lt_pub
+    // （enc_lt_pub 为 AES(K_s) 密文，与 encode_accept 对应）
+    let (uuid, peer_version, enc_lt) = match std::str::from_utf8(payload) {
         Ok(s) => {
             let s = s.trim();
-            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            let parts: Vec<&str> = s.splitn(3, ':').collect();
             let u = parts.first().map(|p| p.to_string()).unwrap_or_default();
-            let k = if parts.len() > 1 {
-                parts[1].to_string()
+            let v = parts.get(1).map(|p| p.to_string()).unwrap_or_default();
+            let k = if parts.len() > 2 {
+                parts[2].to_string()
             } else {
                 String::new()
             };
-            (u, k)
+            (u, v, k)
         }
         Err(_) => {
             log::error!("处理消息: ACCEPT payload 非 UTF-8");
             return -1;
         }
     };
+
+    // 版本兼容校验：仅比较 major.minor，不兼容时拒绝 ACCEPT（不消费配对会话 K_s）
+    if !version::is_compatible(&peer_version) {
+        log::warn!(
+            "处理消息: ACCEPT 版本不兼容，拒绝配对 uuid={}, 对端={}, 本机={}",
+            uuid,
+            peer_version,
+            version::CORE_VERSION
+        );
+        return -1;
+    }
 
     // 配对流程判定：接收方在 nrc_send_pairing_resp 已完成 verifier 并暂存 K_s。
     // K_s 按 ACCEPT 发送方 uuid 取用，确保命中同一对端的配对会话
@@ -747,7 +800,7 @@ fn lost_non_null_fields(
 }
 
 fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
-    // DATA 消息 payload 格式: DATA_TYPE:uuid:pub_key:encrypted_data
+    // DATA 消息 payload 格式: DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data
     let text = match std::str::from_utf8(payload) {
         Ok(s) => s,
         Err(_) => {
@@ -755,15 +808,29 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
             return -1;
         }
     };
-    let parts: Vec<&str> = text.splitn(4, ':').collect();
-    if parts.len() < 4 {
+    let parts: Vec<&str> = text.splitn(5, ':').collect();
+    if parts.len() < 5 {
         log::error!("处理消息: DATA 字段不足");
         return -1;
     }
     // parts[0] 为 wire header（DATA_XXX），用于区分共用同一 msg_type 的请求/响应方向
     let wire_header = parts[0];
     let local_uuid = parts[1];
-    let encrypted_payload = parts[3];
+    let peer_version = parts[2];
+    let encrypted_payload = parts[4];
+
+    // 明文版本校验：不兼容时在解密前直接丢弃，避免无效解密与日志噪声。
+    // 即便此处被绕过，密文侧的 AES-GCM AAD 也绑定了同一 major.minor，跨版本必然解密失败。
+    if !version::is_compatible(peer_version) {
+        log::warn!(
+            "处理消息: DATA 版本不兼容，丢弃 msg_type={}, uuid={}, 对端={}, 本机={}",
+            msg_type,
+            local_uuid,
+            peer_version,
+            version::CORE_VERSION
+        );
+        return -1;
+    }
 
     let key_arr = {
         let Ok(guard) = ctx.lock() else {
@@ -783,7 +850,9 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
         }
     };
 
-    let plain = match aes::decrypt(&key_arr, encrypted_payload) {
+    // AAD 绑定 core 协议版本（major.minor）：跨版本时即便密钥完全一致，
+    // GCM 认证标签也不匹配，解密必然失败——密文层面的第二重版本约束。
+    let plain = match aes::decrypt_with_aad(&key_arr, encrypted_payload, &version::data_aad()) {
         Ok(p) => p,
         Err(_) => {
             log::error!(
@@ -934,7 +1003,11 @@ mod tests {
         let ctx = Mutex::new(CoreContext::new());
 
         for index in 0..(MAX_PAIRING_SESSIONS * 4) {
-            let payload = format!("peer-{index}:spake:{index}:50:desktop");
+            // 新格式：uuid:coreVersion:spake2_pub:ip:battery:device_type
+            let payload = format!(
+                "peer-{index}:{}:spake:{index}:50:desktop",
+                version::CORE_VERSION
+            );
             assert_eq!(process_pairing_init(&ctx, payload.as_bytes()), 0);
             assert!(ctx.lock().unwrap().pairing_sessions.len() <= MAX_PAIRING_SESSIONS);
         }
@@ -955,10 +1028,11 @@ mod tests {
                 Instant::now() - Duration::from_secs(1);
         }
 
-        assert_eq!(
-            process_pairing_init(&ctx, b"current:spake:127.0.0.1:50:desktop"),
-            0
+        let payload = format!(
+            "current:{}:spake:127.0.0.1:50:desktop",
+            version::CORE_VERSION
         );
+        assert_eq!(process_pairing_init(&ctx, payload.as_bytes()), 0);
 
         let guard = ctx.lock().unwrap();
         assert!(!guard.pairing_sessions.contains_key("expired"));
@@ -1029,10 +1103,24 @@ mod tests {
         ctx
     }
 
-    /// 以真实加密帧驱动 process_frame（DATA_TYPE:uuid:pub_key:encrypted）
+    /// 以真实加密帧驱动 process_frame（DATA_TYPE:uuid:coreVersion:pub_key:encrypted）
+    ///
+    /// 密文使用与生产一致的版本 AAD，保证测试覆盖真实解密路径。
     fn drive_data_frame(ctx: &SafeContext, header: &str, plaintext: &str) -> i32 {
-        let encrypted = aes::encrypt(&TEST_AES_KEY, plaintext.as_bytes()).expect("加密失败");
-        let payload = format!("{}:{}:{}:{}", header, TEST_REMOTE_UUID, "", encrypted);
+        let encrypted = aes::encrypt_with_aad(
+            &TEST_AES_KEY,
+            plaintext.as_bytes(),
+            &crate::protocol::version::data_aad(),
+        )
+        .expect("加密失败");
+        let payload = format!(
+            "{}:{}:{}:{}:{}",
+            header,
+            TEST_REMOTE_UUID,
+            crate::protocol::version::CORE_VERSION,
+            "",
+            encrypted
+        );
         process_frame(ctx, None, MessageType::PACKAGE_INFO, payload.as_bytes())
     }
 
@@ -1147,5 +1235,137 @@ mod tests {
         assert_eq!(events.len(), 1);
         let (_, forwarded) = &events[0];
         assert_eq!(forwarded, plaintext);
+    }
+
+    // ===== 版本绑定（阻断跨版本通信）=====
+
+    /// 以指定版本号与 AAD 驱动 DATA 帧，便于构造跨版本场景。
+    fn drive_data_frame_with_version(
+        ctx: &SafeContext,
+        header: &str,
+        plaintext: &str,
+        peer_version: &str,
+        aad: &[u8],
+    ) -> i32 {
+        let encrypted =
+            aes::encrypt_with_aad(&TEST_AES_KEY, plaintext.as_bytes(), aad).expect("加密失败");
+        let payload = format!(
+            "{}:{}:{}:{}:{}",
+            header, TEST_REMOTE_UUID, peer_version, "", encrypted
+        );
+        process_frame(ctx, None, MessageType::PACKAGE_INFO, payload.as_bytes())
+    }
+
+    /// 明文版本不兼容时，DATA 帧必须在解密前被丢弃，且不下发平台。
+    #[test]
+    fn data_frame_with_incompatible_version_is_dropped() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let (major, minor) =
+            crate::protocol::version::major_minor(crate::protocol::version::CORE_VERSION).unwrap();
+        let peer_version = format!("{}.{}", major + 1, minor);
+        let plaintext =
+            r#"{"type":"ICON_RESPONSE","packageName":"com.a","iconData":"AAA=","time":1}"#;
+
+        let rc = drive_data_frame_with_version(
+            &ctx,
+            "DATA_ICON_RESPONSE",
+            plaintext,
+            &peer_version,
+            // 明文版本已被拒绝，AAD 与密文内容不影响结论
+            &crate::protocol::version::data_aad(),
+        );
+        assert_eq!(rc, -1, "跨版本 DATA 帧应被拒绝");
+        assert!(take_events().is_empty(), "跨版本帧不得下发平台");
+    }
+
+    /// 明文版本被绕过时，密文 AAD 仍能阻断：同密钥但 AAD 不同 → 解密失败。
+    #[test]
+    fn data_frame_with_mismatched_aad_fails_decryption() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let plaintext =
+            r#"{"type":"ICON_RESPONSE","packageName":"com.a","iconData":"AAA=","time":1}"#;
+
+        // 版本明文合法（同 major.minor），但密文使用另一版本的 AAD
+        let rc = drive_data_frame_with_version(
+            &ctx,
+            "DATA_ICON_RESPONSE",
+            plaintext,
+            crate::protocol::version::CORE_VERSION,
+            b"NotifyRelay-Data-v99.99",
+        );
+        assert_eq!(rc, -1, "AAD 不匹配必须解密失败");
+        assert!(take_events().is_empty(), "解密失败不得下发平台");
+    }
+
+    /// 版本兼容（含 patch 差异）时 DATA 帧正常解密并下发。
+    #[test]
+    fn data_frame_with_compatible_version_is_forwarded() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_data_cb();
+        let (major, minor) =
+            crate::protocol::version::major_minor(crate::protocol::version::CORE_VERSION).unwrap();
+        // patch 差异仍互通：AAD 只绑定 major.minor，故两端一致
+        let peer_version = format!("{}.{}.99", major, minor);
+        let plaintext =
+            r#"{"type":"ICON_RESPONSE","packageName":"com.a","iconData":"AAA=","time":1}"#;
+
+        let rc = drive_data_frame_with_version(
+            &ctx,
+            "DATA_ICON_RESPONSE",
+            plaintext,
+            &peer_version,
+            &crate::protocol::version::data_aad(),
+        );
+        assert_eq!(rc, 0, "同 major.minor 的 patch 差异应互通");
+        let events = take_events();
+        assert_eq!(events.len(), 1, "兼容版本应正常下发");
+        assert_eq!(events[0].0, "ICON_RESPONSE");
+    }
+
+    /// HANDSHAKE 版本不兼容时必须拒绝（不自动 ACCEPT），返回 -1。
+    #[test]
+    fn handshake_with_incompatible_version_is_rejected() {
+        let ctx = Mutex::new(CoreContext::new());
+        let (major, minor) =
+            crate::protocol::version::major_minor(crate::protocol::version::CORE_VERSION).unwrap();
+        let hs = binary_codec::ProtoHandshake {
+            uuid: "peer-bad-ver".to_string(),
+            device_name: "127.0.0.1".to_string(),
+            device_type: "desktop".to_string(),
+            battery: 50,
+            feature_flag: None,
+            core_version: format!("{}.{}", major + 1, minor),
+        };
+        let payload = serde_json::to_vec(&hs).unwrap();
+        assert_eq!(
+            process_frame(&ctx, None, MessageType::HANDSHAKE, &payload),
+            -1,
+            "跨版本 HANDSHAKE 应被拒绝"
+        );
+    }
+
+    /// PAIRING_INIT 版本不兼容时必须拒绝，且不建立配对会话。
+    #[test]
+    fn pairing_init_with_incompatible_version_is_rejected() {
+        let ctx = Mutex::new(CoreContext::new());
+        let (major, minor) =
+            crate::protocol::version::major_minor(crate::protocol::version::CORE_VERSION).unwrap();
+        // 字段顺序：uuid:coreVersion:spake2_pub:ip:battery:device_type
+        let payload = format!(
+            "peer-bad:{}.{}:spake:127.0.0.1:50:desktop",
+            major + 1,
+            minor
+        );
+        assert_eq!(
+            process_frame(&ctx, None, MessageType::PAIRING_INIT, payload.as_bytes()),
+            -1,
+            "跨版本 PAIRING_INIT 应被拒绝"
+        );
+        assert!(
+            ctx.lock().unwrap().pairing_sessions.is_empty(),
+            "被拒绝的配对不得留下会话"
+        );
     }
 }

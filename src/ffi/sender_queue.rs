@@ -63,10 +63,21 @@ pub unsafe extern "C" fn nrc_enqueue_message(
         }
     }
 
+    // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
+    // 断线期间的通知累积是有益的，恢复后应完整补收（实时状态的丢弃在 state_merge / sender_queue 内处理）。
+    //
+    // 仅对 DATA_NOTIFICATION 注入：其他通道（图标/应用列表/控制等）的模型未声明 `ts`，
+    // 注入会触发 `normalize_or_keep` 的"往返丢字段"兜底并产生无谓告警，且这些通道无时效语义。
+    let plaintext = if hdr == "DATA_NOTIFICATION" {
+        crate::timestamp::inject_ts(text, crate::timestamp::now_ms())
+    } else {
+        text.to_string()
+    };
+
     queue.enqueue(SendItem {
         device_uuid: uuid.to_string(),
         header: hdr.to_string(),
-        plaintext: text.to_string(),
+        plaintext,
         dedup_key: if dk.is_empty() {
             None
         } else {

@@ -335,10 +335,10 @@ fn handle_connection(
             }
         },
         t if t >= 10 && t <= 200 => {
-            // DATA 帧: DATA_TYPE:uuid:pub_key:encrypted_data
+            // DATA 帧: DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data
             match std::str::from_utf8(&first_payload) {
                 Ok(s) => {
-                    let parts: Vec<&str> = s.splitn(4, ':').collect();
+                    let parts: Vec<&str> = s.splitn(5, ':').collect();
                     if parts.len() >= 2 {
                         parts[1].to_string()
                     } else {
@@ -371,10 +371,14 @@ fn handle_connection(
             }
         }
         MessageType::ACCEPT | MessageType::REJECT => {
-            // 控制帧: payload 就是 UUID
+            // REJECT 负载即 UUID；ACCEPT 负载为 uuid:coreVersion:enc_lt_pub，首段才是 UUID
             match std::str::from_utf8(&first_payload) {
                 Ok(s) => {
-                    let uuid = s.trim().to_string();
+                    let uuid = if first_type == MessageType::ACCEPT {
+                        s.trim().split(':').next().unwrap_or("").trim().to_string()
+                    } else {
+                        s.trim().to_string()
+                    };
                     if uuid.is_empty() {
                         log::warn!("控制帧 UUID 为空");
                         return;

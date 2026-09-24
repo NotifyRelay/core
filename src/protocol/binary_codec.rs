@@ -94,6 +94,9 @@ pub struct ProtoHandshake {
     pub battery: i32,
     #[serde(rename = "featureFlag", skip_serializing_if = "Option::is_none")]
     pub feature_flag: Option<Vec<String>>,
+    /// 发送方 core 版本（语义化版本），接收端在建立连接前校验 major.minor 兼容性。
+    #[serde(rename = "coreVersion", default)]
+    pub core_version: String,
 }
 
 /// 编码 ProtoHandshake 为二进制帧
@@ -112,6 +115,7 @@ pub fn encode_handshake_frame(
         device_type: device_type.to_string(),
         battery,
         feature_flag: Some(feature_flag.iter().map(|s| s.to_string()).collect()),
+        core_version: super::version::CORE_VERSION.to_string(),
     };
     let json = serde_json::to_string(&hs).unwrap_or_default();
     // 构造帧: type(1) + length(4) + payload
@@ -135,6 +139,11 @@ pub fn decode_handshake_frame(payload: &[u8]) -> Option<ProtoHandshake> {
 /// `DATA_ICON_REQUEST` 与 `DATA_ICON_RESPONSE` 共用 `PACKAGE_INFO` 消息类型，
 /// 仅靠 msg_type 无法区分方向；此处把原始 header 写入负载，
 /// 使接收端能把图标响应派发为 `IconResponse` 而非 `IconRequest`。
+///
+/// 负载格式：`DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data`。
+/// `coreVersion` 明文携带协议版本，接收端据此在解密前快速判定兼容性；
+/// 密文侧另有 AES-GCM AAD 绑定同一 `major.minor`（见 `crypto::aes::encrypt_with_aad`），
+/// 明文与密文双重约束，跨版本即便公钥正确也无法通信。
 pub fn encode_data_frame(
     header: &str,
     msg_type: u8,
@@ -142,10 +151,14 @@ pub fn encode_data_frame(
     local_pub_key: &str,
     encrypted_payload: &str,
 ) -> Vec<u8> {
-    // DATA 消息的 payload 格式: DATA_TYPE:uuid:pub_key:encrypted_data
+    // DATA 消息的 payload 格式: DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data
     let data_payload = format!(
-        "{}:{}:{}:{}",
-        header, local_uuid, local_pub_key, encrypted_payload
+        "{}:{}:{}:{}:{}",
+        header,
+        local_uuid,
+        super::version::CORE_VERSION,
+        local_pub_key,
+        encrypted_payload
     );
     let mut frame = Vec::with_capacity(5 + data_payload.len());
     frame.push(msg_type);

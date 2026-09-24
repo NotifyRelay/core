@@ -1,4 +1,5 @@
 use super::binary_codec;
+use super::version;
 use crate::protocol::header::{FeatureFlag, MessageType};
 
 pub const DEFAULT_TCP_PORT: u16 = 23333;
@@ -10,14 +11,29 @@ pub fn encode_pairing_init(
     battery: i32,
     device_type: &str,
 ) -> Vec<u8> {
+    // 字段顺序须与 processing::process_pairing_init 解析一致：
+    // uuid : coreVersion : spake2_pub : ip : battery : device_type
     let payload = if battery >= 0 {
         format!(
-            "{}:{}:{}:{}+:{}",
-            uuid, spake2_pub, ip, battery, device_type
+            "{}:{}:{}:{}:{}+:{}",
+            uuid,
+            version::CORE_VERSION,
+            spake2_pub,
+            ip,
+            battery,
+            device_type
         )
     } else {
         // 负数电量（放电）需保留负号：解析端按 i32 解析，abs() 会把 -1 变成 1
-        format!("{}:{}:{}:{}:{}", uuid, spake2_pub, ip, battery, device_type)
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            uuid,
+            version::CORE_VERSION,
+            spake2_pub,
+            ip,
+            battery,
+            device_type
+        )
     };
     binary_codec::encode_pairing_frame(MessageType::PAIRING_INIT, &payload)
 }
@@ -31,17 +47,29 @@ pub fn encode_pairing_resp(
     device_type: &str,
 ) -> Vec<u8> {
     // 字段顺序须与 processing::process_pairing_resp 解析一致：
-    // uuid : spake2_pub : lt_pub : ip : battery : device_type
+    // uuid : coreVersion : spake2_pub : lt_pub : ip : battery : device_type
     let payload = if battery >= 0 {
         format!(
-            "{}:{}:{}:{}:{}+:{}",
-            uuid, spake2_pub, lt_pub, ip, battery, device_type
+            "{}:{}:{}:{}:{}:{}+:{}",
+            uuid,
+            version::CORE_VERSION,
+            spake2_pub,
+            lt_pub,
+            ip,
+            battery,
+            device_type
         )
     } else {
         // 同 encode_pairing_init：负数电量保留负号（abs() 会丢失符号）
         format!(
-            "{}:{}:{}:{}:{}:{}",
-            uuid, spake2_pub, lt_pub, ip, battery, device_type
+            "{}:{}:{}:{}:{}:{}:{}",
+            uuid,
+            version::CORE_VERSION,
+            spake2_pub,
+            lt_pub,
+            ip,
+            battery,
+            device_type
         )
     };
     binary_codec::encode_pairing_frame(MessageType::PAIRING_RESP, &payload)
@@ -56,8 +84,9 @@ pub fn encode_accept(
 ) -> Vec<u8> {
     // 接收方在 ACCEPT 阶段需要发起方的长期公钥以完成长期密钥派生，
     // 否则 device_keys.remote_pub_key 为空，导致 Kotlin 侧 deriveSharedSecret 失败。
-    // 负载格式与配对消息帧一致：uuid:lt_pub_key（base64 不含冒号，splitn(2, ':') 安全）。
-    let payload = format!("{}:{}", uuid, lt_pub_key);
+    // 负载格式与配对消息帧一致：uuid:coreVersion:enc_lt_pub
+    // （base64 不含冒号，splitn(3, ':') 安全）。
+    let payload = format!("{}:{}:{}", uuid, version::CORE_VERSION, lt_pub_key);
     binary_codec::encode_pairing_frame(MessageType::ACCEPT, &payload)
 }
 
@@ -144,4 +173,59 @@ pub fn encode_discovery_response(
     device_type: &str,
 ) -> String {
     encode_discovery_request(uuid, name_b64, port, battery, device_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 帧负载（跳过 5 字节帧头）
+    fn payload(frame: &[u8]) -> String {
+        String::from_utf8_lossy(&frame[5..]).to_string()
+    }
+
+    #[test]
+    fn data_frame_carries_version_in_plaintext() {
+        let frame = encode_data_message("DATA_NOTIFICATION", "uuid-1", "", "enc");
+        let text = payload(&frame);
+        let parts: Vec<&str> = text.splitn(5, ':').collect();
+        assert_eq!(parts.len(), 5, "DATA 帧应为 5 段: {}", text);
+        assert_eq!(parts[0], "DATA_NOTIFICATION");
+        assert_eq!(parts[1], "uuid-1");
+        assert_eq!(parts[2], version::CORE_VERSION);
+        assert_eq!(parts[3], "");
+        assert_eq!(parts[4], "enc");
+    }
+
+    #[test]
+    fn pairing_init_carries_version_as_second_field() {
+        let frame = encode_pairing_init("uuid-a", "spake", "1.2.3.4", 50, "phone");
+        let text = payload(&frame);
+        assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
+    }
+
+    #[test]
+    fn pairing_resp_carries_version_as_second_field() {
+        let frame = encode_pairing_resp("uuid-b", "spake", "enc", "1.2.3.4", 50, "pc");
+        let text = payload(&frame);
+        assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
+    }
+
+    #[test]
+    fn accept_carries_version_as_second_field() {
+        let frame = encode_accept("uuid-a", "enc_lt", "", 0, "");
+        let text = payload(&frame);
+        assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
+    }
+
+    #[test]
+    fn handshake_carries_core_version() {
+        let frame = encode_handshake("uuid-1", "127.0.0.1", 50, "desktop");
+        let text = payload(&frame);
+        assert!(
+            text.contains(&format!("\"coreVersion\":\"{}\"", version::CORE_VERSION)),
+            "HANDSHAKE 必须携带 coreVersion: {}",
+            text
+        );
+    }
 }

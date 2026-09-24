@@ -1,7 +1,7 @@
 use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, with_ctx};
-use crate::{audio_stream, crypto::aes, network, protocol::codec, SafeContext};
+use crate::{audio_stream, crypto::aes, network, protocol::codec, protocol::version, SafeContext};
 
 fn send_control(
     ctx: &crate::CoreContext,
@@ -38,7 +38,9 @@ fn send_control(
         .map(|i| i.uuid.clone())
         .unwrap_or_default();
 
-    if let Ok(encrypted) = aes::encrypt(&key_arr, payload.as_bytes()) {
+    // DATA 通道加密统一绑定 core 版本 AAD（与 sender_queue / process_data 一致）
+    if let Ok(encrypted) = aes::encrypt_with_aad(&key_arr, payload.as_bytes(), &version::data_aad())
+    {
         let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, "", &encrypted);
         let ip = ctx.audio.lock().unwrap().peer_ip.clone();
 

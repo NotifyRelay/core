@@ -20,6 +20,7 @@ pub mod reconnect;
 mod router;
 pub mod sender_queue;
 mod state_merge;
+mod timestamp;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;

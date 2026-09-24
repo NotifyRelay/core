@@ -51,6 +51,21 @@ struct SenderState {
 #[derive(Clone)]
 struct ReceiverState {
     last_full: String,
+    /// 该会话最近一次已应用消息的 `ts`（毫秒 Unix 时间戳）。
+    /// 用于丢弃乱序到达的旧包（网络重排/发送端积压回放），保证接收端只前进不后退。
+    last_ts: i64,
+}
+
+/// 入站实时状态（超级岛 / 媒体）的合并结果。
+///
+/// 必须区分「主动丢弃」与「解析失败」：前者是时间戳系统的正常决策，
+/// 调用方需把该消息视为已消费（不得再走通用 on_data 下发）；
+/// 后者沿用既有兜底（返回 false 交给通用路径）。
+pub enum MergeOutcome {
+    /// 已合并为全量：`(feature_id, 全量json, is_end, need_full)`
+    Merged(String, String, bool, bool),
+    /// 过期包 / 乱序旧包：已被时间戳系统丢弃，调用方应视为已消费
+    Dropped,
 }
 
 pub struct StateMerge {
@@ -147,8 +162,19 @@ impl StateMerge {
                 last_push: now,
             });
 
+        let header = if is_media {
+            "DATA_MEDIAPLAY"
+        } else {
+            "DATA_SUPERISLAND"
+        };
+
+        // 发送端清理：入队前先丢弃该设备同 header 下已过期的实时状态积压
+        // （断线期间累积的 FULL/DELTA），避免恢复连接后按序回放造成"追逐"。
+        // 丢弃过 DELTA 时强制本次为 FULL：接收端基线可能因丢弃而缺字段，FULL 可一次性重建。
+        let purged = queue.purge_stale_realtime(remote_uuid, header);
+
         let first = session.last_full.is_empty();
-        let force = session.force_full_next;
+        let force = session.force_full_next || purged > 0;
 
         let payload = if first || force || is_end {
             build_full_wire(&full, &feature_id, &hash, is_end)
@@ -157,12 +183,8 @@ impl StateMerge {
             let delta = diff_island(&old_val, &full);
             build_delta_wire(&delta, &feature_id, &hash)
         };
-
-        let header = if is_media {
-            "DATA_MEDIAPLAY"
-        } else {
-            "DATA_SUPERISLAND"
-        };
+        // `ts` 由 `SenderQueue::enqueue` 统一注入（wire 层，不进入 canonical/last_full），
+        // 覆盖本路径与保活/重同步等全部实时状态发送点。
         let item = SendItem {
             device_uuid: remote_uuid.to_string(),
             header: header.to_string(),
@@ -191,13 +213,17 @@ impl StateMerge {
         true
     }
 
-    /// 接收端：把解密后的明文（FULL 或 DELTA）合并为全量，返回 (feature_id, 全量json, is_end)。
+    /// 接收端：把解密后的明文（FULL 或 DELTA）合并为全量。
+    ///
+    /// 返回 [`MergeOutcome::Merged`] 携带 `(feature_id, 全量json, is_end, need_full)`；
+    /// 时间戳判定为过期/乱序时返回 [`MergeOutcome::Dropped`]（调用方须视为已消费）；
+    /// 无法解析或无 featureId 时返回 `None`（沿用既有兜底，交给通用路径）。
     pub fn merge_incoming(
         &mut self,
         device_uuid: &str,
         is_media: bool,
         payload: &str,
-    ) -> Option<(String, String, bool, bool)> {
+    ) -> Option<MergeOutcome> {
         let v: Value = serde_json::from_str(payload).ok()?;
         let feature_id = if is_media {
             MEDIA_KEY.to_string()
@@ -213,6 +239,35 @@ impl StateMerge {
         let key = Self::key(device_uuid, &feature_id);
         let is_end = v.get("terminateValue").and_then(|x| x.as_str()) == Some(TERMINATE_VALUE)
             || v.get("terminate").and_then(|x| x.as_bool()) == Some(true);
+
+        // 时间戳丢弃：实时状态（超级岛 / 媒体）必须丢弃过期包与乱序旧包。
+        // 结束包是会话终止信号，不参与丢弃（否则对端卡片/岛会残留）。
+        let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+        if !is_end {
+            if crate::timestamp::is_stale(ts, crate::timestamp::now_ms()) {
+                log::debug!(
+                    "[state_merge] 丢弃过期实时状态 uuid={} fid={} media={} ts={}",
+                    device_uuid,
+                    feature_id,
+                    is_media,
+                    ts
+                );
+                return Some(MergeOutcome::Dropped);
+            }
+            if let Some(r) = self.receivers.get(&key) {
+                if r.last_ts > 0 && ts > 0 && ts < r.last_ts {
+                    log::debug!(
+                        "[state_merge] 丢弃乱序旧包 uuid={} fid={} media={} ts={} last_ts={}",
+                        device_uuid,
+                        feature_id,
+                        is_media,
+                        ts,
+                        r.last_ts
+                    );
+                    return Some(MergeOutcome::Dropped);
+                }
+            }
+        }
 
         let mut need_full = false;
         let new_full = if v.get("type").and_then(|x| x.as_str()) == Some("delta") {
@@ -252,15 +307,20 @@ impl StateMerge {
         if is_end {
             self.receivers.remove(&key);
         } else if !need_full {
-            // 仅在拥有可靠基线（FULL 或有基线的 DELTA 合并结果）时才写入
+            // 仅在拥有可靠基线（FULL 或有基线的 DELTA 合并结果）时才写入；
+            // 同时推进 last_ts，保证后续乱序旧包被丢弃
+            let prev_ts = self.receivers.get(&key).map(|r| r.last_ts).unwrap_or(0);
             self.receivers.insert(
                 key.clone(),
                 ReceiverState {
                     last_full: new_full.clone(),
+                    last_ts: if ts > 0 { ts } else { prev_ts },
                 },
             );
         }
-        Some((feature_id, new_full, is_end, need_full))
+        Some(MergeOutcome::Merged(
+            feature_id, new_full, is_end, need_full,
+        ))
     }
 
     /// 处理来自接收端的 ACK，清除对应发送会话的 pending。
@@ -601,6 +661,9 @@ fn strip_routing(v: &Value) -> String {
         m.remove("featureKeyValue");
         m.remove("hash");
         m.remove("device");
+        // `ts` 是 wire 层时效元数据，由接收端消费后即弃：
+        // 若留在基线与下发内容中，后续全量会携带上一包的过期 ts，造成平台端误判。
+        m.remove("ts");
     }
     serde_json::to_string(&obj).unwrap_or_default()
 }
@@ -809,7 +872,12 @@ pub fn handle_state_message(
             return false;
         };
         match g.state_merge.merge_incoming(uuid, is_media, plaintext) {
-            Some(r) => r,
+            Some(MergeOutcome::Merged(fid, full, is_end, need_full)) => {
+                (fid, full, is_end, need_full)
+            }
+            // 过期/乱序包已被时间戳系统丢弃：必须视为已消费，
+            // 否则会落到通用 on_data 路径把过期状态下发给平台，丢弃形同虚设
+            Some(MergeOutcome::Dropped) => return true,
             None => return false,
         }
     };
@@ -983,14 +1051,17 @@ mod tests {
         let full1 = si_full("t1", "c1");
         let merged1 = {
             let mut r = StateMerge::new();
-            let (_, f, _, _) = r
+            match r
                 .merge_incoming(
                     "devA",
                     false,
                     &build_full_wire(&serde_json::from_str(&full1).unwrap(), "fid", "h1", false),
                 )
-                .unwrap();
-            f
+                .unwrap()
+            {
+                MergeOutcome::Merged(_, f, _, _) => f,
+                MergeOutcome::Dropped => panic!("首次 FULL 不应被丢弃"),
+            }
         };
         assert_eq!(merged1, full1);
     }
@@ -1240,5 +1311,172 @@ mod tests {
             }),
             "重同步后应重发 FULL (MEDIA_PLAY)"
         );
+    }
+
+    // ===== 时间戳系统 =====
+
+    /// 发送端：入队实时状态应自动注入 `ts`（覆盖主动推送与保活等所有路径）。
+    #[test]
+    fn test_realtime_push_injects_timestamp() {
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        assert!(sm.push_state(&q, "devA", false, &si_full("t1", "c1"), false, false));
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 1);
+        let ts = crate::timestamp::extract_ts(&items[0]);
+        assert!(ts.is_some(), "实时状态必须携带 ts: {}", items[0]);
+        assert!(ts.unwrap() > 0);
+    }
+
+    /// 接收端：过期实时状态包必须被丢弃（返回 Dropped，且不建立/不覆盖基线）。
+    #[test]
+    fn test_stale_realtime_state_is_dropped() {
+        let mut sm = StateMerge::new();
+        let stale_ts = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        let full = json!({
+            "packageName": "com.x",
+            "appName": "App",
+            "title": "t1",
+            "text": "c1",
+            "featureKeyValue": "fid",
+            "ts": stale_ts,
+        });
+        let payload = full.to_string();
+        match sm.merge_incoming("devA", false, &payload).unwrap() {
+            MergeOutcome::Dropped => {}
+            MergeOutcome::Merged(..) => panic!("过期包必须被丢弃"),
+        }
+        // 丢弃后不应留下基线：后续带基线的 DELTA 仍会因无基线而请求 FULL
+        let delta = json!({
+            "type": "delta",
+            "featureKeyValue": "fid",
+            "changes": {"title": "t2"},
+            "ts": crate::timestamp::now_ms(),
+        })
+        .to_string();
+        match sm.merge_incoming("devA", false, &delta).unwrap() {
+            MergeOutcome::Merged(_, _, _, need_full) => {
+                assert!(need_full, "丢弃过期包后不应留下可用基线")
+            }
+            MergeOutcome::Dropped => panic!("新包不应被丢弃"),
+        }
+    }
+
+    /// 接收端：乱序旧包（ts 小于该会话已应用 ts）必须被丢弃，保证只前进不后退。
+    #[test]
+    fn test_out_of_order_old_packet_is_dropped() {
+        let mut sm = StateMerge::new();
+        let now = crate::timestamp::now_ms();
+        let newer = json!({
+            "packageName": "com.x",
+            "appName": "App",
+            "title": "new",
+            "text": "c",
+            "featureKeyValue": "fid",
+            "ts": now,
+        })
+        .to_string();
+        match sm.merge_incoming("devA", false, &newer).unwrap() {
+            MergeOutcome::Merged(..) => {}
+            MergeOutcome::Dropped => panic!("首个新包不应被丢弃"),
+        }
+
+        let older = json!({
+            "packageName": "com.x",
+            "appName": "App",
+            "title": "old",
+            "text": "c",
+            "featureKeyValue": "fid",
+            "ts": now - 1000,
+        })
+        .to_string();
+        match sm.merge_incoming("devA", false, &older).unwrap() {
+            MergeOutcome::Dropped => {}
+            MergeOutcome::Merged(..) => panic!("乱序旧包必须被丢弃"),
+        }
+    }
+
+    /// 结束包不参与时间戳丢弃：即便 ts 过期也必须送达（否则对端卡片/岛残留）。
+    #[test]
+    fn test_end_packet_bypasses_staleness() {
+        let mut sm = StateMerge::new();
+        let stale_ts = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        let end = json!({
+            "featureKeyValue": "fid",
+            "terminateValue": TERMINATE_VALUE,
+            "terminate": true,
+            "ts": stale_ts,
+        })
+        .to_string();
+        match sm.merge_incoming("devA", false, &end).unwrap() {
+            MergeOutcome::Merged(_, _, is_end, _) => assert!(is_end, "结束标记应保留"),
+            MergeOutcome::Dropped => panic!("结束包不得被时间戳丢弃"),
+        }
+    }
+
+    /// 发送端：断线积压的过期实时状态在下次推送前被清理，并强制本次为 FULL。
+    #[test]
+    fn test_sender_purges_stale_backlog_and_forces_full() {
+        let q = SenderQueue::new();
+        let mut sm = StateMerge::new();
+        // 首次推送建立基线并清空队列
+        assert!(sm.push_state(&q, "devA", true, &si_full("t1", "c1"), false, false));
+        q.test_drain_plaintexts();
+
+        // 模拟断线期间积压：手工入队两条过期媒体状态。
+        // 使用 DELTA 负载：全量项会按 coalesce_key 相互替换（只留最新），
+        // 而增量项依赖前序消息、按设计不替换，故用其验证"多条积压"被整体清理。
+        let stale_ts = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        for title in ["stale1", "stale2"] {
+            let payload = json!({
+                "type": "delta",
+                "featureKeyValue": MEDIA_KEY,
+                "changes": {"title": title},
+                "ts": stale_ts,
+            })
+            .to_string();
+            q.enqueue(SendItem {
+                device_uuid: "devA".to_string(),
+                header: "DATA_MEDIAPLAY".to_string(),
+                plaintext: payload,
+                dedup_key: None,
+                retries_left: 0,
+                coalesce_key: None,
+            });
+        }
+        assert_eq!(q.pending_count(), 2, "积压应已入队");
+
+        // 新状态推送：过期积压被清理，且本次强制 FULL
+        assert!(sm.push_state(&q, "devA", true, &si_full("t2", "c2"), false, false));
+        let items = q.test_drain_plaintexts();
+        assert!(
+            items
+                .iter()
+                .all(|p| !p.contains("stale1") && !p.contains("stale2")),
+            "过期积压必须被清理: {:?}",
+            items
+        );
+        assert!(
+            items
+                .iter()
+                .any(|p| p.contains("\"type\":\"MEDIA_PLAY\"") && p.contains("t2")),
+            "清理积压后本次应发送 FULL: {:?}",
+            items
+        );
+    }
+
+    /// 通知（非实时）不参与丢弃：过期 ts 的通知仍应正常合并下发。
+    #[test]
+    fn test_notification_not_dropped_by_timestamp() {
+        let v = crate::state_merge::parse_notification_inbound(
+            &json!({
+                "packageName": "com.x",
+                "title": "t",
+                "time": 1,
+                "ts": crate::timestamp::now_ms() - 600_000,
+            })
+            .to_string(),
+        );
+        assert_eq!(v["title"], "t", "通知解析不受时间戳影响");
     }
 }

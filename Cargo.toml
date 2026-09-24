@@ -1,6 +1,8 @@
 [package]
 name = "notify-relay-core"
-version = "0.1.0"
+# 版本号参与全链路协议兼容校验（仅比较 major.minor）与 DATA 通道 AES-GCM AAD 绑定：
+# 跨 major.minor 的 core 之间即便公钥正确也无法解密，从而阻断跨版本通信。
+version = "0.2.0"
 edition = "2021"
 
 [lib]
