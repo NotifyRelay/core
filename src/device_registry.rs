@@ -13,6 +13,36 @@ pub fn now_sec() -> i64 {
 /// 未知电量约定值：超出 [-100,100] 区间的值均视为未知
 pub const BATTERY_UNKNOWN: i32 = -101;
 
+/// 电量阈值：|v| 超过该值视为未知（单一来源，平台端不再各自硬编码 100）
+pub const BATTERY_THRESHOLD: i32 = 100;
+
+/// 未识别设备类型占位值（core 派生 has_known_device_type 的单一来源）
+pub const UNKNOWN_DEVICE_TYPE: &str = "unknown";
+
+/// 电量是否未知：|v| > 阈值
+pub fn battery_is_unknown(battery: i32) -> bool {
+    battery.abs() > BATTERY_THRESHOLD
+}
+
+/// 电量百分比；未知时为 -1
+pub fn battery_percent(battery: i32) -> i32 {
+    if battery_is_unknown(battery) {
+        -1
+    } else {
+        battery.abs()
+    }
+}
+
+/// 是否充电中；电量未知时为 false
+pub fn is_charging(battery: i32) -> bool {
+    !battery_is_unknown(battery) && battery >= 0
+}
+
+/// 设备类型是否有效（非空白且非 unknown 占位）
+pub fn has_known_device_type(device_type: &str) -> bool {
+    !device_type.trim().is_empty() && device_type != UNKNOWN_DEVICE_TYPE
+}
+
 /// 注册设备状态（平台端可读快照，不含 displayName 等 UI 元数据）
 #[derive(Debug, Clone)]
 pub struct RegisteredDevice {
@@ -75,7 +105,7 @@ impl DeviceRegistry {
                 entry.port = port;
             }
             // 未知电量（超出 [-100,100]）不覆盖已有值
-            if battery.abs() <= 100 {
+            if battery.abs() <= BATTERY_THRESHOLD {
                 entry.battery = battery;
             }
             if !device_type.is_empty() {
@@ -121,7 +151,7 @@ impl DeviceRegistry {
                 entry.port = port;
             }
             // 未知电量（超出 [-100,100]）不覆盖已有值
-            if battery.abs() <= 100 {
+            if battery.abs() <= BATTERY_THRESHOLD {
                 entry.battery = battery;
             }
             if !device_type.is_empty() {
@@ -193,5 +223,48 @@ impl DeviceRegistry {
 impl Default for DeviceRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn battery_is_unknown_threshold() {
+        assert!(!battery_is_unknown(0));
+        assert!(!battery_is_unknown(100));
+        assert!(!battery_is_unknown(-100));
+        assert!(battery_is_unknown(101));
+        assert!(battery_is_unknown(-101));
+        assert!(battery_is_unknown(BATTERY_UNKNOWN));
+    }
+
+    #[test]
+    fn battery_percent_known_and_unknown() {
+        assert_eq!(battery_percent(80), 80);
+        assert_eq!(battery_percent(-50), 50);
+        assert_eq!(battery_percent(100), 100);
+        assert_eq!(battery_percent(-100), 100);
+        assert_eq!(battery_percent(BATTERY_UNKNOWN), -1);
+        assert_eq!(battery_percent(200), -1);
+    }
+
+    #[test]
+    fn is_charging_sign_and_unknown() {
+        assert!(is_charging(80));
+        assert!(is_charging(0)); // 0% 视为充电中（battery >= 0，与两端既有语义一致）
+        assert!(!is_charging(-50));
+        assert!(!is_charging(BATTERY_UNKNOWN)); // 未知 → false
+        assert!(!is_charging(200)); // 未知 → false
+    }
+
+    #[test]
+    fn has_known_device_type_cases() {
+        assert!(has_known_device_type("android"));
+        assert!(has_known_device_type("pc"));
+        assert!(!has_known_device_type(UNKNOWN_DEVICE_TYPE));
+        assert!(!has_known_device_type(""));
+        assert!(!has_known_device_type("   "));
     }
 }

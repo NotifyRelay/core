@@ -10,7 +10,8 @@ const DEFAULT_AUTHED_ONLINE_MS: i64 = 12_000;
 const DEFAULT_UNAUTHED_ONLINE_MS: i64 = 20_000;
 
 /// 获取设备状态快照（JSON 数组）
-/// 每项: {uuid, name, ip, port, battery, deviceType, lastSeen, connected, paired, online}
+/// 每项: {uuid, name, ip, port, battery, deviceType, lastSeen, connected, paired, online,
+///        batteryPercent, isCharging, batteryUnknown, hasKnownDeviceType}
 /// online = now - lastSeen <= 已配对 ? authed_timeout_ms : unauthed_timeout_ms
 /// 在线判定完全基于 lastSeen 时效（mark_connected 已刷新 lastSeen），
 /// 避免 TCP 半开连接（对端断网无 FIN/RST）导致 connected 粘滞而永远在线；
@@ -143,6 +144,10 @@ pub unsafe extern "C" fn nrc_get_device_list(
                     "connected": d.connected,
                     "paired": is_paired,
                     "online": online,
+                    "batteryPercent": crate::device_registry::battery_percent(d.battery),
+                    "isCharging": crate::device_registry::is_charging(d.battery),
+                    "batteryUnknown": crate::device_registry::battery_is_unknown(d.battery),
+                    "hasKnownDeviceType": crate::device_registry::has_known_device_type(&d.device_type),
                 }))
             })
             .collect();

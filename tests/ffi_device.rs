@@ -107,6 +107,11 @@ fn test_device_list_known_device_offline_placeholder() {
     assert_eq!(d["online"], false); // lastSeen=0 视为离线
     assert_eq!(d["lastSeen"], 0);
     assert_eq!(d["deviceType"], "");
+    // core 派生字段（P1-6）：未知电量占位 → 派生值
+    assert_eq!(d["batteryPercent"], -1);
+    assert_eq!(d["isCharging"], false);
+    assert_eq!(d["batteryUnknown"], true);
+    assert_eq!(d["hasKnownDeviceType"], false); // deviceType 为空
 }
 
 #[test]
