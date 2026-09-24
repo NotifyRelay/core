@@ -99,3 +99,25 @@ pub unsafe extern "C" fn nrc_parse_superisland_inbound(
     let result = crate::state_merge::parse_superisland_inbound(uuid, pkg, full);
     to_cstr(&result.to_string())
 }
+
+/// 通知入站解析 FFI：纯字符串输入/输出，无 ctx。
+///
+/// 平台传入 `full_json`（解密后的通知全量 JSON），返回归一结构 JSON 字符串。
+/// 调用方须用 `nrc_free_string` 释放返回的 char*。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_parse_notification_inbound(full_json: *const c_char) -> *mut c_char {
+    let full = unsafe { from_cstr(full_json) };
+    let result = crate::state_merge::parse_notification_inbound(full);
+    to_cstr(&result.to_string())
+}
+
+/// 媒体入站解析 FFI：纯字符串输入/输出，无 ctx。
+///
+/// 平台传入 `full_json`（解密后的媒体全量 JSON），返回归一结构 JSON 字符串。
+/// 调用方须用 `nrc_free_string` 释放返回的 char*。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_parse_media_inbound(full_json: *const c_char) -> *mut c_char {
+    let full = unsafe { from_cstr(full_json) };
+    let result = crate::state_merge::parse_media_inbound(full);
+    to_cstr(&result.to_string())
+}

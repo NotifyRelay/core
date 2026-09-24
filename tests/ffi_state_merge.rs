@@ -305,3 +305,152 @@ fn test_parse_si_invalid_json_returns_null() {
     let v = parse_superisland("uuid-1", "com.test", "not json");
     assert!(v.is_null(), "非法 JSON 应返回 null");
 }
+
+// ===== nrc_parse_notification_inbound 测试 =====
+
+fn parse_notification(full_json: &str) -> serde_json::Value {
+    let f = cstr(full_json);
+    let r = unsafe { ffi::state_merge::nrc_parse_notification_inbound(f) };
+    assert!(!r.is_null(), "返回指针不应为 null");
+    let s = unsafe { CString::from_raw(r) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    serde_json::from_str(&s).unwrap_or_else(|_| panic!("应返回合法 JSON: {}", s))
+}
+
+#[test]
+fn test_parse_notif_basic() {
+    let json =
+        r#"{"packageName":"com.test","appName":"Test","title":"t1","text":"c1","time":1234567890}"#;
+    let v = parse_notification(json);
+    assert_eq!(v["packageName"], "com.test");
+    assert_eq!(v["appName"], "Test");
+    assert_eq!(v["title"], "t1");
+    assert_eq!(v["text"], "c1");
+    assert_eq!(v["time"], 1234567890);
+}
+
+#[test]
+fn test_parse_notif_missing_fields_default() {
+    let v = parse_notification(r#"{}"#);
+    assert!(v["packageName"].is_null(), "缺失 packageName 应为 null");
+    assert!(v["appName"].is_null(), "缺失 appName 应为 null");
+    assert!(v["title"].is_null(), "缺失 title 应为 null");
+    assert!(v["text"].is_null(), "缺失 text 应为 null");
+    assert_eq!(v["time"], 0);
+}
+
+#[test]
+fn test_parse_notif_missing_time_defaults_zero() {
+    let v = parse_notification(r#"{"packageName":"com.test","title":"t1"}"#);
+    assert_eq!(v["time"], 0, "缺失 time 应为 0（平台自行替换为当前时间）");
+}
+
+#[test]
+fn test_parse_notif_invalid_json_returns_null() {
+    let v = parse_notification("not json");
+    assert!(v.is_null(), "非法 JSON 应返回 null");
+}
+
+#[test]
+fn test_parse_notif_non_object_returns_null() {
+    let v = parse_notification(r#"[1,2,3]"#);
+    assert!(v.is_null(), "非 JSON 对象应返回 null");
+}
+
+// ===== nrc_parse_media_inbound 测试 =====
+
+fn parse_media(full_json: &str) -> serde_json::Value {
+    let f = cstr(full_json);
+    let r = unsafe { ffi::state_merge::nrc_parse_media_inbound(f) };
+    assert!(!r.is_null(), "返回指针不应为 null");
+    let s = unsafe { CString::from_raw(r) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    serde_json::from_str(&s).unwrap_or_else(|_| panic!("应返回合法 JSON: {}", s))
+}
+
+#[test]
+fn test_parse_media_basic() {
+    let json = r#"{"mediaType":"MUSIC","packageName":"com.music","appName":"Music","title":"t1","text":"c1","coverUrl":"data:image/jpeg;base64,abc","isPlaying":true,"time":1234567890}"#;
+    let v = parse_media(json);
+    assert_eq!(v["mediaType"], "MUSIC");
+    assert_eq!(v["packageName"], "com.music");
+    assert_eq!(v["appName"], "Music");
+    assert_eq!(v["title"], "t1");
+    assert_eq!(v["text"], "c1");
+    assert_eq!(v["coverImage"], "data:image/jpeg;base64,abc");
+    assert_eq!(v["isPlaying"], true);
+    assert_eq!(v["isEnd"], false);
+    assert_eq!(v["time"], 1234567890);
+}
+
+#[test]
+fn test_parse_media_is_end_by_media_type() {
+    let v = parse_media(r#"{"mediaType":"END"}"#);
+    assert_eq!(v["isEnd"], true);
+}
+
+#[test]
+fn test_parse_media_is_end_by_terminate_value() {
+    let v = parse_media(r#"{"terminateValue":"__END__"}"#);
+    assert_eq!(v["isEnd"], true);
+}
+
+#[test]
+fn test_parse_media_is_end_case_insensitive() {
+    let v = parse_media(r#"{"mediaType":"end"}"#);
+    assert_eq!(v["isEnd"], true, "mediaType END 应忽略大小写");
+}
+
+#[test]
+fn test_parse_media_not_end() {
+    let v = parse_media(r#"{"mediaType":"MUSIC","terminateValue":"other"}"#);
+    assert_eq!(v["isEnd"], false);
+}
+
+#[test]
+fn test_parse_media_is_playing_default_true() {
+    let v = parse_media(r#"{"title":"t1"}"#);
+    assert_eq!(v["isPlaying"], true, "缺失 isPlaying 应缺省为 true");
+}
+
+#[test]
+fn test_parse_media_is_playing_false() {
+    let v = parse_media(r#"{"isPlaying":false}"#);
+    assert_eq!(v["isPlaying"], false);
+}
+
+#[test]
+fn test_parse_media_cover_image_pure_passthrough() {
+    let v = parse_media(r#"{"coverUrl":"http://example.com/cover.jpg"}"#);
+    assert_eq!(v["coverImage"], "http://example.com/cover.jpg");
+}
+
+#[test]
+fn test_parse_media_missing_fields_default() {
+    let v = parse_media(r#"{}"#);
+    assert!(v["mediaType"].is_null(), "缺失 mediaType 应为 null");
+    assert!(v["packageName"].is_null(), "缺失 packageName 应为 null");
+    assert!(v["appName"].is_null(), "缺失 appName 应为 null");
+    assert!(v["title"].is_null(), "缺失 title 应为 null");
+    assert!(v["text"].is_null(), "缺失 text 应为 null");
+    assert!(v["coverImage"].is_null(), "缺失 coverImage 应为 null");
+    assert_eq!(v["isPlaying"], true);
+    assert_eq!(v["isEnd"], false);
+    assert_eq!(v["time"], 0);
+}
+
+#[test]
+fn test_parse_media_invalid_json_returns_null() {
+    let v = parse_media("not json");
+    assert!(v.is_null(), "非法 JSON 应返回 null");
+}
+
+#[test]
+fn test_parse_media_non_object_returns_null() {
+    let v = parse_media(r#"[1,2,3]"#);
+    assert!(v.is_null(), "非 JSON 对象应返回 null");
+}

@@ -478,6 +478,86 @@ pub fn parse_superisland_inbound(uuid: &str, pkg: &str, full_json: &str) -> Valu
     })
 }
 
+/// 通知入站解析：从全量 JSON 抽取并归一通知字段。
+///
+/// 输入 `full_json`（解密后的通知全量 JSON），返回归一结构：
+/// - `packageName`/`appName`/`title`/`text`：字符串，空时为 `null`（与 parse_superisland_inbound 对齐）
+/// - `time`：i64，缺省 `0`（由平台自行替换为当前时间）
+///
+/// 非 JSON 对象时返回 `Value::Null`。
+pub fn parse_notification_inbound(full_json: &str) -> Value {
+    let v: Value = match serde_json::from_str::<Value>(full_json) {
+        Ok(v) if v.is_object() => v,
+        _ => return Value::Null,
+    };
+    let obj = v.as_object().expect("checked is_object");
+
+    let opt_str = |key: &str| -> Value {
+        match obj.get(key).and_then(|x| x.as_str()) {
+            Some(s) if !s.is_empty() => Value::String(s.to_string()),
+            _ => Value::Null,
+        }
+    };
+    let time = obj.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
+
+    json!({
+        "packageName": opt_str("packageName"),
+        "appName": opt_str("appName"),
+        "title": opt_str("title"),
+        "text": opt_str("text"),
+        "time": time,
+    })
+}
+
+/// 媒体入站解析：从全量 JSON 抽取并归一媒体字段。
+///
+/// 输入 `full_json`（解密后的媒体全量 JSON），返回归一结构：
+/// - `mediaType`/`packageName`/`appName`/`title`/`text`/`coverImage`：字符串，空时为 `null`
+/// - `isPlaying`：bool，缺省 `true`
+/// - `time`：i64，缺省 `0`（由平台自行替换为当前时间）
+/// - `isEnd`：`mediaType` 忽略大小写等于 `"END"` 或 `terminateValue == TERMINATE_VALUE`
+///
+/// 非 JSON 对象时返回 `Value::Null`。
+pub fn parse_media_inbound(full_json: &str) -> Value {
+    let v: Value = match serde_json::from_str::<Value>(full_json) {
+        Ok(v) if v.is_object() => v,
+        _ => return Value::Null,
+    };
+    let obj = v.as_object().expect("checked is_object");
+
+    let opt_str = |key: &str| -> Value {
+        match obj.get(key).and_then(|x| x.as_str()) {
+            Some(s) if !s.is_empty() => Value::String(s.to_string()),
+            _ => Value::Null,
+        }
+    };
+
+    let media_type = obj.get("mediaType").and_then(|x| x.as_str()).unwrap_or("");
+    let is_playing = obj
+        .get("isPlaying")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
+    let time = obj.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
+    let terminate_value = obj
+        .get("terminateValue")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+
+    let is_end = media_type.eq_ignore_ascii_case("END") || terminate_value == TERMINATE_VALUE;
+
+    json!({
+        "mediaType": opt_str("mediaType"),
+        "packageName": opt_str("packageName"),
+        "appName": opt_str("appName"),
+        "title": opt_str("title"),
+        "text": opt_str("text"),
+        "coverImage": opt_str("coverUrl"),
+        "isPlaying": is_playing,
+        "isEnd": is_end,
+        "time": time,
+    })
+}
+
 // ===== 内部辅助 =====
 
 fn build_full_wire(full: &Value, feature_id: &str, hash: &str, is_end: bool) -> String {
