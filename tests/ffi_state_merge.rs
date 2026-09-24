@@ -194,3 +194,114 @@ fn test_media_resync_sender_path() {
     // 再次推送全量（接收端重同步请求后，发送端应经 force_full_next 重发 FULL 而非 delta）
     assert_eq!(push_media(&ctx, queue_handle, "dev-1", FULL_STATE, 0, 0), 0);
 }
+
+// ===== nrc_parse_superisland_inbound 测试 =====
+
+fn parse_superisland(uuid: &str, pkg: &str, full_json: &str) -> serde_json::Value {
+    let u = cstr(uuid);
+    let p = cstr(pkg);
+    let f = cstr(full_json);
+    let r = unsafe { ffi::state_merge::nrc_parse_superisland_inbound(u, p, f) };
+    unsafe {
+        free_cstr(u);
+        free_cstr(p);
+    }
+    assert!(!r.is_null(), "返回指针不应为 null");
+    let s = unsafe { CString::from_raw(r) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    serde_json::from_str(&s).unwrap_or_else(|_| panic!("应返回合法 JSON: {}", s))
+}
+
+#[test]
+fn test_parse_si_basic() {
+    let wire = r#"{"packageName":"com.test","appName":"Test","title":"t1","text":"c1","param_v2_raw":"{\"k\":1}","featureKeyValue":"fid-abc","pics":{"icon":"base64data","empty":"","num":123},"type":"SUPERISLAND","hash":"x"}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert_eq!(v["featureId"], "fid-abc");
+    assert_eq!(v["packageName"], "com.test");
+    assert_eq!(v["appName"], "Test");
+    assert_eq!(v["title"], "t1");
+    assert_eq!(v["text"], "c1");
+    assert_eq!(v["paramV2Raw"], r#"{"k":1}"#);
+    assert_eq!(v["isEnd"], false);
+    assert_eq!(v["sourceKey"], "uuid-1|com.test|fid-abc");
+    // pics：仅保留非空 string 值（"empty" 空串与 "num" 非字符串被过滤）
+    assert_eq!(v["pics"]["icon"], "base64data");
+    assert!(v["pics"].get("empty").is_none() || v["pics"]["empty"].is_null());
+    assert!(v["pics"].get("num").is_none() || v["pics"]["num"].is_null());
+}
+
+#[test]
+fn test_parse_si_is_end() {
+    let wire = r#"{"featureKeyValue":"fid","terminateValue":"__END__"}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert_eq!(v["isEnd"], true);
+    assert_eq!(v["featureId"], "fid");
+}
+
+#[test]
+fn test_parse_si_not_end() {
+    let wire = r#"{"featureKeyValue":"fid","terminateValue":"other"}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert_eq!(v["isEnd"], false);
+}
+
+#[test]
+fn test_parse_si_feature_id_fallback() {
+    // 无 featureKeyValue → 回退 compute_feature_id_impl（sha1 hex，40 字符）
+    let wire = r#"{"packageName":"com.test","title":"t1","text":"c1"}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    let fid = v["featureId"].as_str().expect("featureId 应为字符串");
+    assert_eq!(fid.len(), 40, "sha1 hex 应为 40 字符");
+    assert!(fid.chars().all(|c| c.is_ascii_hexdigit()), "应为 hex");
+    // sourceKey 仍含三段
+    assert_eq!(v["sourceKey"], format!("uuid-1|com.test|{}", fid));
+}
+
+#[test]
+fn test_parse_si_feature_id_whitespace_falls_back() {
+    // featureKeyValue 为纯空白 → 视为缺失，走回退（对齐 Android isNullOrBlank）
+    let wire = r#"{"packageName":"com.test","featureKeyValue":"   "}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    let fid = v["featureId"].as_str().expect("featureId 应为字符串");
+    assert_eq!(fid.len(), 40, "空白 featureKeyValue 应走回退");
+}
+
+#[test]
+fn test_parse_si_source_key_format() {
+    let wire = r#"{"featureKeyValue":"fid"}"#;
+    let v = parse_superisland("uuid-1", "com.mapped", wire);
+    assert_eq!(v["sourceKey"], "uuid-1|com.mapped|fid");
+}
+
+#[test]
+fn test_parse_si_null_fields_when_missing() {
+    let wire = r#"{"packageName":"com.test"}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert!(v["title"].is_null(), "缺失 title 应为 null");
+    assert!(v["text"].is_null(), "缺失 text 应为 null");
+    assert!(v["paramV2Raw"].is_null(), "缺失 paramV2Raw 应为 null");
+    assert_eq!(v["appName"], "", "缺失 appName 应为空串");
+}
+
+#[test]
+fn test_parse_si_param_v2_raw_blank_is_null() {
+    let wire = r#"{"packageName":"com.test","param_v2_raw":"   "}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert!(v["paramV2Raw"].is_null(), "纯空白 paramV2Raw 应为 null");
+}
+
+#[test]
+fn test_parse_si_pics_empty_string_filtered() {
+    let wire = r#"{"featureKeyValue":"fid","pics":{"keep":"val","drop":""}}"#;
+    let v = parse_superisland("uuid-1", "com.test", wire);
+    assert_eq!(v["pics"]["keep"], "val");
+    assert!(v["pics"].get("drop").is_none() || v["pics"]["drop"].is_null());
+}
+
+#[test]
+fn test_parse_si_invalid_json_returns_null() {
+    let v = parse_superisland("uuid-1", "com.test", "not json");
+    assert!(v.is_null(), "非法 JSON 应返回 null");
+}

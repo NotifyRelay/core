@@ -26,6 +26,9 @@ const SI_HEARTBEAT_MS: u64 = 8_000;
 const MEDIA_HEARTBEAT_MS: u64 = 6_000;
 const MEDIA_KEY: &str = "media_global";
 
+/// 超级岛结束哨兵值，双端统一以此判定 isEnd。
+pub const TERMINATE_VALUE: &str = "__END__";
+
 fn sha256_hex(s: &str) -> String {
     use sha2::Digest;
     let h = sha2::Sha256::digest(s.as_bytes());
@@ -208,7 +211,7 @@ impl StateMerge {
             return None;
         }
         let key = Self::key(device_uuid, &feature_id);
-        let is_end = v.get("terminateValue").and_then(|x| x.as_str()) == Some("__END__")
+        let is_end = v.get("terminateValue").and_then(|x| x.as_str()) == Some(TERMINATE_VALUE)
             || v.get("terminate").and_then(|x| x.as_bool()) == Some(true);
 
         let mut need_full = false;
@@ -378,6 +381,103 @@ impl StateMerge {
     }
 }
 
+/// 超级岛入站解析：从全量/wire JSON 抽取展示用归一结构（纯函数，无 ctx）。
+///
+/// 将双端各自重复的字段抽取、featureId 计算、isEnd 判定、sourceKey 拼装统一到 core，
+/// 平台只需传入 `uuid`（来自 on_data 回调，不在 wire 内）与 `pkg`（已解析的包名：
+/// Android 传映射后 mappedPkg，Win 传原始 packageName）即可获得归一结构。
+///
+/// 归一结构字段：
+/// - `featureId`：优先 `featureKeyValue`，否则 `compute_feature_id_impl(packageName, paramV2Raw, title, text, "")`
+/// - `packageName` / `appName`：原始字符串（缺省 ""）
+/// - `title` / `text`：非空字符串，空则 null
+/// - `paramV2Raw`：非空白字符串，空白则 null
+/// - `pics`：`{key: value}` 仅保留非空 string 值
+/// - `isEnd`：`terminateValue == TERMINATE_VALUE`
+/// - `sourceKey`：`uuid|pkg` 恒含，`featureId` 非空时追加（与 Android listOfNotNull 对齐）
+pub fn parse_superisland_inbound(uuid: &str, pkg: &str, full_json: &str) -> Value {
+    let v: Value = match serde_json::from_str::<Value>(full_json) {
+        Ok(v) if v.is_object() => v,
+        _ => return Value::Null,
+    };
+    let obj = v.as_object().expect("checked is_object");
+
+    let package_name = obj
+        .get("packageName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let app_name = obj.get("appName").and_then(|x| x.as_str()).unwrap_or("");
+    let title_raw = obj.get("title").and_then(|x| x.as_str()).unwrap_or("");
+    let text_raw = obj.get("text").and_then(|x| x.as_str()).unwrap_or("");
+    let param_raw = obj
+        .get("param_v2_raw")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let feature_key_value = obj
+        .get("featureKeyValue")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let terminate_value = obj
+        .get("terminateValue")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+
+    let feature_id = if !feature_key_value.trim().is_empty() {
+        feature_key_value.to_string()
+    } else {
+        crate::ffi::utils::compute_feature_id_impl(package_name, param_raw, title_raw, text_raw, "")
+    };
+
+    let is_end = terminate_value == TERMINATE_VALUE;
+
+    // pics：仅保留非空 string 值
+    let mut pics_map = Map::new();
+    if let Some(pics_obj) = obj.get("pics").and_then(|p| p.as_object()) {
+        for (k, val) in pics_obj {
+            if let Some(s) = val.as_str() {
+                if !s.is_empty() {
+                    pics_map.insert(k.clone(), Value::String(s.to_string()));
+                }
+            }
+        }
+    }
+
+    // sourceKey：uuid|pkg 恒含，featureId 非空白时追加（与 Android listOfNotNull + isNotBlank 对齐）
+    let mut parts = vec![uuid.to_string(), pkg.to_string()];
+    if !feature_id.trim().is_empty() {
+        parts.push(feature_id.clone());
+    }
+    let source_key = parts.join("|");
+
+    let title_val = if title_raw.is_empty() {
+        Value::Null
+    } else {
+        Value::String(title_raw.to_string())
+    };
+    let text_val = if text_raw.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text_raw.to_string())
+    };
+    let param_val = if param_raw.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(param_raw.to_string())
+    };
+
+    json!({
+        "featureId": feature_id,
+        "packageName": package_name,
+        "appName": app_name,
+        "title": title_val,
+        "text": text_val,
+        "paramV2Raw": param_val,
+        "pics": Value::Object(pics_map),
+        "isEnd": is_end,
+        "sourceKey": source_key,
+    })
+}
+
 // ===== 内部辅助 =====
 
 fn build_full_wire(full: &Value, feature_id: &str, hash: &str, is_end: bool) -> String {
@@ -395,7 +495,7 @@ fn build_full_wire(full: &Value, feature_id: &str, hash: &str, is_end: bool) -> 
         m.insert("featureKeyValue".into(), json!(feature_id));
         m.insert("hash".into(), json!(hash));
         if is_end {
-            m.insert("terminateValue".into(), json!("__END__"));
+            m.insert("terminateValue".into(), json!(TERMINATE_VALUE));
             m.insert("terminate".into(), json!(true));
         } else {
             m.remove("terminate");

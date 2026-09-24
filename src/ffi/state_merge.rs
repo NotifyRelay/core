@@ -9,7 +9,7 @@
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 
-use crate::ffi::common::from_cstr;
+use crate::ffi::common::{from_cstr, to_cstr};
 use crate::sender_queue::SenderQueue;
 use crate::SafeContext;
 
@@ -80,4 +80,22 @@ fn push_state_impl(
     } else {
         -1
     }
+}
+
+/// 超级岛入站解析 FFI：纯字符串输入/输出，无 ctx。
+///
+/// 平台传入 `device_uuid`（来自 on_data 回调，不在 wire 内）、`pkg`（已解析包名：
+/// Android 传映射后 mappedPkg，Win 传原始 packageName）与 `full_json`（wire/全量 JSON），
+/// 返回归一结构 JSON 字符串。调用方须用 `nrc_free_string` 释放返回的 char*。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_parse_superisland_inbound(
+    device_uuid: *const c_char,
+    pkg: *const c_char,
+    full_json: *const c_char,
+) -> *mut c_char {
+    let uuid = unsafe { from_cstr(device_uuid) };
+    let pkg = unsafe { from_cstr(pkg) };
+    let full = unsafe { from_cstr(full_json) };
+    let result = crate::state_merge::parse_superisland_inbound(uuid, pkg, full);
+    to_cstr(&result.to_string())
 }
