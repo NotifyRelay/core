@@ -215,11 +215,20 @@ impl ReconnectState {
                             codec::DEFAULT_TCP_PORT,
                             5000,
                         );
-                        if resp.is_some() {
-                            // 握手成功即视为在线：记录心跳时间，避免短连接协议下无限重复握手
-                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                            if let Ok(mut guard) = ctx.lock() {
-                                guard.heartbeat.record(&uuid);
+                        if let Some((msg_type, payload)) = resp {
+                            // REJECT 表示对端明确拒绝（如 core 版本不兼容）：不得记为在线，
+                            // 否则不兼容设备会被反复判定为已连接，掩盖真实失败原因。
+                            if msg_type == crate::protocol::header::MessageType::REJECT {
+                                let reason = codec::decode_reject_payload(&payload)
+                                    .map(|(_, r)| r)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                log::warn!("重连: 对端拒绝握手 uuid={}, reason={}", uuid, reason);
+                            } else {
+                                // 握手成功即视为在线：记录心跳时间，避免短连接协议下无限重复握手
+                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                                if let Ok(mut guard) = ctx.lock() {
+                                    guard.heartbeat.record(&uuid);
+                                }
                             }
                         }
 

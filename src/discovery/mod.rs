@@ -137,7 +137,20 @@ impl DiscoveryState {
                             codec::DEFAULT_TCP_PORT,
                             3000,
                         );
-                        if resp.is_some() {
+                        if let Some((msg_type, payload)) = resp {
+                            // REJECT 表示对端明确拒绝（如 core 版本不兼容）：
+                            // 不能视为"在线"，否则设备会被错误标记为可用并反复握手。
+                            if msg_type == crate::protocol::header::MessageType::REJECT {
+                                let reason = codec::decode_reject_payload(&payload)
+                                    .map(|(_, r)| r)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                log::warn!(
+                                    "发现扫描: 对端拒绝握手 uuid={}, reason={}",
+                                    uuid,
+                                    reason
+                                );
+                                continue;
+                            }
                             // 握手成功即视为在线：记录心跳时间，避免短连接协议下每轮扫描重复握手
                             let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
                             if let Ok(mut guard) = ctx.lock() {

@@ -40,6 +40,66 @@ fn fire_pairing_cb(
     }
 }
 
+/// 主动回带原因的 REJECT 并上抛平台回调。
+///
+/// 版本不兼容等"本机主动拒绝"场景必须让平台端可见：
+/// 仅写 Rust 日志并返回 -1 时，平台只看到笼统的"配对超时/验证失败"，
+/// 真实原因被封在 core 内部而无法定位。此处同时：
+/// 1. 向对端发送 `uuid:reason` 的 REJECT（对端可据 reason 提示用户升级）；
+/// 2. 触发本机 `on_pairing("REJECT")` 与 `on_pairing("RESULT")`，data/extra 携带 reason。
+fn reject_with_reason(ctx: &SafeContext, uuid: &str, reason: &str) {
+    let network = match ctx.lock() {
+        Ok(guard) => guard.network.tcp.clone(),
+        Err(_) => return,
+    };
+    let reject = codec::encode_reject_with_reason(uuid, reason);
+    do_send_via_network(&network, uuid, &reject);
+    fire_pairing_cb(
+        ctx,
+        uuid,
+        "REJECT",
+        &serde_json::json!({"uuid": uuid, "reason": reason}).to_string(),
+        0,
+        reason,
+    );
+    fire_pairing_cb(
+        ctx,
+        uuid,
+        "RESULT",
+        &serde_json::json!({"uuid": uuid, "success": false, "error": reason}).to_string(),
+        0,
+        reason,
+    );
+}
+
+/// DATA 帧版本不兼容的去重上报。
+///
+/// DATA 是高频通道，逐帧回调会刷屏；按对端 uuid 去重，每个不兼容对端只通知一次。
+/// 通知内容与 REJECT 对齐（reason=version_mismatch），平台端据此提示用户升级。
+fn notify_version_mismatch_once(ctx: &SafeContext, uuid: &str) {
+    let first = {
+        let Ok(mut guard) = ctx.lock() else {
+            return;
+        };
+        guard.version_mismatch_notified.insert(uuid.to_string())
+    };
+    if !first {
+        return;
+    }
+    fire_pairing_cb(
+        ctx,
+        uuid,
+        "REJECT",
+        &serde_json::json!({
+            "uuid": uuid,
+            "reason": codec::RejectReason::VERSION_MISMATCH
+        })
+        .to_string(),
+        0,
+        codec::RejectReason::VERSION_MISMATCH,
+    );
+}
+
 fn fire_data_cb(ctx: &SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
     let (cb, ud) = {
         let Ok(g) = ctx.lock() else {
@@ -154,6 +214,7 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
 
     // 版本兼容校验：仅比较 major.minor，patch 差异仍互通。
     // 不兼容时拒绝握手（不自动 ACCEPT），避免两端在版本不一致时建立半可用连接。
+    // 主动回带原因的 REJECT，使对端平台端能显示"版本不兼容"而非笼统的连接失败。
     if !version::is_compatible(&hs.core_version) {
         log::warn!(
             "处理消息: HANDSHAKE 版本不兼容，拒绝连接 uuid={}, 对端={}, 本机={}",
@@ -165,6 +226,7 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
             },
             version::CORE_VERSION
         );
+        reject_with_reason(ctx, &uuid_str, codec::RejectReason::VERSION_MISMATCH);
         return -1;
     }
 
@@ -302,6 +364,7 @@ fn process_pairing_init(ctx: &SafeContext, payload: &[u8]) -> i32 {
             peer_version,
             version::CORE_VERSION
         );
+        reject_with_reason(ctx, uuid, codec::RejectReason::VERSION_MISMATCH);
         return -1;
     }
 
@@ -361,6 +424,7 @@ fn process_pairing_resp(ctx: &SafeContext, payload: &[u8]) -> i32 {
             peer_version,
             version::CORE_VERSION
         );
+        reject_with_reason(ctx, uuid, codec::RejectReason::VERSION_MISMATCH);
         return -1;
     }
 
@@ -496,6 +560,7 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
             peer_version,
             version::CORE_VERSION
         );
+        reject_with_reason(ctx, &uuid, codec::RejectReason::VERSION_MISMATCH);
         return -1;
     }
 
@@ -646,11 +711,11 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
 }
 
 fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
-    let uuid = match std::str::from_utf8(payload) {
-        Ok(s) => s.trim(),
-        Err(_) => return -1,
+    // 负载格式：`uuid` 或 `uuid:reason`（reason 见 codec::RejectReason）。
+    // 旧端只发 uuid，故 reason 缺失时回落 "rejected"，保持向后兼容。
+    let Some((uuid, reason)) = codec::decode_reject_payload(payload) else {
+        return -1;
     };
-    let uuid = uuid.to_string();
 
     let network = match ctx.lock() {
         Ok(mut guard) => {
@@ -664,17 +729,17 @@ fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
         ctx,
         &uuid,
         "REJECT",
-        &serde_json::json!({"uuid": uuid}).to_string(),
+        &serde_json::json!({"uuid": uuid, "reason": reason}).to_string(),
         0,
-        "rejected",
+        &reason,
     );
     fire_pairing_cb(
         ctx,
         &uuid,
         "RESULT",
-        &serde_json::json!({"uuid": uuid, "success": false, "error": "rejected"}).to_string(),
+        &serde_json::json!({"uuid": uuid, "success": false, "error": reason}).to_string(),
         0,
-        "rejected",
+        &reason,
     );
     {
         let ack = codec::encode_ack(&uuid);
@@ -829,6 +894,7 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
             peer_version,
             version::CORE_VERSION
         );
+        notify_version_mismatch_once(ctx, local_uuid);
         return -1;
     }
 
@@ -1366,6 +1432,166 @@ mod tests {
         assert!(
             ctx.lock().unwrap().pairing_sessions.is_empty(),
             "被拒绝的配对不得留下会话"
+        );
+    }
+
+    // ===== 版本不兼容原因的端到端可见性 =====
+
+    /// on_pairing 回调捕获容器：(msg_type, data, extra)
+    type PairingEvents = Mutex<Vec<(String, String, String)>>;
+    static PAIRING_EVENTS: PairingEvents = Mutex::new(Vec::new());
+
+    extern "C" fn capture_pairing_cb(
+        _uuid: *const c_char,
+        msg_type: *const c_char,
+        data: *const c_char,
+        _int_value: i32,
+        extra: *const c_char,
+        _user_data: *mut c_void,
+    ) {
+        use std::ffi::CStr;
+        let read = |p: *const c_char| -> String {
+            if p.is_null() {
+                return String::new();
+            }
+            unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        PAIRING_EVENTS
+            .lock()
+            .unwrap()
+            .push((read(msg_type), read(data), read(extra)));
+    }
+
+    fn ctx_with_pairing_cb() -> SafeContext {
+        PAIRING_EVENTS.lock().unwrap().clear();
+        let ctx = Mutex::new(CoreContext::new());
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.router.user_data = &PAIRING_EVENTS as *const PairingEvents as *mut c_void;
+            guard.router.on_pairing = Some(capture_pairing_cb);
+        }
+        ctx
+    }
+
+    fn take_pairing_events() -> Vec<(String, String, String)> {
+        std::mem::take(&mut *PAIRING_EVENTS.lock().unwrap())
+    }
+
+    /// REJECT 帧可携带原因，且解析端能还原出 reason（供平台端明确提示）。
+    #[test]
+    fn reject_with_reason_is_parsed_and_surfaced() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_pairing_cb();
+
+        let frame =
+            codec::encode_reject_with_reason("peer-x", codec::RejectReason::VERSION_MISMATCH);
+        // 帧头 5 字节（type + length LE），payload 紧随其后
+        let decoded = crate::protocol::binary_codec::read_frame(&mut &frame[..]).unwrap();
+        assert_eq!(decoded.0, MessageType::REJECT);
+        assert_eq!(
+            process_frame(&ctx, None, decoded.0, &decoded.1),
+            0,
+            "REJECT 应被正常处理"
+        );
+
+        let events = take_pairing_events();
+        assert!(
+            events.iter().any(|(t, ..)| t == "REJECT"),
+            "应上抛 REJECT 事件，实际: {:?}",
+            events
+        );
+        let (_, data, extra) = events
+            .iter()
+            .find(|(t, ..)| t == "REJECT")
+            .expect("缺少 REJECT 事件");
+        assert!(
+            data.contains(codec::RejectReason::VERSION_MISMATCH),
+            "data 应携带 reason，实际: {}",
+            data
+        );
+        assert_eq!(extra, codec::RejectReason::VERSION_MISMATCH);
+        // RESULT 同步失败也必须带同一原因
+        let (_, result_data, _) = events
+            .iter()
+            .find(|(t, ..)| t == "RESULT")
+            .expect("缺少 RESULT 事件");
+        assert!(
+            result_data.contains(codec::RejectReason::VERSION_MISMATCH),
+            "RESULT 应携带 reason，实际: {}",
+            result_data
+        );
+    }
+
+    /// 旧格式 REJECT（仅 uuid，无 reason）必须继续可用，回落为 rejected。
+    #[test]
+    fn legacy_reject_without_reason_falls_back() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_pairing_cb();
+
+        assert_eq!(
+            process_frame(&ctx, None, MessageType::REJECT, b"peer-legacy"),
+            0
+        );
+        let events = take_pairing_events();
+        let (_, data, extra) = events
+            .iter()
+            .find(|(t, ..)| t == "REJECT")
+            .expect("缺少 REJECT 事件");
+        assert!(data.contains(codec::RejectReason::REJECTED));
+        assert_eq!(extra, codec::RejectReason::REJECTED);
+    }
+
+    /// 版本不兼容的 DATA 帧：平台端应收到一次 version_mismatch 通知（且仅一次）。
+    #[test]
+    fn data_version_mismatch_notifies_platform_once() {
+        let _serial = icon_test_guard();
+        let ctx = ctx_with_pairing_cb();
+        let (major, minor) =
+            crate::protocol::version::major_minor(crate::protocol::version::CORE_VERSION).unwrap();
+        let peer_version = format!("{}.{}", major + 1, minor);
+        let plaintext = r#"{"type":"ICON_RESPONSE","iconData":"AAA=","time":1}"#;
+
+        let encrypted = aes::encrypt_with_aad(
+            &TEST_AES_KEY,
+            plaintext.as_bytes(),
+            &crate::protocol::version::data_aad(),
+        )
+        .unwrap();
+        let payload = format!(
+            "DATA_ICON_RESPONSE:{}:{}:{}:{}",
+            TEST_REMOTE_UUID, peer_version, "", encrypted
+        );
+        // 先设置设备密钥，确保走到版本校验分支（校验先于解密）
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.crypto.set_device_key(
+                TEST_REMOTE_UUID.to_string(),
+                String::new(),
+                base64::engine::general_purpose::STANDARD.encode(TEST_AES_KEY),
+            );
+        }
+
+        assert_eq!(
+            process_frame(&ctx, None, MessageType::PACKAGE_INFO, payload.as_bytes()),
+            -1
+        );
+        assert_eq!(
+            process_frame(&ctx, None, MessageType::PACKAGE_INFO, payload.as_bytes()),
+            -1
+        );
+
+        let events = take_pairing_events();
+        let mismatch_count = events
+            .iter()
+            .filter(|(t, d, _)| t == "REJECT" && d.contains(codec::RejectReason::VERSION_MISMATCH))
+            .count();
+        assert_eq!(
+            mismatch_count, 1,
+            "同一对端的版本不兼容只应通知一次，实际: {:?}",
+            events
         );
     }
 }

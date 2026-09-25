@@ -90,8 +90,47 @@ pub fn encode_accept(
     binary_codec::encode_pairing_frame(MessageType::ACCEPT, &payload)
 }
 
+/// 拒绝原因码（REJECT 负载第二段），供平台端把失败原因明确呈现给用户，
+/// 避免所有失败都被笼统归类为"配对超时/验证失败"而无法定位。
+pub struct RejectReason;
+
+impl RejectReason {
+    /// 版本不兼容（跨 major.minor），两端需升级到同一版本
+    pub const VERSION_MISMATCH: &'static str = "version_mismatch";
+    /// 用户主动拒绝/取消
+    pub const REJECTED: &'static str = "rejected";
+}
+
 pub fn encode_reject(uuid: &str) -> Vec<u8> {
     binary_codec::encode_control_frame(MessageType::REJECT, uuid)
+}
+
+/// 编码带原因的 REJECT 帧：`uuid:reason`。
+///
+/// 兼容旧接收端：旧端只取首段作为 uuid（`splitn(2, ':')`），多余段被忽略；
+/// 新接收端解析出 reason 后通过 `on_pairing("REJECT")` 的 data 字段上抛。
+pub fn encode_reject_with_reason(uuid: &str, reason: &str) -> Vec<u8> {
+    binary_codec::encode_control_frame(MessageType::REJECT, &format!("{}:{}", uuid, reason))
+}
+
+/// 解析 REJECT 负载为 `(uuid, reason)`；旧格式（仅 uuid）原因回落为 `rejected`。
+///
+/// 空负载返回 None。集中在此避免发现扫描 / 重连 / 处理三处重复解析逻辑。
+pub fn decode_reject_payload(payload: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(payload).ok()?.trim();
+    let (uuid, reason) = match text.split_once(':') {
+        Some((u, r)) => (u.trim(), r.trim()),
+        None => (text, ""),
+    };
+    if uuid.is_empty() {
+        return None;
+    }
+    let reason = if reason.is_empty() {
+        RejectReason::REJECTED
+    } else {
+        reason
+    };
+    Some((uuid.to_string(), reason.to_string()))
 }
 
 pub fn encode_ack(uuid: &str) -> Vec<u8> {

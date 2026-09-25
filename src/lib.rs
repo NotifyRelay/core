@@ -91,6 +91,11 @@ pub struct CoreContext {
     pub pending_device_deletions: Vec<String>,
     /// 持久化库路径覆盖（测试隔离用：每个测试注入独立库文件；生产为 None）
     db_override: Option<std::path::PathBuf>,
+    /// 已上报"版本不兼容"的对端 uuid。
+    ///
+    /// DATA 帧为高频通道，若每帧都回调平台会造成刷屏；此处按对端去重，
+    /// 保证每个不兼容对端只通知一次（重连/重新握手时会再次触发）。
+    pub version_mismatch_notified: std::collections::HashSet<String>,
 }
 
 pub struct PairingContext {
@@ -190,6 +195,7 @@ impl CoreContext {
             persisted_devices: HashMap::new(),
             pending_device_deletions: Vec::new(),
             db_override: None,
+            version_mismatch_notified: std::collections::HashSet::new(),
         }
     }
 
