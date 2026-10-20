@@ -1,5 +1,6 @@
 use std::os::raw::{c_char, c_void};
 
+use crate::dedup::compute_dedup_key;
 use crate::sender_queue::{SendItem, SenderQueue};
 use crate::SafeContext;
 
@@ -7,6 +8,15 @@ use super::common::from_cstr;
 
 /// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
 const SENT_DEDUP_TTL_MS: i64 = 3000;
+
+/// 规范化帧类型标识：非空且不以 DATA_ 开头时补前缀（接收端只识别 DATA_*）
+pub(crate) fn normalize_header(header: &str) -> String {
+    if !header.is_empty() && !header.starts_with("DATA_") {
+        format!("DATA_{}", header)
+    } else {
+        header.to_string()
+    }
+}
 
 /// 创建发送队列（内部实现，供 nrc_start_core 调用）
 /// 返回句柄（正整数，0 表示失败）
@@ -32,7 +42,8 @@ pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_handle:
     queue.start_worker(ctx_ptr as usize);
 }
 
-/// 入队消息（IP 由 Rust 内部管理，无需平台端传入）
+/// 入队消息（IP 由 Rust 内部管理；header 规范化、去重键推导与发送去重均在内部完成）
+/// 返回：1=已入队 0=命中去重丢弃 -1=参数无效或队列未初始化
 #[no_mangle]
 pub unsafe extern "C" fn nrc_enqueue_message(
     ctx_ptr: *mut c_void,
@@ -40,27 +51,27 @@ pub unsafe extern "C" fn nrc_enqueue_message(
     device_uuid: *const c_char,
     header: *const c_char,
     plaintext: *const c_char,
-    dedup_key: *const c_char,
-) {
+) -> i32 {
     if ctx_ptr.is_null() || queue_handle == 0 {
-        return;
+        return -1;
     }
     let queue = unsafe { &*(super::handle::get(queue_handle) as *const SenderQueue) };
     let uuid = unsafe { from_cstr(device_uuid) };
-    let hdr = unsafe { from_cstr(header) };
+    let hdr = normalize_header(unsafe { from_cstr(header) });
     let text = unsafe { from_cstr(plaintext) };
-    let dk = unsafe { from_cstr(dedup_key) };
 
-    // 发送去重 TTL（与原平台端实现一致：3000ms）
-    if !dk.is_empty() {
-        let ctx = unsafe { &mut *(ctx_ptr as *mut crate::SafeContext) };
-        let dedup_ok = ctx
-            .get_mut()
-            .map(|g| g.dedup.check_and_pend(&dk, SENT_DEDUP_TTL_MS))
-            .unwrap_or(false);
-        if !dedup_ok {
-            return;
+    let dedup_key = compute_dedup_key(uuid, text);
+
+    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+    let dedup_ok = match ctx.get_mut() {
+        Ok(g) => {
+            g.dedup.maybe_cleanup();
+            g.dedup.check_and_pend(&dedup_key, SENT_DEDUP_TTL_MS)
         }
+        Err(_) => return -1,
+    };
+    if !dedup_ok {
+        return 0;
     }
 
     // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
@@ -76,14 +87,111 @@ pub unsafe extern "C" fn nrc_enqueue_message(
 
     queue.enqueue(SendItem {
         device_uuid: uuid.to_string(),
-        header: hdr.to_string(),
+        header: hdr,
         plaintext,
-        dedup_key: if dk.is_empty() {
-            None
-        } else {
-            Some(dk.to_string())
-        },
+        dedup_key: Some(dedup_key),
         retries_left: 0,
         coalesce_key: None,
     });
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::Mutex;
+
+    fn create_ctx() -> Mutex<crate::CoreContext> {
+        let p = std::env::temp_dir()
+            .join(format!("nrsq_{}", std::process::id()))
+            .join("rust_core.db");
+        Mutex::new(crate::CoreContext::with_db_override(p))
+    }
+
+    #[test]
+    fn normalize_header_cases() {
+        assert_eq!(normalize_header("ICON_REQUEST"), "DATA_ICON_REQUEST");
+        assert_eq!(normalize_header("DATA_JSON"), "DATA_JSON");
+        assert_eq!(normalize_header("DATA_"), "DATA_");
+        assert_eq!(normalize_header(""), "");
+    }
+
+    #[test]
+    fn enqueue_message_params_and_dedup() {
+        let ctx = create_ctx();
+        let ptr = &ctx as *const Mutex<crate::CoreContext> as *mut c_void;
+
+        // 空上下文 → -1
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            -1
+        );
+        // 队列未初始化 → -1
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(ptr, 0, std::ptr::null(), std::ptr::null(), std::ptr::null())
+            },
+            -1
+        );
+
+        let queue_handle = unsafe { create_sender_queue_impl(ptr) };
+        assert_ne!(queue_handle, 0);
+
+        let uuid = CString::new("uuid-1").unwrap();
+        let header = CString::new("ICON_REQUEST").unwrap();
+        let body = CString::new(r#"{"a":1}"#).unwrap();
+        let body2 = CString::new(r#"{"a":2}"#).unwrap();
+
+        // 首次入队 → 1
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    ptr,
+                    queue_handle,
+                    uuid.as_ptr(),
+                    header.as_ptr(),
+                    body.as_ptr(),
+                )
+            },
+            1
+        );
+        // 同一 (uuid, plaintext) 在 TTL 内重复 → 0
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    ptr,
+                    queue_handle,
+                    uuid.as_ptr(),
+                    header.as_ptr(),
+                    body.as_ptr(),
+                )
+            },
+            0
+        );
+        // 不同 plaintext → 1
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    ptr,
+                    queue_handle,
+                    uuid.as_ptr(),
+                    header.as_ptr(),
+                    body2.as_ptr(),
+                )
+            },
+            1
+        );
+
+        let queue = unsafe { &*(super::super::handle::get(queue_handle) as *const SenderQueue) };
+        assert_eq!(queue.pending_count(), 2);
+    }
 }

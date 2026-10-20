@@ -1,5 +1,7 @@
-//! FFI 工具接口语义测试（feature_id / dedup_key / 去重判定 / FTP 凭据 / 密码 / nrc_dedup）
+//! FFI 工具接口语义测试（feature_id / 去重判定 / 内容去重 / FTP 凭据 / 密码 / nrc_dedup）
 //! 目的：保证 PC 与 Android 两个平台端共享的工具接口契约不变
+//! 说明：nrc_enqueue_message 依赖 crate 内 pub(crate) 队列构造，集成测试不可达，
+//!       其语义由 src/ffi/sender_queue.rs 的 crate 内单元测试覆盖。
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -125,36 +127,106 @@ fn test_compute_feature_id_distinguishes_inputs() {
     }
 }
 
-// ==================== dedup_key ====================
+// ==================== 内容去重（入站 10s 窗口）====================
 
 #[test]
-fn test_compute_dedup_key() {
-    let u = cstr("uuid-1");
-    let d1 = cstr("data-1");
-    let d2 = cstr("data-2");
+fn test_content_dedup_action_semantics() {
+    let ctx = create_ctx();
+    let ptr = ctx_ptr(&ctx);
+    let title = cstr("Title");
+    let text = cstr("Body");
 
-    let r1 = unsafe { ffi::utils::nrc_compute_dedup_key(u, d1) };
-    let r2 = unsafe { ffi::utils::nrc_compute_dedup_key(u, d1) };
-    let r3 = unsafe { ffi::utils::nrc_compute_dedup_key(u, d2) };
-    let s1 = unsafe { read_cstr(r1) };
-    assert_eq!(s1, unsafe { read_cstr(r2) });
-    assert_eq!(s1.len(), 64); // sha256 hex
-    assert_ne!(s1, unsafe { read_cstr(r3) });
-
-    // 不同设备相同数据 → 不同 key
-    let u2 = cstr("uuid-2");
-    let r4 = unsafe { ffi::utils::nrc_compute_dedup_key(u2, d1) };
-    assert_ne!(s1, unsafe { read_cstr(r4) });
+    // 未标记 → 0（未见）
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        0
+    );
+    // 标记已见 → 0
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        0
+    );
+    // 窗口内已见 → 1（纯查询不改变状态，重复查询结果一致）
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        1
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        1
+    );
+    // 清除内容键 → 0，之后未见
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 2, title, text) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        0
+    );
 
     unsafe {
-        free_str(r1);
-        free_str(r2);
-        free_str(r3);
-        free_str(r4);
-        free_cstr(u);
-        free_cstr(u2);
-        free_cstr(d1);
-        free_cstr(d2);
+        free_cstr(title);
+        free_cstr(text);
+    }
+}
+
+#[test]
+fn test_content_dedup_edge_cases() {
+    let ctx = create_ctx();
+    let ptr = ctx_ptr(&ctx);
+    let title = cstr("");
+    let text = cstr("");
+
+    // 空上下文 → -1
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(std::ptr::null_mut(), 0, title, text) },
+        -1
+    );
+    // 非法 action → -1
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 99, title, text) },
+        -1
+    );
+    // 空 title/text 仍可用
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        1
+    );
+
+    unsafe {
+        free_cstr(title);
+        free_cstr(text);
+    }
+}
+
+#[test]
+fn test_content_dedup_key_isolation() {
+    let ctx = create_ctx();
+    let ptr = ctx_ptr(&ctx);
+    let t1 = cstr("A");
+    let x1 = cstr("1");
+    let t2 = cstr("A");
+    let x2 = cstr("2");
+
+    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 1, t1, x1) }, 0);
+    // 键不同的 (title,text) 互不影响
+    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t2, x2) }, 0);
+    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t1, x1) }, 1);
+
+    unsafe {
+        free_cstr(t1);
+        free_cstr(x1);
+        free_cstr(t2);
+        free_cstr(x2);
     }
 }
 

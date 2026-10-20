@@ -3,23 +3,7 @@ use std::os::raw::c_void;
 
 use sha2::Digest;
 
-use super::common::{from_cstr, to_cstr};
-
-#[no_mangle]
-pub unsafe extern "C" fn nrc_compute_dedup_key(
-    device_uuid: *const c_char,
-    data: *const c_char,
-) -> *mut c_char {
-    let uuid = unsafe { from_cstr(device_uuid) };
-    let d = unsafe { from_cstr(data) };
-    let input = format!("{}|{}", uuid, d);
-    let hash = sha2::Sha256::digest(input.as_bytes());
-    let hex = hash
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    to_cstr(&hex)
-}
+use super::common::{from_cstr, to_cstr, with_ctx_or};
 
 /// 计算"岛"的特征ID（与 Kotlin computeFeatureId 对齐）。抽取为可复用实现供状态合并引擎调用。
 pub(crate) fn compute_feature_id_impl(
@@ -148,6 +132,38 @@ pub unsafe extern "C" fn nrc_dedup(
         }
         _ => -1,
     }
+}
+
+/// 入站内容去重（10s 窗口；键与 TTL 由 core 持有）
+/// action=0 纯查询：1=窗口内已见 / 0=未见（不写状态）
+/// action=1 标记已见：0
+/// action=2 清除全部内容键：0
+/// 空上下文或 action 非法：-1
+#[no_mangle]
+pub unsafe extern "C" fn nrc_content_dedup(
+    ctx_ptr: *mut c_void,
+    action: i32,
+    title: *const c_char,
+    text: *const c_char,
+) -> i32 {
+    let key = crate::dedup::content_key(unsafe { from_cstr(title) }, unsafe { from_cstr(text) });
+    with_ctx_or(ctx_ptr, -1, |guard| match action {
+        0 => i32::from(
+            guard
+                .dedup
+                .contains(&key, crate::dedup::CONTENT_DEDUP_TTL_MS),
+        ),
+        1 => {
+            guard.dedup.maybe_cleanup();
+            guard.dedup.mark_sent(&key);
+            0
+        }
+        2 => {
+            guard.dedup.clear_prefix(crate::dedup::CONTENT_KEY_PREFIX);
+            0
+        }
+        _ => -1,
+    })
 }
 
 use base64::Engine;
