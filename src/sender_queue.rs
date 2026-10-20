@@ -25,6 +25,8 @@ pub struct SenderQueue {
     running: Arc<AtomicBool>,
     /// 当前并发发送任务数
     active: Arc<AtomicUsize>,
+    /// core 上下文指针：释放未发送即被丢弃项的去重键时使用（0 表示未绑定）
+    ctx_ptr: AtomicUsize,
 }
 
 struct SenderQueueInner {
@@ -82,6 +84,7 @@ impl SenderQueue {
             })),
             running: Arc::new(AtomicBool::new(true)),
             active: Arc::new(AtomicUsize::new(0)),
+            ctx_ptr: AtomicUsize::new(0),
         }
     }
 }
@@ -124,6 +127,33 @@ impl SenderQueue {
         }
     }
 
+    /// 绑定 core 上下文指针（队列创建时写入；0 表示未绑定）
+    pub(crate) fn set_ctx_ptr(&self, ctx_ptr: usize) {
+        self.ctx_ptr.store(ctx_ptr, Ordering::Relaxed);
+    }
+
+    /// 释放未发送即被丢弃项的去重键。
+    ///
+    /// 键自身不随项存放：遗漏清理会让该键永久驻留 pending，
+    /// 导致后续相同负载被误判为重复而静默丢弃。
+    fn release_dedup_keys_at(ctx_ptr: usize, keys: &[String]) {
+        if ctx_ptr == 0 || keys.is_empty() {
+            return;
+        }
+        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+        if let Ok(mut guard) = ctx.lock() {
+            for key in keys {
+                if !key.is_empty() {
+                    guard.dedup.clear_pending(key);
+                }
+            }
+        }
+    }
+
+    fn release_dedup_keys(&self, keys: &[String]) {
+        Self::release_dedup_keys_at(self.ctx_ptr.load(Ordering::Relaxed), keys);
+    }
+
     /// 清理指定设备 + header 下已过期的实时状态积压（FULL 与 DELTA 均适用）。
     ///
     /// 断线期间实时状态（超级岛 / 媒体）会持续入队，恢复后按序回放会造成"追逐"；
@@ -141,6 +171,7 @@ impl SenderQueue {
             return 0;
         };
         let before = inner.items.len();
+        let mut dropped_keys: Vec<String> = Vec::new();
         inner.items.retain(|it| {
             if it.device_uuid != device_uuid || it.header != header {
                 return true;
@@ -148,13 +179,22 @@ impl SenderQueue {
             if Self::is_media_end_packet(&it.plaintext) {
                 return true;
             }
-            match crate::timestamp::extract_ts(&it.plaintext) {
+            let keep = match crate::timestamp::extract_ts(&it.plaintext) {
                 Some(ts) => !crate::timestamp::is_stale(ts, now),
                 // 未携带 ts（旧格式/异常负载）：保守保留
                 None => true,
+            };
+            if !keep {
+                if let Some(ref key) = it.dedup_key {
+                    dropped_keys.push(key.clone());
+                }
             }
+            keep
         });
         let dropped = before - inner.items.len();
+        drop(inner);
+        // 释放被丢弃项的去重键（需在 inner 锁释放后进行）
+        self.release_dedup_keys(&dropped_keys);
         if dropped > 0 {
             log::debug!(
                 "发送队列: 清理过期实时状态积压 uuid={} header={}, 丢弃 {} 条",
@@ -185,15 +225,22 @@ impl SenderQueue {
         if is_media && item.coalesce_key.is_none() {
             item.coalesce_key = Some(format!("{}|{}", item.device_uuid, item.header));
         }
+        let mut replaced_keys: Vec<String> = Vec::new();
         if let Ok(mut inner) = self.inner.lock() {
             // 全量媒体状态入队时移除同键旧项（含未发出的增量），只保留最新，
             // 根除网络恢复后过期状态的爆发式回放
             if let Some(ref key) = item.coalesce_key {
                 if !Self::is_delta_payload(&item.plaintext) {
                     let before = inner.items.len();
-                    inner
-                        .items
-                        .retain(|it| it.coalesce_key.as_deref() != Some(key.as_str()));
+                    inner.items.retain(|it| {
+                        let replaced = it.coalesce_key.as_deref() == Some(key.as_str());
+                        if replaced {
+                            if let Some(ref k) = it.dedup_key {
+                                replaced_keys.push(k.clone());
+                            }
+                        }
+                        !replaced
+                    });
                     let dropped = before - inner.items.len();
                     if dropped > 0 {
                         log::debug!(
@@ -206,6 +253,8 @@ impl SenderQueue {
             }
             inner.items.push(item);
         }
+        // 释放被替换旧项的去重键（需在 inner 锁释放后进行）
+        self.release_dedup_keys(&replaced_keys);
     }
 
     /// 启动后台调度线程（实际发送在并发任务线程中执行，同设备串行）
@@ -227,6 +276,7 @@ impl SenderQueue {
                         continue;
                     }
 
+                    let mut stale_keys: Vec<String> = Vec::new();
                     let item = {
                         let mut guard = match inner.lock() {
                             Ok(g) => g,
@@ -249,7 +299,15 @@ impl SenderQueue {
                         // 超级岛/媒体状态，恢复后即使没有新推送，worker 也会按序回放造成"追逐"。
                         // 此处按注入的 `ts` 丢弃过期项（结束包保留，会话终止信号必须送达）。
                         let before = guard.items.len();
-                        guard.items.retain(|it| !Self::is_stale_realtime_item(it));
+                        guard.items.retain(|it| {
+                            let stale = Self::is_stale_realtime_item(it);
+                            if stale {
+                                if let Some(ref key) = it.dedup_key {
+                                    stale_keys.push(key.clone());
+                                }
+                            }
+                            !stale
+                        });
                         let dropped = before - guard.items.len();
                         if dropped > 0 {
                             log::debug!("发送队列: 发送前清理过期实时状态 {} 条", dropped);
@@ -276,6 +334,8 @@ impl SenderQueue {
                             None => None,
                         }
                     };
+                    // 释放被丢弃项的去重键（需在 inner 锁释放后进行）
+                    Self::release_dedup_keys_at(ctx_ptr, &stale_keys);
 
                     match item {
                         Some(item) => {
@@ -287,6 +347,7 @@ impl SenderQueue {
                                 dedup_key: item.dedup_key.clone(),
                             };
                             let task_inner = inner.clone();
+                            let orphan_key = item.dedup_key.clone();
                             let spawn_result = thread::Builder::new()
                                 .name("sender-task".to_string())
                                 .spawn(move || {
@@ -294,7 +355,11 @@ impl SenderQueue {
                                     Self::process_item(ctx_ptr, &item, &task_inner);
                                 });
                             if let Err(e) = spawn_result {
-                                // spawn 失败时闭包被丢弃，TaskGuard 的 Drop 已清理状态
+                                // spawn 失败时闭包被丢弃：TaskGuard 的 Drop 已清理并发状态，
+                                // 该项不会发送，需同时释放其去重键
+                                if let Some(ref key) = orphan_key {
+                                    Self::release_dedup_keys_at(ctx_ptr, std::slice::from_ref(key));
+                                }
                                 log::warn!("发送队列: 派生发送任务失败: {}", e);
                                 thread::sleep(Duration::from_millis(100));
                             }
@@ -311,7 +376,13 @@ impl SenderQueue {
     fn process_item(ctx_ptr: usize, item: &SendItem, inner: &Arc<Mutex<SenderQueueInner>>) {
         let send_ok = match Self::try_send(ctx_ptr, item) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => {
+                // 取锁失败使该项未发送即被丢弃：释放其去重键
+                if let Some(ref key) = item.dedup_key {
+                    Self::release_dedup_keys_at(ctx_ptr, std::slice::from_ref(key));
+                }
+                return;
+            }
         };
 
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
@@ -689,5 +760,86 @@ mod tests {
         let dropped = q.purge_stale_realtime("dev1", "DATA_MEDIAPLAY");
         assert_eq!(dropped, 1, "仅应清理目标设备与 header 的过期项");
         assert_eq!(q.pending_count(), 2);
+    }
+
+    fn make_ctx(tag: &str) -> Mutex<crate::CoreContext> {
+        let p = std::env::temp_dir()
+            .join(format!("nrq_{}_{}", std::process::id(), tag))
+            .join("rust_core.db");
+        Mutex::new(crate::CoreContext::with_db_override(p))
+    }
+
+    fn item_with_key(uuid: &str, header: &str, text: &str, key: &str) -> SendItem {
+        SendItem {
+            device_uuid: uuid.to_string(),
+            header: header.to_string(),
+            plaintext: text.to_string(),
+            dedup_key: Some(key.to_string()),
+            retries_left: 0,
+            coalesce_key: None,
+        }
+    }
+
+    #[test]
+    fn test_purge_stale_realtime_releases_dedup_key() {
+        let ctx = make_ctx("purge");
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        let q = SenderQueue::new();
+        q.set_ctx_ptr(ctx_ptr);
+
+        // 模拟入队时的去重键登记
+        {
+            let mut guard = ctx.lock().unwrap();
+            assert!(guard.dedup.check_and_pend("k-purge", 3000));
+            assert!(!guard.dedup.check_and_pend("k-purge", 3000));
+        }
+
+        let stale = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
+        let payload = format!(r#"{{"changes":{{"title":"s"}},"ts":{}}}"#, stale);
+        q.enqueue(item_with_key("dev1", "DATA_MEDIAPLAY", &payload, "k-purge"));
+
+        assert_eq!(q.purge_stale_realtime("dev1", "DATA_MEDIAPLAY"), 1);
+        // 丢弃项的去重键必须被释放，否则相同负载会被永久判为重复
+        assert!(
+            ctx.lock().unwrap().dedup.check_and_pend("k-purge", 3000),
+            "被丢弃项的去重键应已释放"
+        );
+    }
+
+    #[test]
+    fn test_coalesce_replacement_releases_old_key() {
+        let ctx = make_ctx("coalesce");
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        let q = SenderQueue::new();
+        q.set_ctx_ptr(ctx_ptr);
+
+        {
+            let mut guard = ctx.lock().unwrap();
+            assert!(guard.dedup.check_and_pend("k-old", 3000));
+            assert!(guard.dedup.check_and_pend("k-new", 3000));
+        }
+
+        q.enqueue(item_with_key(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"title":"a"}"#,
+            "k-old",
+        ));
+        q.enqueue(item_with_key(
+            "dev1",
+            "DATA_MEDIAPLAY",
+            r#"{"title":"b"}"#,
+            "k-new",
+        ));
+
+        let mut guard = ctx.lock().unwrap();
+        assert!(
+            guard.dedup.check_and_pend("k-old", 3000),
+            "被替换旧项的去重键应已释放"
+        );
+        assert!(
+            !guard.dedup.check_and_pend("k-new", 3000),
+            "保留项的键仍在 pending"
+        );
     }
 }

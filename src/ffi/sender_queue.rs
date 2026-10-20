@@ -9,6 +9,11 @@ use super::common::from_cstr;
 /// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
 const SENT_DEDUP_TTL_MS: i64 = 3000;
 
+/// 参与发送去重的通知类 header（仅通知通道存在重复发送语义）
+fn is_notification_header(header: &str) -> bool {
+    header == "DATA_NOTIFICATION"
+}
+
 /// 规范化帧类型标识：非空且不以 DATA_ 开头时补前缀（接收端只识别 DATA_*）
 pub(crate) fn normalize_header(header: &str) -> String {
     if !header.is_empty() && !header.starts_with("DATA_") {
@@ -25,6 +30,7 @@ pub(crate) unsafe fn create_sender_queue_impl(ctx_ptr: *mut c_void) -> u64 {
         return 0;
     }
     let queue = Box::new(SenderQueue::new());
+    queue.set_ctx_ptr(ctx_ptr as usize);
     let handle = super::handle::put(Box::into_raw(queue) as *mut c_void);
 
     let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
@@ -43,7 +49,9 @@ pub(crate) unsafe fn start_sender_queue_impl(ctx_ptr: *mut c_void, queue_handle:
 }
 
 /// 入队消息（IP 由 Rust 内部管理；header 规范化、去重键推导与发送去重均在内部完成）
-/// 返回：1=已入队 0=命中去重丢弃 -1=参数无效或队列未初始化
+///
+/// 发送去重仅作用于通知类消息（`DATA_NOTIFICATION`）：其他通道无重复语义。
+/// 返回：1=已入队 0=命中去重丢弃（仅通知类） -1=参数无效或队列未初始化
 #[no_mangle]
 pub unsafe extern "C" fn nrc_enqueue_message(
     ctx_ptr: *mut c_void,
@@ -60,26 +68,32 @@ pub unsafe extern "C" fn nrc_enqueue_message(
     let hdr = normalize_header(unsafe { from_cstr(header) });
     let text = unsafe { from_cstr(plaintext) };
 
-    let dedup_key = compute_dedup_key(uuid, text);
+    let is_notification = is_notification_header(&hdr);
 
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    let dedup_ok = match ctx.get_mut() {
-        Ok(g) => {
-            g.dedup.maybe_cleanup();
-            g.dedup.check_and_pend(&dedup_key, SENT_DEDUP_TTL_MS)
+    let dedup_key = if is_notification {
+        let key = compute_dedup_key(uuid, text);
+        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
+        let dedup_ok = match ctx.get_mut() {
+            Ok(g) => {
+                g.dedup.maybe_cleanup();
+                g.dedup.check_and_pend(&key, SENT_DEDUP_TTL_MS)
+            }
+            Err(_) => return -1,
+        };
+        if !dedup_ok {
+            return 0;
         }
-        Err(_) => return -1,
+        Some(key)
+    } else {
+        None
     };
-    if !dedup_ok {
-        return 0;
-    }
 
     // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
     // 断线期间的通知累积是有益的，恢复后应完整补收（实时状态的丢弃在 state_merge / sender_queue 内处理）。
     //
     // 仅对 DATA_NOTIFICATION 注入：其他通道（图标/应用列表/控制等）的模型未声明 `ts`，
     // 注入会触发 `normalize_or_keep` 的"往返丢字段"兜底并产生无谓告警，且这些通道无时效语义。
-    let plaintext = if hdr == "DATA_NOTIFICATION" {
+    let plaintext = if is_notification {
         crate::timestamp::inject_ts(text, crate::timestamp::now_ms())
     } else {
         text.to_string()
@@ -89,7 +103,7 @@ pub unsafe extern "C" fn nrc_enqueue_message(
         device_uuid: uuid.to_string(),
         header: hdr,
         plaintext,
-        dedup_key: Some(dedup_key),
+        dedup_key,
         retries_left: 0,
         coalesce_key: None,
     });
@@ -147,51 +161,77 @@ mod tests {
         assert_ne!(queue_handle, 0);
 
         let uuid = CString::new("uuid-1").unwrap();
-        let header = CString::new("ICON_REQUEST").unwrap();
+        let notification = CString::new("DATA_NOTIFICATION").unwrap();
+        let icon = CString::new("ICON_REQUEST").unwrap();
         let body = CString::new(r#"{"a":1}"#).unwrap();
         let body2 = CString::new(r#"{"a":2}"#).unwrap();
 
-        // 首次入队 → 1
+        // 通知：首次入队 → 1
         assert_eq!(
             unsafe {
                 nrc_enqueue_message(
                     ptr,
                     queue_handle,
                     uuid.as_ptr(),
-                    header.as_ptr(),
+                    notification.as_ptr(),
                     body.as_ptr(),
                 )
             },
             1
         );
-        // 同一 (uuid, plaintext) 在 TTL 内重复 → 0
+        // 通知：同一 (uuid, plaintext) 在 TTL 内重复 → 0
         assert_eq!(
             unsafe {
                 nrc_enqueue_message(
                     ptr,
                     queue_handle,
                     uuid.as_ptr(),
-                    header.as_ptr(),
+                    notification.as_ptr(),
                     body.as_ptr(),
                 )
             },
             0
         );
-        // 不同 plaintext → 1
+        // 通知：不同 plaintext → 1
         assert_eq!(
             unsafe {
                 nrc_enqueue_message(
                     ptr,
                     queue_handle,
                     uuid.as_ptr(),
-                    header.as_ptr(),
+                    notification.as_ptr(),
                     body2.as_ptr(),
+                )
+            },
+            1
+        );
+        // 非通知通道不去重：同一负载连续两次都入队
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    ptr,
+                    queue_handle,
+                    uuid.as_ptr(),
+                    icon.as_ptr(),
+                    body.as_ptr(),
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                nrc_enqueue_message(
+                    ptr,
+                    queue_handle,
+                    uuid.as_ptr(),
+                    icon.as_ptr(),
+                    body.as_ptr(),
                 )
             },
             1
         );
 
         let queue = unsafe { &*(super::super::handle::get(queue_handle) as *const SenderQueue) };
-        assert_eq!(queue.pending_count(), 2);
+        assert_eq!(queue.pending_count(), 4);
     }
 }
