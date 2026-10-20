@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -534,15 +534,131 @@ pub fn oneshot_send_only(payload: &[u8], ip: &str, port: u16, timeout_ms: u32) -
 /// 所有设备均监听该端口，并周期向该端口广播自身发现信息。
 pub const UDP_BROADCAST_PORT: u16 = 23334;
 
-/// 创建 UDP 广播发送 socket（绑定临时端口并开启广播）。
-/// 与监听 socket 分离，避免向广播地址发送的包回环到自身监听路径。
-pub fn create_udp_broadcast_socket() -> Result<UdpSocket, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| format!("创建 UDP 广播发送 socket 失败: {}", e))?;
-    socket
-        .set_broadcast(true)
-        .map_err(|e| format!("设置 UDP 广播失败: {}", e))?;
-    Ok(socket)
+/// 可用于发现广播的本机 IPv4 地址筛选：排除环回、未指定地址与 169.254.0.0/16 链路本地址。
+pub fn is_broadcast_source_addr(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local()
+}
+
+/// 枚举本机可广播的 IPv4 地址（顺序稳定，供发送与日志使用）。
+fn broadcast_source_addrs() -> Vec<Ipv4Addr> {
+    let Ok(ifas) = local_ip_address::list_afinet_netifas() else {
+        return Vec::new();
+    };
+    let mut addrs: Vec<Ipv4Addr> = ifas
+        .into_iter()
+        .filter_map(|(_, ip)| match ip {
+            IpAddr::V4(v4) if is_broadcast_source_addr(v4) => Some(v4),
+            _ => None,
+        })
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+/// 发现广播发送器：对本机每个可广播 IPv4 地址各持一个绑定该源地址的发送 socket。
+///
+/// 有限广播地址 255.255.255.255 的出口由系统路由表在全部网卡中择一决定，
+/// 多网卡共存（VPN / 虚拟网卡 / 链路本地址）时会落在优先级最高的网卡上；
+/// 绑定源地址后发送，出口网卡由该地址确定，广播可覆盖每一条本机所在链路。
+pub struct UdpDiscoverySender {
+    /// 源地址 → 已绑定该源地址并开启广播的发送 socket
+    sockets: HashMap<Ipv4Addr, UdpSocket>,
+    /// 无可用源地址时的兜底发送 socket（绑定 0.0.0.0，出口由路由表决定）
+    fallback: Option<UdpSocket>,
+}
+
+impl Default for UdpDiscoverySender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UdpDiscoverySender {
+    pub fn new() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            fallback: None,
+        }
+    }
+
+    /// 取（必要时创建）绑定指定源地址的发送 socket。
+    fn socket_for(&mut self, ip: Ipv4Addr) -> Option<&UdpSocket> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.sockets.entry(ip) {
+            let socket = match UdpSocket::bind(SocketAddr::from((ip, 0))) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("UDP 广播发现: 绑定源地址 {} 失败: {}", ip, e);
+                    return None;
+                }
+            };
+            if let Err(e) = socket.set_broadcast(true) {
+                log::debug!("UDP 广播发现: 源地址 {} 开启广播失败: {}", ip, e);
+                return None;
+            }
+            slot.insert(socket);
+        }
+        self.sockets.get(&ip)
+    }
+
+    /// 回收已消失的本机地址对应的 socket，避免网络切换后占用残留。
+    fn retain_live(&mut self, live: &[Ipv4Addr]) {
+        self.sockets.retain(|ip, _| live.contains(ip));
+    }
+
+    /// 向每个可广播地址各发送一条发现报文，返回成功发送的条数。
+    ///
+    /// 无可用源地址时改用 0.0.0.0 绑定 socket 发送一次，保持单一网卡环境的既有行为。
+    pub fn send(&mut self, message: &str) -> usize {
+        let dst = match format!("255.255.255.255:{}", UDP_BROADCAST_PORT).parse::<SocketAddr>() {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("UDP 广播发现: 目标地址解析失败: {}", e);
+                return 0;
+            }
+        };
+        let addrs = broadcast_source_addrs();
+        self.retain_live(&addrs);
+
+        if addrs.is_empty() {
+            if self.fallback.is_none() {
+                let socket = match UdpSocket::bind("0.0.0.0:0") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("UDP 广播发现: 创建发送 socket 失败: {}", e);
+                        return 0;
+                    }
+                };
+                match socket.set_broadcast(true) {
+                    Ok(()) => self.fallback = Some(socket),
+                    Err(e) => {
+                        log::warn!("UDP 广播发现: 设置 UDP 广播失败: {}", e);
+                        return 0;
+                    }
+                }
+            }
+            if let Some(socket) = self.fallback.as_ref() {
+                if let Err(e) = socket.send_to(message.as_bytes(), dst) {
+                    log::debug!("UDP 广播发现: 发送失败: {}", e);
+                    return 0;
+                }
+                return 1;
+            }
+            return 0;
+        }
+
+        let mut sent = 0usize;
+        for ip in addrs {
+            let Some(socket) = self.socket_for(ip) else {
+                continue;
+            };
+            match socket.send_to(message.as_bytes(), dst) {
+                Ok(_) => sent += 1,
+                Err(e) => log::debug!("UDP 广播发现: 经 {} 发送失败: {}", ip, e),
+            }
+        }
+        sent
+    }
 }
 
 /// 创建 UDP 广播发现监听 socket（绑定 UDP_BROADCAST_PORT，接收其他设备的广播）。
@@ -576,21 +692,6 @@ pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
     Ok(socket)
 }
 
-/// 发送 UDP 广播发现消息：仅向 255.255.255.255 有限广播地址发送一条发现报文。
-///
-/// 已不再枚举网卡补发子网定向广播（x.x.x.255）：该做法在未接入网络的网卡（如 169.254.x.x
-/// 链路本地地址）上必然失败（Windows 报 os error 10051），既不产生任何有效发现，又会按
-/// 广播周期持续输出大量噪声日志，故整体移除；局域网发现由有限广播承担。
-pub fn send_udp_discovery_broadcast(socket: &UdpSocket, message: &str) -> Result<(), String> {
-    socket
-        .send_to(
-            message.as_bytes(),
-            format!("255.255.255.255:{}", UDP_BROADCAST_PORT),
-        )
-        .map(|_| ())
-        .map_err(|e| format!("UDP 有限广播失败: {}", e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +709,21 @@ mod tests {
     fn test_remove_device_session_not_exists() {
         let state = Arc::new(Mutex::new(TcpServerState::new()));
         remove_device_session(state.clone(), "test-uuid");
+    }
+
+    #[test]
+    fn broadcast_source_addr_excludes_loopback_unspecified_and_link_local() {
+        assert!(is_broadcast_source_addr(Ipv4Addr::new(192, 168, 31, 123)));
+        assert!(is_broadcast_source_addr(Ipv4Addr::new(10, 6, 22, 1)));
+        assert!(!is_broadcast_source_addr(Ipv4Addr::LOCALHOST));
+        assert!(!is_broadcast_source_addr(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_broadcast_source_addr(Ipv4Addr::new(169, 254, 46, 28)));
+    }
+
+    #[test]
+    fn discovery_sender_sends_at_least_once() {
+        // 无网卡环境下走 0.0.0.0 兜底，同样必须发送成功
+        let mut sender = UdpDiscoverySender::new();
+        assert!(sender.send("local-test:payload") >= 1);
     }
 }

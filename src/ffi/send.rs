@@ -623,17 +623,11 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                 .name("periodic-discovery".to_string())
                 .spawn(move || {
                     // UDP 广播发现线程：
-                    // - 以 BROADCAST_INTERVAL_MS 为周期广播本机发现信息（发送 socket）；
+                    // - 以 BROADCAST_INTERVAL_MS 为周期广播本机发现信息（每个可广播本机地址各发一条）；
                     // - 其余时间分片监听 UDP 广播端口，收到对端广播即解析并走统一消费链
                     //   （registry 登记 / device_ips 记录 / on_device_discovered 回调）。
                     // 移动网络（蜂窝）下无局域网广播域，广播不可达属预期，勿改回全段 TCP 扫描。
-                    let sender = match crate::network::create_udp_broadcast_socket() {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            log::warn!("UDP 广播发现: 创建发送 socket 失败: {}", e);
-                            None
-                        }
-                    };
+                    let mut sender = crate::network::UdpDiscoverySender::new();
                     // 监听 socket 绑定失败（如端口被其他实例占用）时不阻塞广播发送，退化为仅发送
                     let listener = match crate::network::bind_udp_discovery_listener() {
                         Ok(s) => Some(s),
@@ -642,9 +636,6 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                             None
                         }
                     };
-                    if sender.is_none() && listener.is_none() {
-                        return;
-                    }
 
                     // 首次进入循环即广播一次，缩短平台开启发现后的首个发现周期
                     let mut last_broadcast = Instant::now()
@@ -658,37 +649,35 @@ pub unsafe extern "C" fn nrc_periodic_broadcast(
                         }
 
                         // 1) 到点广播本机发现信息
-                        if let Some(sock) = sender.as_ref() {
-                            if last_broadcast.elapsed()
-                                >= Duration::from_millis(BROADCAST_INTERVAL_MS)
-                            {
-                                let msg = {
-                                    // 后台线程统一走 lock() 取锁，避免裸指针 + get_mut()
-                                    // 绕过互斥导致 CoreContext 数据竞争
-                                    let ctx = unsafe { &*(ctx_usize as *const SafeContext) };
-                                    let Ok(guard) = ctx.lock() else {
-                                        continue;
-                                    };
-                                    match &guard.broadcast_info {
-                                        Some(i) => codec::encode_discovery_request(
-                                            &i.uuid,
-                                            &i.name_b64,
-                                            codec::DEFAULT_TCP_PORT,
-                                            i.battery,
-                                            &i.device_type,
-                                        ),
-                                        None => String::new(),
-                                    }
+                        if last_broadcast.elapsed() >= Duration::from_millis(BROADCAST_INTERVAL_MS)
+                        {
+                            let msg = {
+                                // 后台线程统一走 lock() 取锁，避免裸指针 + get_mut()
+                                // 绕过互斥导致 CoreContext 数据竞争
+                                let ctx = unsafe { &*(ctx_usize as *const SafeContext) };
+                                let Ok(guard) = ctx.lock() else {
+                                    continue;
                                 };
-                                if !msg.is_empty() {
-                                    if let Err(e) =
-                                        crate::network::send_udp_discovery_broadcast(sock, &msg)
-                                    {
-                                        log::debug!("UDP 广播发现: 发送失败: {}", e);
-                                    }
+                                match &guard.broadcast_info {
+                                    Some(i) => codec::encode_discovery_request(
+                                        &i.uuid,
+                                        &i.name_b64,
+                                        codec::DEFAULT_TCP_PORT,
+                                        i.battery,
+                                        &i.device_type,
+                                    ),
+                                    None => String::new(),
                                 }
-                                last_broadcast = Instant::now();
+                            };
+                            if !msg.is_empty() {
+                                // 逐个本机可广播地址各发一条：出口网卡由绑定的源地址决定，
+                                // 不依赖 255.255.255.255 的路由选择，避免多网卡下单链路发送
+                                let sent = sender.send(&msg);
+                                if sent == 0 {
+                                    log::debug!("UDP 广播发现: 本轮无可用发送接口");
+                                }
                             }
+                            last_broadcast = Instant::now();
                         }
 
                         // 2) 分片监听对端广播（读超时 100ms，兼顾定时广播的及时性）
