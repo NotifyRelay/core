@@ -107,6 +107,8 @@ pub unsafe extern "C" fn nrc_enqueue_message(
         retries_left: 0,
         coalesce_key: None,
     });
+    // 补清理队列丢弃项遗留的去重键（此处未持有 ctx 锁）
+    queue.flush_orphan_keys();
     1
 }
 

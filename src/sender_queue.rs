@@ -25,8 +25,10 @@ pub struct SenderQueue {
     running: Arc<AtomicBool>,
     /// 当前并发发送任务数
     active: Arc<AtomicUsize>,
-    /// core 上下文指针：释放未发送即被丢弃项的去重键时使用（0 表示未绑定）
+    /// core 上下文指针：补清理未发送即被丢弃项的去重键时使用（0 表示未绑定）
     ctx_ptr: AtomicUsize,
+    /// 待补清理的去重键：丢弃发生在可能已持有 ctx 锁的调用栈内，此处只登记
+    orphan_keys: Arc<Mutex<Vec<String>>>,
 }
 
 struct SenderQueueInner {
@@ -72,6 +74,8 @@ impl SenderQueue {
     const DEFAULT_TIMEOUT_MS: u32 = 3000;
     /// 失败退避冷却上限（秒）
     const MAX_COOLDOWN_SECS: u64 = 5;
+    /// orphan_keys 上限（超出丢弃最旧记录，正常路径每轮 worker 即清空）
+    const MAX_ORPHAN_KEYS: usize = 4096;
 
     pub fn new() -> Self {
         Self {
@@ -85,6 +89,7 @@ impl SenderQueue {
             running: Arc::new(AtomicBool::new(true)),
             active: Arc::new(AtomicUsize::new(0)),
             ctx_ptr: AtomicUsize::new(0),
+            orphan_keys: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -132,26 +137,58 @@ impl SenderQueue {
         self.ctx_ptr.store(ctx_ptr, Ordering::Relaxed);
     }
 
-    /// 释放未发送即被丢弃项的去重键。
+    /// 登记未发送即被丢弃项的去重键，等待未持 ctx 锁的一侧补清理。
     ///
     /// 键自身不随项存放：遗漏清理会让该键永久驻留 pending，
     /// 导致后续相同负载被误判为重复而静默丢弃。
-    fn release_dedup_keys_at(ctx_ptr: usize, keys: &[String]) {
-        if ctx_ptr == 0 || keys.is_empty() {
+    /// 丢弃可能发生在已持有 ctx 锁的调用栈内（状态推送 → enqueue/purge_stale_realtime），
+    /// 而 SafeContext 是不可重入互斥锁，故此处只登记，不在原地加锁。
+    fn defer_orphan_keys_at(orphan: &Arc<Mutex<Vec<String>>>, keys: &[String]) {
+        if keys.is_empty() {
             return;
         }
-        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        if let Ok(mut guard) = ctx.lock() {
-            for key in keys {
-                if !key.is_empty() {
-                    guard.dedup.clear_pending(key);
-                }
+        if let Ok(mut list) = orphan.lock() {
+            let len = list.len();
+            if len + keys.len() > Self::MAX_ORPHAN_KEYS {
+                let overflow = len + keys.len() - Self::MAX_ORPHAN_KEYS;
+                list.drain(0..overflow.min(len));
             }
+            list.extend(keys.iter().filter(|k| !k.is_empty()).cloned());
         }
     }
 
-    fn release_dedup_keys(&self, keys: &[String]) {
-        Self::release_dedup_keys_at(self.ctx_ptr.load(Ordering::Relaxed), keys);
+    fn defer_orphan_keys(&self, keys: &[String]) {
+        Self::defer_orphan_keys_at(&self.orphan_keys, keys);
+    }
+
+    /// 补清理延迟释放的键（worker 每轮与 FFI 入队路径调用，调用时未持有 ctx 锁）
+    fn flush_orphan_keys_at(ctx_ptr: usize, orphan: &Arc<Mutex<Vec<String>>>) {
+        if ctx_ptr == 0 {
+            return;
+        }
+        let keys: Vec<String> = match orphan.lock() {
+            Ok(mut list) => {
+                if list.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *list)
+            }
+            Err(_) => return,
+        };
+        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+        match ctx.lock() {
+            Ok(mut guard) => {
+                for key in &keys {
+                    guard.dedup.clear_pending(key);
+                }
+            }
+            // 取锁失败：回填，留待下一次补清理
+            Err(_) => Self::defer_orphan_keys_at(orphan, &keys),
+        }
+    }
+
+    pub(crate) fn flush_orphan_keys(&self) {
+        Self::flush_orphan_keys_at(self.ctx_ptr.load(Ordering::Relaxed), &self.orphan_keys);
     }
 
     /// 清理指定设备 + header 下已过期的实时状态积压（FULL 与 DELTA 均适用）。
@@ -192,9 +229,8 @@ impl SenderQueue {
             keep
         });
         let dropped = before - inner.items.len();
-        drop(inner);
-        // 释放被丢弃项的去重键（需在 inner 锁释放后进行）
-        self.release_dedup_keys(&dropped_keys);
+        // 登记被丢弃项的去重键，交由未持 ctx 锁的一侧补清理
+        self.defer_orphan_keys(&dropped_keys);
         if dropped > 0 {
             log::debug!(
                 "发送队列: 清理过期实时状态积压 uuid={} header={}, 丢弃 {} 条",
@@ -253,8 +289,8 @@ impl SenderQueue {
             }
             inner.items.push(item);
         }
-        // 释放被替换旧项的去重键（需在 inner 锁释放后进行）
-        self.release_dedup_keys(&replaced_keys);
+        // 登记被替换旧项的去重键，交由未持 ctx 锁的一侧补清理
+        self.defer_orphan_keys(&replaced_keys);
     }
 
     /// 启动后台调度线程（实际发送在并发任务线程中执行，同设备串行）
@@ -262,6 +298,7 @@ impl SenderQueue {
         let inner = self.inner.clone();
         let running = self.running.clone();
         let active = self.active.clone();
+        let orphan = self.orphan_keys.clone();
 
         thread::Builder::new()
             .name("sender-queue".to_string())
@@ -270,6 +307,9 @@ impl SenderQueue {
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
+
+                    // 补清理延迟释放的去重键（此处未持 ctx 锁）
+                    Self::flush_orphan_keys_at(ctx_ptr, &orphan);
 
                     if active.load(Ordering::Relaxed) >= Self::MAX_CONCURRENT {
                         thread::sleep(Duration::from_millis(20));
@@ -334,8 +374,8 @@ impl SenderQueue {
                             None => None,
                         }
                     };
-                    // 释放被丢弃项的去重键（需在 inner 锁释放后进行）
-                    Self::release_dedup_keys_at(ctx_ptr, &stale_keys);
+                    // 登记被丢弃项的去重键，交由补清理路径释放
+                    Self::defer_orphan_keys_at(&orphan, &stale_keys);
 
                     match item {
                         Some(item) => {
@@ -347,18 +387,19 @@ impl SenderQueue {
                                 dedup_key: item.dedup_key.clone(),
                             };
                             let task_inner = inner.clone();
+                            let task_orphan = orphan.clone();
                             let orphan_key = item.dedup_key.clone();
                             let spawn_result = thread::Builder::new()
                                 .name("sender-task".to_string())
                                 .spawn(move || {
                                     let _guard = task_guard;
-                                    Self::process_item(ctx_ptr, &item, &task_inner);
+                                    Self::process_item(ctx_ptr, &item, &task_inner, &task_orphan);
                                 });
                             if let Err(e) = spawn_result {
                                 // spawn 失败时闭包被丢弃：TaskGuard 的 Drop 已清理并发状态，
-                                // 该项不会发送，需同时释放其去重键
+                                // 该项不会发送，需同时登记其去重键待补清理
                                 if let Some(ref key) = orphan_key {
-                                    Self::release_dedup_keys_at(ctx_ptr, std::slice::from_ref(key));
+                                    Self::defer_orphan_keys_at(&orphan, std::slice::from_ref(key));
                                 }
                                 log::warn!("发送队列: 派生发送任务失败: {}", e);
                                 thread::sleep(Duration::from_millis(100));
@@ -373,13 +414,18 @@ impl SenderQueue {
             .expect("启动发送队列线程失败");
     }
 
-    fn process_item(ctx_ptr: usize, item: &SendItem, inner: &Arc<Mutex<SenderQueueInner>>) {
+    fn process_item(
+        ctx_ptr: usize,
+        item: &SendItem,
+        inner: &Arc<Mutex<SenderQueueInner>>,
+        orphan: &Arc<Mutex<Vec<String>>>,
+    ) {
         let send_ok = match Self::try_send(ctx_ptr, item) {
             Ok(v) => v,
             Err(_) => {
-                // 取锁失败使该项未发送即被丢弃：释放其去重键
+                // 取锁失败使该项未发送即被丢弃：登记其去重键待补清理
                 if let Some(ref key) = item.dedup_key {
-                    Self::release_dedup_keys_at(ctx_ptr, std::slice::from_ref(key));
+                    Self::defer_orphan_keys_at(orphan, std::slice::from_ref(key));
                 }
                 return;
             }
@@ -799,10 +845,48 @@ mod tests {
         q.enqueue(item_with_key("dev1", "DATA_MEDIAPLAY", &payload, "k-purge"));
 
         assert_eq!(q.purge_stale_realtime("dev1", "DATA_MEDIAPLAY"), 1);
+        // 丢弃仅登记，由补清理路径释放
+        q.flush_orphan_keys();
         // 丢弃项的去重键必须被释放，否则相同负载会被永久判为重复
         assert!(
             ctx.lock().unwrap().dedup.check_and_pend("k-purge", 3000),
             "被丢弃项的去重键应已释放"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_while_ctx_locked_defers_release_without_deadlock() {
+        let ctx = make_ctx("nested");
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        let q = SenderQueue::new();
+        q.set_ctx_ptr(ctx_ptr);
+
+        {
+            let mut guard = ctx.lock().unwrap();
+            assert!(guard.dedup.check_and_pend("k-old", 3000));
+        }
+
+        // 模拟状态推送路径：持 ctx 锁调用 enqueue（第二次入队触发 coalesce 丢弃第一项）
+        {
+            let _guard = ctx.lock().unwrap();
+            q.enqueue(item_with_key(
+                "dev1",
+                "DATA_MEDIAPLAY",
+                r#"{"title":"a"}"#,
+                "k-old",
+            ));
+            q.enqueue(item_with_key(
+                "dev1",
+                "DATA_MEDIAPLAY",
+                r#"{"title":"b"}"#,
+                "k-new",
+            ));
+        }
+
+        q.flush_orphan_keys();
+        assert!(
+            ctx.lock().unwrap().dedup.check_and_pend("k-old", 3000),
+            "持锁路径丢弃的键应由补清理释放"
         );
     }
 
@@ -831,6 +915,7 @@ mod tests {
             r#"{"title":"b"}"#,
             "k-new",
         ));
+        q.flush_orphan_keys();
 
         let mut guard = ctx.lock().unwrap();
         assert!(
