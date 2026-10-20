@@ -891,6 +891,27 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_orphan_keys_keeps_sent_window() {
+        let ctx = make_ctx("flush-sent");
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        let q = SenderQueue::new();
+        q.set_ctx_ptr(ctx_ptr);
+
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.dedup.mark_sent("k-sent");
+        }
+        q.defer_orphan_keys(&["k-sent".to_string()]);
+        q.flush_orphan_keys();
+
+        // 补清理只清 pending，不得影响已发送键的窗口
+        assert!(
+            !ctx.lock().unwrap().dedup.check_and_pend("k-sent", 3000),
+            "已发送键的窗口不应被补清理影响"
+        );
+    }
+
+    #[test]
     fn test_coalesce_replacement_releases_old_key() {
         let ctx = make_ctx("coalesce");
         let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
