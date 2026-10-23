@@ -2,6 +2,52 @@ use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, to_cstr};
 
+/// 图标请求入参（已解除 C 侧指针的原始入参集合）。
+struct IconRequestArgs {
+    packages_json: *const c_char,
+    installed_json: *const c_char,
+    cached_json: *const c_char,
+    app_device_json: *const c_char,
+    source_device_uuid: *const c_char,
+    now_ms: i64,
+}
+
+/// 解析图标请求入参并在上下文锁内构造报文。
+/// release_pending 为真时先解除同批包名的旧登记，再交给 prepare 重新判定。
+unsafe fn request_icons_impl(
+    ctx_ptr: *mut c_void,
+    args: IconRequestArgs,
+    release_pending: bool,
+) -> *mut c_char {
+    if ctx_ptr.is_null() {
+        return to_cstr("{}");
+    }
+    let packages = parse_str_array(from_cstr(args.packages_json));
+    let installed = parse_str_array(from_cstr(args.installed_json));
+    let cached = parse_str_array(from_cstr(args.cached_json));
+    let app_device = parse_map(from_cstr(args.app_device_json));
+    let source = from_cstr(args.source_device_uuid);
+
+    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
+    let guard = match ctx.get_mut() {
+        Ok(g) => g,
+        Err(_) => return to_cstr("{}"),
+    };
+    if release_pending {
+        crate::app_sync::clear_icon_pending(&mut guard.app_sync, &packages);
+    }
+    let result = crate::app_sync::prepare_icon_request(
+        &mut guard.app_sync,
+        &packages,
+        &installed,
+        &cached,
+        &app_device,
+        source,
+        args.now_ms,
+    );
+    to_cstr(&result)
+}
+
 /// 批量过滤并构造图标请求报文（Rust 内部维护 pending 状态与超时清理）。
 ///
 /// 参数：
@@ -23,30 +69,48 @@ pub unsafe extern "C" fn nrc_app_sync_prepare_icon_request(
     source_device_uuid: *const c_char,
     now_ms: i64,
 ) -> *mut c_char {
-    if ctx_ptr.is_null() {
-        return to_cstr("{}");
-    }
-    let packages = parse_str_array(from_cstr(packages_json));
-    let installed = parse_str_array(from_cstr(installed_json));
-    let cached = parse_str_array(from_cstr(cached_json));
-    let app_device = parse_map(from_cstr(app_device_json));
-    let source = from_cstr(source_device_uuid);
-
-    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.get_mut() {
-        Ok(g) => g,
-        Err(_) => return to_cstr("{}"),
-    };
-    let result = crate::app_sync::prepare_icon_request(
-        &mut guard.app_sync,
-        &packages,
-        &installed,
-        &cached,
-        &app_device,
-        source,
+    let args = IconRequestArgs {
+        packages_json,
+        installed_json,
+        cached_json,
+        app_device_json,
+        source_device_uuid,
         now_ms,
-    );
-    to_cstr(&result)
+    };
+    request_icons_impl(ctx_ptr, args, false)
+}
+
+/// 图标请求聚合入口：先解除同批包名的旧登记，再过滤并构造图标请求报文。
+///
+/// 参数：
+/// - packages_json: 候选包名数组 JSON
+/// - installed_json: 本机已安装包名数组 JSON
+/// - cached_json: 已缓存图标包名数组 JSON
+/// - app_device_json: 包名 -> 来源设备 UUID 数组 的映射 JSON（可能为空对象 {}）
+/// - source_device_uuid: 当前来源设备 UUID
+/// - now_ms: 当前时间戳（毫秒）
+///
+/// 返回 JSON（ICON_REQUEST 报文，与 nrc_app_sync_prepare_icon_request 一致）；无需请求时返回 {}
+/// 每次调用自带旧登记解除，调用方无需再调用 nrc_app_sync_clear_icon_pending。
+#[no_mangle]
+pub unsafe extern "C" fn nrc_app_sync_request_icons(
+    ctx_ptr: *mut c_void,
+    packages_json: *const c_char,
+    installed_json: *const c_char,
+    cached_json: *const c_char,
+    app_device_json: *const c_char,
+    source_device_uuid: *const c_char,
+    now_ms: i64,
+) -> *mut c_char {
+    let args = IconRequestArgs {
+        packages_json,
+        installed_json,
+        cached_json,
+        app_device_json,
+        source_device_uuid,
+        now_ms,
+    };
+    request_icons_impl(ctx_ptr, args, true)
 }
 
 /// 清除已完成的图标请求登记（收到响应或关联成功后调用）

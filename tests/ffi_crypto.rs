@@ -347,3 +347,193 @@ fn test_decrypt_local_state_invalid_ciphertext_fails() {
         free_cstr(bad);
     }
 }
+
+// ==================== 本地状态序列化 / 反序列化聚合入口 ====================
+
+/// 调用序列化聚合入口并按需释放返回值
+fn serialize_state(ctx: &SafeContext, uuid: &str, encrypt: i32) -> String {
+    let u = cstr(uuid);
+    let r = unsafe { ffi::key_management::nrc_serialize_local_state(ctx_ptr(ctx), u, encrypt) };
+    let out = unsafe { read_cstr(r) };
+    unsafe {
+        free_str(r);
+        free_cstr(u);
+    }
+    out
+}
+
+/// 调用反序列化聚合入口并解析返回的 JSON
+fn deserialize_state(
+    ctx: &SafeContext,
+    payload: &str,
+    uuid: &str,
+    encrypted: i32,
+) -> serde_json::Value {
+    let p = cstr(payload);
+    let u = cstr(uuid);
+    let r =
+        unsafe { ffi::key_management::nrc_deserialize_local_state(ctx_ptr(ctx), p, u, encrypted) };
+    let out = unsafe { read_cstr(r) };
+    unsafe {
+        free_str(r);
+        free_cstr(p);
+        free_cstr(u);
+    }
+    serde_json::from_str(&out).unwrap_or_else(|_| panic!("应返回合法 JSON: {}", out))
+}
+
+/// 读取上下文导出的状态 JSON
+fn export_state_str(ctx: &SafeContext) -> String {
+    let state = ffi::key_management::nrc_export_state(ctx_ptr(ctx));
+    let s = unsafe { read_cstr(state) };
+    unsafe { free_str(state) };
+    s
+}
+
+/// 读取上下文导出的设备密钥 JSON
+fn export_device_key_str(ctx: &SafeContext, uuid: &str) -> String {
+    let u = cstr(uuid);
+    let key = unsafe { ffi::key_management::nrc_export_device_key(ctx_ptr(ctx), u) };
+    let s = unsafe { read_cstr(key) };
+    unsafe {
+        free_str(key);
+        free_cstr(u);
+    }
+    s
+}
+
+/// 读取上下文的本机公钥
+fn public_key_str(ctx: &SafeContext) -> String {
+    let p = ffi::ecdh::nrc_ecdh_get_public_key(ctx_ptr(ctx));
+    let s = unsafe { read_cstr(p) };
+    unsafe { free_str(p) };
+    s
+}
+
+/// 为上下文准备可导出的状态：本地密钥对 + 一个设备密钥
+fn seed_state(ctx: &SafeContext) {
+    let ptr = ctx_ptr(ctx);
+    assert_eq!(ffi::ecdh::nrc_ecdh_generate_keypair(ptr), 0);
+    let uuid = cstr("device-1");
+    let key = [7u8; 32];
+    let migrated =
+        unsafe { ffi::key_management::nrc_migrate_shared_secret(ptr, uuid, key.as_ptr(), 32) };
+    assert_eq!(migrated, 0);
+    unsafe { free_cstr(uuid) };
+}
+
+#[test]
+fn test_serialize_local_state_plain_matches_export_state() {
+    // encrypt=0 时聚合入口与 nrc_export_state 的结果一致
+    let ctx = create_ctx();
+    seed_state(&ctx);
+
+    let aggregated = serialize_state(&ctx, "device-1", 0);
+    let exported = export_state_str(&ctx);
+    // 状态内 devices 为映射，按解析后的结构比对
+    let agg_json: serde_json::Value = serde_json::from_str(&aggregated).unwrap();
+    let exp_json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(agg_json, exp_json);
+    assert!(aggregated.contains("local_private_key_pem"));
+    assert!(aggregated.contains("local_public_key_b64"));
+}
+
+#[test]
+fn test_serialize_local_state_encrypted_matches_two_step() {
+    // encrypt=1 时聚合入口与「export_state → encrypt_local_state」两步等价（解密后比对）
+    let ctx = create_ctx();
+    seed_state(&ctx);
+    let ptr = ctx_ptr(&ctx);
+
+    let encrypted = serialize_state(&ctx, "device-1", 1);
+    // 密文不含明文状态字段
+    assert!(!encrypted.contains("local_private_key_pem"));
+
+    // 用两步原语解密，结果应与导出状态一致
+    let uuid = cstr("device-1");
+    let enc_c = CString::new(encrypted).unwrap();
+    let decrypted =
+        unsafe { ffi::key_management::nrc_decrypt_local_state(ptr, enc_c.as_ptr(), uuid) };
+    let plain = unsafe { read_cstr(decrypted) };
+    unsafe { free_str(decrypted) };
+
+    let plain_json: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    let exported = export_state_str(&ctx);
+    let exp_json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(plain_json, exp_json);
+    unsafe { free_cstr(uuid) };
+}
+
+#[test]
+fn test_deserialize_local_state_plain_import() {
+    // 明文状态直接导入可还原到另一上下文
+    let src = create_ctx();
+    let dst = create_ctx();
+    seed_state(&src);
+
+    let plain = serialize_state(&src, "device-1", 0);
+    let result = deserialize_state(&dst, &plain, "device-1", 0);
+    assert_eq!(result["ok"], true);
+
+    // 导入后本地公钥与设备密钥一致
+    assert_eq!(public_key_str(&src), public_key_str(&dst));
+    let key_src = export_device_key_str(&src, "device-1");
+    let key_dst = export_device_key_str(&dst, "device-1");
+    assert_eq!(key_src, key_dst);
+}
+
+#[test]
+fn test_serialize_deserialize_roundtrip_encrypted() {
+    // 加密序列化 → 加密反序列化：状态可完整还原
+    let src = create_ctx();
+    let dst = create_ctx();
+    seed_state(&src);
+
+    let encrypted = serialize_state(&src, "device-1", 1);
+    let result = deserialize_state(&dst, &encrypted, "device-1", 1);
+    assert_eq!(result["ok"], true);
+    assert_eq!(public_key_str(&src), public_key_str(&dst));
+    assert_eq!(ffi::ecdh::nrc_ecdh_has_keypair(ctx_ptr(&dst)), 1);
+}
+
+#[test]
+fn test_deserialize_local_state_wrong_uuid_fails() {
+    // 设备 UUID 不同 → 派生的本地状态密钥不同 → 解密失败，状态不导入
+    let src = create_ctx();
+    let dst = create_ctx();
+    seed_state(&src);
+
+    let encrypted = serialize_state(&src, "device-1", 1);
+    let result = deserialize_state(&dst, &encrypted, "device-2", 1);
+    assert_eq!(result["ok"], false);
+    assert_eq!(ffi::ecdh::nrc_ecdh_has_keypair(ctx_ptr(&dst)), 0);
+}
+
+#[test]
+fn test_deserialize_local_state_invalid_payload_fails() {
+    // 明文非合法状态 JSON → 解析失败，返回 ok=false
+    let ctx = create_ctx();
+    let bad_plain = deserialize_state(&ctx, "not-json-at-all", "device-1", 0);
+    assert_eq!(bad_plain["ok"], false);
+    // 密文非法 → 解密失败，返回 ok=false
+    let bad_cipher = deserialize_state(&ctx, "AA", "device-1", 1);
+    assert_eq!(bad_cipher["ok"], false);
+}
+
+#[test]
+fn test_serialize_local_state_null_ctx_returns_null() {
+    let uuid = cstr("device-1");
+    let r =
+        unsafe { ffi::key_management::nrc_serialize_local_state(std::ptr::null_mut(), uuid, 0) };
+    assert!(r.is_null());
+
+    // 空上下文的反序列化返回失败标记，不崩溃
+    let d = unsafe {
+        ffi::key_management::nrc_deserialize_local_state(std::ptr::null_mut(), uuid, uuid, 0)
+    };
+    assert_eq!(unsafe { read_cstr(d) }, r#"{"ok":false}"#);
+    unsafe {
+        free_str(d);
+        free_cstr(uuid);
+    }
+}

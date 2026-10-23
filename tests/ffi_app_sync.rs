@@ -254,3 +254,107 @@ fn test_clear_icon_pending_after_prepare() {
     );
     assert!(!r2.to_string().is_empty() || !r3.to_string().is_empty());
 }
+
+/// 聚合入口的测试封装（参数与 prepare_icon_request 封装一致）
+fn request_icons(
+    ctx: &SafeContext,
+    packages: &str,
+    installed: &str,
+    cached: &str,
+    app_device: &str,
+    source: &str,
+    now_ms: i64,
+) -> serde_json::Value {
+    let p = cstr(packages);
+    let i = cstr(installed);
+    let c = cstr(cached);
+    let m = cstr(app_device);
+    let s = cstr(source);
+    let ptr = ctx_ptr(ctx);
+    let r = unsafe { ffi::app_sync::nrc_app_sync_request_icons(ptr, p, i, c, m, s, now_ms) };
+    let out = unsafe { read_cstr(r) };
+    unsafe {
+        free_str(r);
+        free_cstr(p);
+        free_cstr(i);
+        free_cstr(c);
+        free_cstr(m);
+        free_cstr(s);
+    }
+    serde_json::from_str(&out).unwrap_or_else(|_| panic!("应返回合法 JSON: {}", out))
+}
+
+#[test]
+fn test_request_icons_matches_two_step_primitives() {
+    // 聚合入口与「clear + prepare」两步串联的报文结果必须等价（含已有 pending 的情形）
+    let agg_ctx = create_ctx();
+    let two_ctx = create_ctx();
+    let packages = r#"["com.a","com.b","com.c"]"#;
+
+    // 两个上下文都先登记同一批包名，使 pending 状态一致
+    let _ = prepare_icon_request(&agg_ctx, packages, "[]", "[]", "{}", "dev-1", 900);
+    let _ = prepare_icon_request(&two_ctx, packages, "[]", "[]", "{}", "dev-1", 900);
+
+    // 两步：先清空候选包名登记，再 prepare
+    let clear = cstr(packages);
+    unsafe {
+        ffi::app_sync::nrc_app_sync_clear_icon_pending(ctx_ptr(&two_ctx), clear);
+        free_cstr(clear);
+    }
+    let two_step = prepare_icon_request(&two_ctx, packages, "[]", "[]", "{}", "dev-1", 1000);
+    let aggregated = request_icons(&agg_ctx, packages, "[]", "[]", "{}", "dev-1", 1000);
+    assert_eq!(aggregated, two_step);
+    assert_eq!(aggregated["type"], "ICON_REQUEST");
+}
+
+#[test]
+fn test_request_icons_clears_previous_pending() {
+    // 聚合入口自带旧登记解除：连续调用仍能重新生成请求报文
+    let ctx = create_ctx();
+    let first = request_icons(&ctx, r#"["com.a"]"#, "[]", "[]", "{}", "dev-1", 1000);
+    assert_eq!(first["packageName"], "com.a");
+
+    // 对照：两步原语不做 clear 时，同一 TTL 窗口内被判定为进行中
+    let still_pending = prepare_icon_request(&ctx, r#"["com.a"]"#, "[]", "[]", "{}", "dev-1", 2000);
+    assert_eq!(still_pending, serde_json::json!({}));
+
+    // 聚合入口自带 clear，同一时间点仍能重新生成
+    let second = request_icons(&ctx, r#"["com.a"]"#, "[]", "[]", "{}", "dev-1", 2000);
+    assert_eq!(second["packageName"], "com.a");
+}
+
+#[test]
+fn test_request_icons_still_honors_filters() {
+    // 聚合入口保留 prepare 的全部过滤语义
+    let ctx = create_ctx();
+    let result = request_icons(
+        &ctx,
+        r#"["com.installed","com.cached","com.other"]"#,
+        r#"["com.installed"]"#,
+        r#"["com.cached"]"#,
+        r#"{"com.other":["dev-2"]}"#,
+        "dev-1",
+        1000,
+    );
+    assert_eq!(result, serde_json::json!({}));
+}
+
+#[test]
+fn test_request_icons_null_ctx_returns_empty() {
+    let p = cstr(r#"["com.a"]"#);
+    let i = cstr("[]");
+    let c = cstr("[]");
+    let m = cstr("{}");
+    let s = cstr("dev-1");
+    let null_ctx: *mut c_void = std::ptr::null_mut();
+    let r = unsafe { ffi::app_sync::nrc_app_sync_request_icons(null_ctx, p, i, c, m, s, 1000) };
+    assert_eq!(unsafe { read_cstr(r) }, "{}");
+    unsafe {
+        free_str(r);
+        free_cstr(p);
+        free_cstr(i);
+        free_cstr(c);
+        free_cstr(m);
+        free_cstr(s);
+    }
+}
