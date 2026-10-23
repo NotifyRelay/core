@@ -34,6 +34,9 @@ parking_lot = "0.12"
 threadpool = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 zeroize = "1"
+# UniFFI：Kotlin 绑定由 gobley-uniffi-bindgen 0.3.7 生成，其内置 uniffi_bindgen 为 0.29.4。
+# 元数据格式按精确版本校验，此处必须锁定同一版本，否则 bindgen 静默只产出公共骨架。
+uniffi = "=0.29.4"
 
 [dev-dependencies]
 env_logger = "0.11"

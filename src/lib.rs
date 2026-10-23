@@ -1,5 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 
+pub mod api;
 mod app_sync;
 pub mod audio_codec;
 pub mod audio_stream;
@@ -510,3 +511,7 @@ impl Default for CoreContext {
 }
 
 pub type SafeContext = Mutex<CoreContext>;
+
+// UniFFI 脚手架：生成 Kotlin 绑定所需的元数据与符号。
+// 由 gobley-uniffi-bindgen 0.3.7 从编译产物中读取。
+uniffi::setup_scaffolding!("notify_relay_core");
