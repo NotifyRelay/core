@@ -175,6 +175,54 @@ fn skipped(reason: &str) -> String {
     serde_json::json!({ "action": "skipped", "reason": reason }).to_string()
 }
 
+// ===== 上下文级剪贴板入口 =====
+
+/// 剪贴板内容变化入口（供 ABI / UniFFI 共用）。
+///
+/// 内部完成类型归一化、内容去重、防循环、频率限制与 2MB 阈值判定，
+/// 通过后直接构造报文按 targets 逐个入队发送。
+pub fn on_changed_for(
+    ctx_ptr: usize,
+    queue_handle: u64,
+    targets_json: &str,
+    mime: &str,
+    content: &str,
+    now_ms: i64,
+    force: bool,
+) -> String {
+    let targets: Vec<String> = serde_json::from_str::<Vec<String>>(targets_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|u| !u.is_empty())
+        .collect();
+    if targets.is_empty() {
+        return skipped("no targets");
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return skipped("lock failed");
+    };
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    on_changed(
+        &mut guard.clipboard,
+        queue,
+        &targets,
+        mime,
+        content,
+        now_ms,
+        force,
+    )
+}
+
+/// 收到远程剪贴板报文入口（供 ABI / UniFFI 共用）。
+pub fn on_received_for(ctx_ptr: usize, payload_json: &str, now_ms: i64) -> String {
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return r#"{"type":"text","content":""}"#.to_string();
+    };
+    on_received(&mut guard.clipboard, payload_json, now_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

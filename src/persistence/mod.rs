@@ -643,3 +643,58 @@ pub fn load_all(
     }
     Ok(())
 }
+
+// ===== 上下文级持久化入口 =====
+
+/// 获取本机 UUID（库为准；库无记录则生成 v4 UUID 并落库）。
+///
+/// 读取前自动落盘（dirty 时写入 uuid/state/设备行），失败返回 `None`。
+/// 平台端应以 `None` 判定「持久化未就绪」，此时不得清理旧平台存储（迁移未完成）。
+pub fn local_uuid(ctx: &mut crate::CoreContext) -> Option<String> {
+    ctx.ensure_persistence_loaded();
+    // 平台端通过本接口确认身份来源，激活持久化（uuid 由 Rust 生成持有）
+    ctx.persistence_activated = true;
+    if !ctx.ensure_local_uuid() {
+        return None;
+    }
+    // flush 失败即「持久化未就绪」：uuid 即便已写入库，设备密钥/状态也未落盘，
+    // 平台端若据此清理旧存储将永久丢失密钥，必须返回 None 阻止清理
+    if !ctx.flush_persistence() {
+        return None;
+    }
+    match ctx.persistence.as_ref().and_then(|p| p.get_local_uuid()) {
+        Some(u) if !u.is_empty() => Some(u),
+        _ => None,
+    }
+}
+
+/// 更新设备显示名（改名；亦用于迁移期设备名称导入）。
+///
+/// 直写库行 + 同步运行时注册表；参数为空或写库失败返回 `false`。
+pub fn rename_device(ctx: &mut crate::CoreContext, device_uuid: &str, name: &str) -> bool {
+    ctx.ensure_persistence_loaded();
+    if device_uuid.is_empty() || name.is_empty() {
+        return false;
+    }
+    let now = crate::device_registry::now_sec();
+    let entry = ctx
+        .persisted_devices
+        .entry(device_uuid.to_string())
+        .or_insert_with(|| PersistedDevice {
+            uuid: device_uuid.to_string(),
+            created_at: now,
+            ..Default::default()
+        });
+    entry.display_name = name.to_string();
+    entry.updated_at = now;
+    // 运行时名称同步（不影响 last_seen）
+    ctx.registry.upsert_no_seen(
+        device_uuid,
+        name,
+        "",
+        0,
+        crate::device_registry::BATTERY_UNKNOWN,
+        "",
+    );
+    ctx.persist_device_row_now(device_uuid)
+}

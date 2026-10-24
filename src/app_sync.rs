@@ -234,6 +234,82 @@ pub fn parse_applist_response(payload: &str) -> String {
     .to_string()
 }
 
+// ===== 上下文级应用同步入口 =====
+
+fn parse_str_array(s: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(s)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn parse_map(s: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if let Some(arr) = val.as_array() {
+                    let uuids: Vec<String> = arr
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                    map.insert(k.clone(), uuids);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 图标请求聚合入口（供 ABI / UniFFI 共用）。
+///
+/// `release_pending` 为真时先解除同批包名的旧登记，再交给 prepare 重新判定。
+#[allow(clippy::too_many_arguments)]
+pub fn request_icons_for(
+    ctx_ptr: usize,
+    packages_json: &str,
+    installed_json: &str,
+    cached_json: &str,
+    app_device_json: &str,
+    source_device_uuid: &str,
+    now_ms: i64,
+    release_pending: bool,
+) -> String {
+    let packages = parse_str_array(packages_json);
+    let installed = parse_str_array(installed_json);
+    let cached = parse_str_array(cached_json);
+    let app_device = parse_map(app_device_json);
+
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return "{}".to_string();
+    };
+    if release_pending {
+        clear_icon_pending(&mut guard.app_sync, &packages);
+    }
+    prepare_icon_request(
+        &mut guard.app_sync,
+        &packages,
+        &installed,
+        &cached,
+        &app_device,
+        source_device_uuid,
+        now_ms,
+    )
+}
+
+/// 清除已完成的图标请求登记。
+pub fn clear_icon_pending_for(ctx_ptr: usize, packages_json: &str) {
+    let packages = parse_str_array(packages_json);
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return;
+    };
+    clear_icon_pending(&mut guard.app_sync, &packages);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

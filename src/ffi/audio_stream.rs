@@ -1,63 +1,13 @@
+//! 音频流 C ABI 委托。
+
 use std::os::raw::{c_char, c_void};
 
-use super::common::{from_cstr, with_ctx};
-use crate::{audio_stream, crypto::aes, network, protocol::codec, protocol::version, SafeContext};
+use super::common::from_cstr;
 
-fn send_control(
-    ctx: &crate::CoreContext,
-    remote_uuid: &str,
-    action: &str,
-    sample_rate: i32,
-    channels: i32,
-) {
-    log::info!(
-        "音频流: send_control 开始 action={}, 远端UUID={}",
-        action,
-        remote_uuid
-    );
-    let payload = if action == "audioStart" {
-        format!(
-            r#"{{"type":"MEDIA_CONTROL","action":"{}","sampleRate":{},"channels":{},"codec":"opus"}}"#,
-            action, sample_rate, channels
-        )
-    } else {
-        format!(r#"{{"type":"MEDIA_CONTROL","action":"{}"}}"#, action)
-    };
-
-    let key_arr = match ctx.crypto.get_aes_key(remote_uuid) {
-        Some(k) => k,
-        None => {
-            log::warn!("音频流: 未找到对端密钥或密钥无效 uuid={}", remote_uuid);
-            return;
-        }
-    };
-
-    let local_uuid = ctx
-        .broadcast_info
-        .as_ref()
-        .map(|i| i.uuid.clone())
-        .unwrap_or_default();
-
-    // DATA 通道加密统一绑定 core 版本 AAD（与 sender_queue / process_data 一致）
-    if let Ok(encrypted) = aes::encrypt_with_aad(&key_arr, payload.as_bytes(), &version::data_aad())
-    {
-        let msg = codec::encode_data_message("DATA_MEDIA_CONTROL", &local_uuid, "", &encrypted);
-        let ip = ctx.audio.lock().unwrap().peer_ip.clone();
-
-        if !ip.is_empty() && ip != "0.0.0.0" {
-            if network::oneshot_send_only(&msg, &ip, codec::DEFAULT_TCP_PORT, 3000) {
-                log::info!("音频流: 已发送控制消息 action={}", action);
-            } else {
-                log::warn!("音频流: oneshot 发送控制消息失败 action={}", action);
-            }
-        } else {
-            log::warn!("音频流: 无有效IP发送控制消息 uuid={}", remote_uuid);
-        }
-    } else {
-        log::error!("音频流: 加密控制消息失败");
-    }
-}
-
+/// 启动音频流。`direction` 为 "send" 或 "recv"。
+///
+/// # Safety
+/// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_audio_start(
     ctx_ptr: *mut c_void,
@@ -67,146 +17,44 @@ pub unsafe extern "C" fn nrc_audio_start(
     channels: i32,
     remote_uuid: *const c_char,
 ) -> i32 {
-    let dir = from_cstr(direction).to_string();
-    let ruuid = from_cstr(remote_uuid).to_string();
-    let p = port as u16;
-
-    log::info!(
-        "音频流: nrc_audio_start 方向={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
-        dir,
+    if ctx_ptr.is_null() {
+        return -1;
+    }
+    let direction = unsafe { from_cstr(direction) };
+    let remote_uuid = unsafe { from_cstr(remote_uuid) };
+    crate::audio_stream::start(
+        unsafe { &*(ctx_ptr as *const crate::SafeContext) },
+        direction,
         port,
         sample_rate,
         channels,
-        ruuid
-    );
-
-    let mut start_ok = false;
-
-    if !ctx_ptr.is_null() {
-        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        {
-            let guard = ctx.get_mut().unwrap();
-            let mut audio_state = guard.audio.lock().unwrap();
-            audio_state.remote_uuid = ruuid.clone();
-
-            start_ok = match dir.as_str() {
-                "send" => {
-                    let resolved_ip = guard
-                        .device_ips
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&ruuid).cloned())
-                        .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
-                        .unwrap_or_else(|| {
-                            log::error!("音频流: 无法解析对端IP uuid={}", ruuid);
-                            String::new()
-                        });
-                    if resolved_ip.is_empty() {
-                        false
-                    } else {
-                        audio_state.peer_ip = resolved_ip.clone();
-                        audio_stream::start_sender(
-                            &mut audio_state,
-                            &resolved_ip,
-                            p,
-                            sample_rate,
-                            channels,
-                        )
-                    }
-                }
-                "recv" => {
-                    audio_state.peer_ip = String::new();
-                    audio_stream::start_receiver(&mut audio_state, p, sample_rate, channels)
-                }
-                _ => {
-                    log::error!("音频流 FFI: 未知方向 {dir}");
-                    false
-                }
-            };
-        }
-    }
-
-    if start_ok {
-        log::info!("音频流: nrc_audio_start 成功");
-        if dir == "send" {
-            with_ctx(ctx_ptr, |ctx| {
-                send_control(ctx, &ruuid, "audioStart", sample_rate, channels);
-            });
-        }
-        0
-    } else {
-        log::error!("音频流: nrc_audio_start 失败");
-        -1
-    }
+        remote_uuid,
+    )
 }
 
+/// 写入一帧 PCM 数据。
+///
+/// # Safety
+/// `pcm_data` 须指向 `pcm_len` 字节可读内存。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_audio_write_frame(
     ctx_ptr: *mut c_void,
     pcm_data: *const u8,
     pcm_len: i32,
 ) -> i32 {
-    if pcm_len <= 0 || pcm_data.is_null() {
+    if pcm_len <= 0 || pcm_data.is_null() || ctx_ptr.is_null() {
         return -1;
     }
-    let pcm = std::slice::from_raw_parts(pcm_data, pcm_len as usize);
-    if ctx_ptr.is_null() {
-        return -1;
-    }
-    let ctx = &mut *(ctx_ptr as *mut SafeContext);
-    {
-        let guard = ctx.get_mut().unwrap();
-        if let Ok(audio_state) = guard.audio.try_lock() {
-            if audio_stream::write_frame(&audio_state, pcm) {
-                return 0;
-            }
-        }
-    }
-    -1
+    let pcm = unsafe { std::slice::from_raw_parts(pcm_data, pcm_len as usize) };
+    crate::audio_stream::write_pcm_frame(unsafe { &*(ctx_ptr as *const crate::SafeContext) }, pcm)
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_audio_stop(ctx_ptr: *mut c_void) -> i32 {
-    log::info!("音频流: nrc_audio_stop 开始停止");
-
-    let _ruuid = with_ctx(ctx_ptr, |ctx| {
-        let uuid = ctx.audio.lock().unwrap().remote_uuid.clone();
-        if !uuid.is_empty() {
-            log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
-            send_control(ctx, &uuid, "audioStop", 0, 0);
-        }
-        uuid
-    });
-
-    let thread_handles = if !ctx_ptr.is_null() {
-        let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-        {
-            let guard = ctx.get_mut().unwrap();
-            let audio_state = &mut guard.audio.lock().unwrap();
-            audio_stream::stop(audio_state)
-        }
-    } else {
-        Vec::new()
-    };
-
-    for h in thread_handles {
-        log::info!("音频流: 等待线程退出");
-        h.join().ok();
-        log::info!("音频流: 线程已退出");
+    if ctx_ptr.is_null() {
+        return -1;
     }
-
-    with_ctx(ctx_ptr, |ctx| {
-        let audio_state = ctx.audio.lock().unwrap();
-        *audio_state.encoder.lock() = None;
-        *audio_state.decoder.lock() = None;
-        *audio_state.jitter.lock() = None;
-        audio_state.stats.reset();
-        audio_state.pcm_queue.lock().clear();
-        audio_state.pcm_buffer.lock().clear();
-    });
-
-    log::info!("音频流: nrc_audio_stop 完成");
-    0
+    crate::audio_stream::stop_stream(unsafe { &*(ctx_ptr as *const crate::SafeContext) })
 }
 
 #[no_mangle]
@@ -214,47 +62,82 @@ pub extern "C" fn nrc_audio_is_active(ctx_ptr: *mut c_void) -> i32 {
     if ctx_ptr.is_null() {
         return 0;
     }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    {
-        let guard = ctx.get_mut().unwrap();
-        if let Ok(audio_state) = guard.audio.try_lock() {
-            let active = audio_state.active.load(std::sync::atomic::Ordering::SeqCst);
-            log::debug!("音频流: 查询活跃状态={}", active);
-            return if active { 1 } else { 0 };
-        }
+    if crate::audio_stream::is_active(unsafe { &*(ctx_ptr as *const crate::SafeContext) }) {
+        1
+    } else {
+        0
     }
-    0
 }
 
+/// 注册音频数据回调：把 C 函数指针包成内部闭包。
+///
+/// # Safety
+/// `cb` 须为空或指向签名匹配的有效函数。
 #[no_mangle]
-pub extern "C" fn nrc_register_audio_data_cb(
+pub unsafe extern "C" fn nrc_register_audio_data_cb(
     ctx_ptr: *mut c_void,
-    cb: crate::audio_stream::AudioDataCb,
+    cb: Option<extern "C" fn(*const c_char, *const u8, i32, i32, i32, *mut c_void)>,
 ) {
     if ctx_ptr.is_null() {
         return;
     }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    {
-        let guard = ctx.get_mut().unwrap();
-        let mut audio_state = guard.audio.lock().unwrap();
-        audio_state.on_data = cb;
-    }
+    let Some(cb) = cb else {
+        return;
+    };
+    let wrapped: crate::audio_stream::AudioDataCb = std::sync::Arc::new(
+        move |uuid: &str, pcm: &[u8], sample_rate: i32, channels: i32| {
+            let Ok(uuid_c) = std::ffi::CString::new(uuid) else {
+                return;
+            };
+            cb(
+                uuid_c.as_ptr(),
+                pcm.as_ptr(),
+                pcm.len() as i32,
+                sample_rate,
+                channels,
+                std::ptr::null_mut(),
+            );
+        },
+    );
+    crate::audio_stream::register_data_cb(
+        unsafe { &*(ctx_ptr as *const crate::SafeContext) },
+        wrapped,
+    );
 }
 
+/// 注册音频事件回调：把 C 函数指针包成内部闭包。
+///
+/// # Safety
+/// `cb` 须为空或指向签名匹配的有效函数。
 #[no_mangle]
-pub extern "C" fn nrc_register_audio_event_cb(
+pub unsafe extern "C" fn nrc_register_audio_event_cb(
     ctx_ptr: *mut c_void,
-    cb: crate::audio_stream::AudioEventCb,
+    cb: Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>,
 ) {
     if ctx_ptr.is_null() {
         return;
     }
-    let ctx = unsafe { &mut *(ctx_ptr as *mut SafeContext) };
-    {
-        let guard = ctx.get_mut().unwrap();
-        if let Ok(mut audio_state) = guard.audio.try_lock() {
-            audio_state.on_event = cb;
-        }
-    }
+    let Some(cb) = cb else {
+        return;
+    };
+    let wrapped: crate::audio_stream::AudioEventCb =
+        std::sync::Arc::new(move |uuid: &str, event: &str, data: &str| {
+            let (Ok(uuid_c), Ok(event_c), Ok(data_c)) = (
+                std::ffi::CString::new(uuid),
+                std::ffi::CString::new(event),
+                std::ffi::CString::new(data),
+            ) else {
+                return;
+            };
+            cb(
+                uuid_c.as_ptr(),
+                event_c.as_ptr(),
+                data_c.as_ptr(),
+                std::ptr::null_mut(),
+            );
+        });
+    crate::audio_stream::register_event_cb(
+        unsafe { &*(ctx_ptr as *const crate::SafeContext) },
+        wrapped,
+    );
 }

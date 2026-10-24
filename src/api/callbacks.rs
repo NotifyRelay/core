@@ -1,17 +1,15 @@
-//! 回调接口：把 11 个裸函数指针注册合并为一个 [`CoreCallbacks`] trait。
+//! 回调接口：平台侧实现 [`CoreCallbacks`]，本层把它装配成内部闭包。
 //!
-//! 实现方式：trait 对象存入全局 `OnceLock`，再向既有 `router` / `audio_state`
-//! 安装 C 风格蹦床函数指针，内部调用点无需改动。
+//! 实现方式：trait 对象存入全局 `OnceLock`，再为 `router` / `audio_stream`
+//! 安装闭包；内部调用点无需改动。
 
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
 use super::Core;
 
 /// 平台侧回调实现。
 ///
-/// 所有 `on_*` 可能在 JNA 附加线程、心跳线程或网络线程触发。
+/// 所有 `on_*` 可能在心跳线程、网络线程或音频线程触发。
 #[uniffi::export(callback_interface)]
 pub trait CoreCallbacks: Send + Sync {
     /// 配对/握手过程消息。`message_type` 取值：
@@ -73,168 +71,118 @@ fn callbacks() -> Option<&'static Arc<dyn CoreCallbacks>> {
     CALLBACKS.get()
 }
 
-/// 读取 C 字符串指针；空指针转为空串。
-unsafe fn read(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-extern "C" fn trampoline_pairing(
-    uuid: *const c_char,
-    message_type: *const c_char,
-    data: *const c_char,
-    int_value: i32,
-    extra: *const c_char,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        cb.on_pairing(
-            unsafe { read(uuid) },
-            unsafe { read(message_type) },
-            unsafe { read(data) },
-            int_value,
-            unsafe { read(extra) },
-        );
-    }
-}
-
-extern "C" fn trampoline_data(
-    uuid: *const c_char,
-    message_type: *const c_char,
-    plaintext: *const c_char,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        cb.on_data(
-            unsafe { read(uuid) },
-            unsafe { read(message_type) },
-            unsafe { read(plaintext) },
-        );
-    }
-}
-
-extern "C" fn trampoline_state_query(
-    uuid: *const c_char,
-    feature_id: *const c_char,
-    is_media: i32,
-    _ud: *mut c_void,
-) -> i32 {
-    match callbacks() {
-        Some(cb) => cb.on_state_query(
-            unsafe { read(uuid) },
-            unsafe { read(feature_id) },
-            is_media != 0,
-        ),
-        None => 0,
-    }
-}
-
-extern "C" fn trampoline_device_timeout(uuid: *const c_char, _ud: *mut c_void) {
-    if let Some(cb) = callbacks() {
-        cb.on_device_timeout(unsafe { read(uuid) });
-    }
-}
-
-extern "C" fn trampoline_device_connected(
-    uuid: *const c_char,
-    ip: *const c_char,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        cb.on_device_connected(unsafe { read(uuid) }, unsafe { read(ip) });
-    }
-}
-
-extern "C" fn trampoline_device_disconnected(uuid: *const c_char, _ud: *mut c_void) {
-    if let Some(cb) = callbacks() {
-        cb.on_device_disconnected(unsafe { read(uuid) });
-    }
-}
-
-extern "C" fn trampoline_tcp_error(error: *const c_char, _ud: *mut c_void) {
-    if let Some(cb) = callbacks() {
-        cb.on_tcp_error(unsafe { read(error) });
-    }
-}
-
-extern "C" fn trampoline_device_discovered(
-    uuid: *const c_char,
-    name_b64: *const c_char,
-    port: u16,
-    battery: i32,
-    device_type: *const c_char,
-    ip: *const c_char,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        cb.on_device_discovered(
-            unsafe { read(uuid) },
-            unsafe { read(name_b64) },
-            port,
-            battery,
-            unsafe { read(device_type) },
-            unsafe { read(ip) },
-        );
-    }
-}
-
-extern "C" fn trampoline_audio_data(
-    uuid: *const c_char,
-    data: *const u8,
-    len: i32,
-    sample_rate: i32,
-    channels: i32,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        let pcm = if data.is_null() || len <= 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec()
-        };
-        cb.on_audio_data(unsafe { read(uuid) }, pcm, sample_rate, channels);
-    }
-}
-
-extern "C" fn trampoline_audio_event(
-    uuid: *const c_char,
-    event: *const c_char,
-    data: *const c_char,
-    _ud: *mut c_void,
-) {
-    if let Some(cb) = callbacks() {
-        cb.on_audio_event(unsafe { read(uuid) }, unsafe { read(event) }, unsafe {
-            read(data)
-        });
-    }
-}
-
 #[uniffi::export]
 impl Core {
-    /// 注册平台回调集合，并装配 router 与音频回调蹦床。
+    /// 注册平台回调集合，并装配 `router` 与音频回调。
     pub fn set_callbacks(&self, callbacks: Box<dyn CoreCallbacks>) {
         let _ = CALLBACKS.set(Arc::from(callbacks));
 
         install_log_forwarder();
+        self.install_router_callbacks();
+        self.install_audio_callbacks();
+    }
+}
 
-        if let Ok(mut guard) = self.ctx().lock() {
-            guard.router.on_pairing = Some(trampoline_pairing);
-            guard.router.on_data = Some(trampoline_data);
-            guard.router.on_state_query = Some(trampoline_state_query);
-            guard.router.on_device_timeout = Some(trampoline_device_timeout);
-            guard.router.on_device_connected = Some(trampoline_device_connected);
-            guard.router.on_device_disconnected = Some(trampoline_device_disconnected);
-            guard.router.on_tcp_error = Some(trampoline_tcp_error);
-            guard.router.on_device_discovered = Some(trampoline_device_discovered);
-
-            if let Ok(mut audio) = guard.audio.lock() {
-                audio.on_data = Some(trampoline_audio_data);
-                audio.on_event = Some(trampoline_audio_event);
+impl Core {
+    fn install_router_callbacks(&self) {
+        let Ok(mut guard) = self.ctx().lock() else {
+            return;
+        };
+        guard.router.on_pairing = Some(Arc::new(
+            |device_uuid: &str, message_type: &str, data: &str, int_value: i32, extra: &str| {
+                if let Some(cb) = callbacks() {
+                    cb.on_pairing(
+                        device_uuid.to_string(),
+                        message_type.to_string(),
+                        data.to_string(),
+                        int_value,
+                        extra.to_string(),
+                    );
+                }
+            },
+        ));
+        guard.router.on_data = Some(Arc::new(
+            |device_uuid: &str, message_type: &str, plaintext: &str| {
+                if let Some(cb) = callbacks() {
+                    cb.on_data(
+                        device_uuid.to_string(),
+                        message_type.to_string(),
+                        plaintext.to_string(),
+                    );
+                }
+            },
+        ));
+        guard.router.on_state_query = Some(Arc::new(
+            |device_uuid: &str, feature_id: &str, is_media: bool| -> i32 {
+                match callbacks() {
+                    Some(cb) => {
+                        cb.on_state_query(device_uuid.to_string(), feature_id.to_string(), is_media)
+                    }
+                    None => 0,
+                }
+            },
+        ));
+        guard.router.on_device_timeout = Some(Arc::new(|device_uuid: &str| {
+            if let Some(cb) = callbacks() {
+                cb.on_device_timeout(device_uuid.to_string());
             }
+        }));
+        guard.router.on_device_connected = Some(Arc::new(|device_uuid: &str, ip: &str| {
+            if let Some(cb) = callbacks() {
+                cb.on_device_connected(device_uuid.to_string(), ip.to_string());
+            }
+        }));
+        guard.router.on_device_disconnected = Some(Arc::new(|device_uuid: &str| {
+            if let Some(cb) = callbacks() {
+                cb.on_device_disconnected(device_uuid.to_string());
+            }
+        }));
+        guard.router.on_tcp_error = Some(Arc::new(|error: &str| {
+            if let Some(cb) = callbacks() {
+                cb.on_tcp_error(error.to_string());
+            }
+        }));
+        guard.router.on_device_discovered = Some(Arc::new(
+            |device_uuid: &str,
+             name_b64: &str,
+             port: u16,
+             battery: i32,
+             device_type: &str,
+             ip: &str| {
+                if let Some(cb) = callbacks() {
+                    cb.on_device_discovered(
+                        device_uuid.to_string(),
+                        name_b64.to_string(),
+                        port,
+                        battery,
+                        device_type.to_string(),
+                        ip.to_string(),
+                    );
+                }
+            },
+        ));
+    }
+
+    fn install_audio_callbacks(&self) {
+        let Ok(guard) = self.ctx().lock() else {
+            return;
+        };
+        let data_cb = Arc::new(
+            |device_uuid: &str, pcm: &[u8], sample_rate: i32, channels: i32| {
+                if let Some(cb) = callbacks() {
+                    cb.on_audio_data(device_uuid.to_string(), pcm.to_vec(), sample_rate, channels);
+                }
+            },
+        );
+        let event_cb = Arc::new(|device_uuid: &str, event: &str, data: &str| {
+            if let Some(cb) = callbacks() {
+                cb.on_audio_event(device_uuid.to_string(), event.to_string(), data.to_string());
+            }
+        });
+        let audio_result = guard.audio.lock();
+        if let Ok(mut audio) = audio_result {
+            audio.on_data = Some(data_cb);
+            audio.on_event = Some(event_cb);
         }
     }
 }
@@ -248,11 +196,11 @@ pub fn set_log_callback(callbacks: Box<dyn CoreCallbacks>) {
 
 /// 把既有日志桥的输出转发到 [`CoreCallbacks::on_log`]。
 ///
-/// `log` 全局 logger 只能安装一次，且已由 `ffi::common::init_log_bridge` 在
+/// `log` 全局 logger 只能安装一次，且已由 [`crate::log_bridge::init`] 在
 /// 上下文创建时装好；此处仅把该桥的回调指针指向本层的转发函数，
 /// 避免两条路径争用同一全局 logger。
 fn install_log_forwarder() {
-    crate::ffi::common::set_log_callback_internal(Some(forward_log));
+    crate::log_bridge::set_callback(Some(forward_log));
 }
 
 extern "C" fn forward_log(level: i32, message: *const std::os::raw::c_char) {
@@ -260,7 +208,7 @@ extern "C" fn forward_log(level: i32, message: *const std::os::raw::c_char) {
         let msg = if message.is_null() {
             String::new()
         } else {
-            unsafe { CStr::from_ptr(message) }
+            unsafe { std::ffi::CStr::from_ptr(message) }
                 .to_string_lossy()
                 .into_owned()
         };

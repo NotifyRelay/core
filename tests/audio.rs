@@ -18,15 +18,18 @@ fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(10, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 收到的音频帧容器（进程级）：C 回调无 user_data 通道，测试经此静态容器收集。
+static RECEIVED_FRAMES: Mutex<Vec<Vec<i16>>> = Mutex::new(Vec::new());
+
 extern "C" fn recv_callback(
     _device_uuid: *const c_char,
     pcm_data: *const u8,
     pcm_len: i32,
     _sample_rate: i32,
     _channels: i32,
-    user_data: *mut c_void,
+    _user_data: *mut c_void,
 ) {
-    if pcm_data.is_null() || pcm_len <= 0 || user_data.is_null() {
+    if pcm_data.is_null() || pcm_len <= 0 {
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(pcm_data, pcm_len as usize) };
@@ -34,8 +37,7 @@ extern "C" fn recv_callback(
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
-    let frames = unsafe { &*(user_data as *const Mutex<Vec<Vec<i16>>>) };
-    if let Ok(mut guard) = frames.lock() {
+    if let Ok(mut guard) = RECEIVED_FRAMES.lock() {
         guard.push(pcm);
     }
 }
@@ -44,11 +46,15 @@ fn create_context(uuid: &str) -> SafeContext {
     let mut ctx = CoreContext::new();
     ctx.broadcast_info = Some(BroadcastInfo {
         uuid: uuid.to_string(),
-        name_b64: ffi::common::encode_name_b64("test-device"),
+        name_b64: notify_relay_core::utils::encode_name_b64("test-device"),
         battery: 100,
         device_type: "test".to_string(),
     });
     Mutex::new(ctx)
+}
+
+fn reset_frames() {
+    RECEIVED_FRAMES.lock().unwrap().clear();
 }
 
 fn set_temp_key(ctx: &mut SafeContext, remote_uuid: &str) {
@@ -113,13 +119,13 @@ fn rms(data: &[i16]) -> f64 {
     (sum_sq / data.len() as f64).sqrt()
 }
 
-fn wait_for_frames(frames: &Mutex<Vec<Vec<i16>>>, min_count: usize, timeout: Duration) -> bool {
+fn wait_for_frames(min_count: usize, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         if start.elapsed() >= timeout {
             return false;
         }
-        if let Ok(guard) = frames.lock() {
+        if let Ok(guard) = RECEIVED_FRAMES.lock() {
             if guard.len() >= min_count {
                 return true;
             }
@@ -128,10 +134,19 @@ fn wait_for_frames(frames: &Mutex<Vec<Vec<i16>>>, min_count: usize, timeout: Dur
     }
 }
 
+/// 测试串行锁：帧容器为进程级静态，并行执行会互相串扰。
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn test_audio_basic_loopback() {
+    let _serial = serial();
     init_logger();
     ensure_tcp_listener();
+    reset_frames();
     let port = get_test_port();
 
     let mut ctx_a = create_context("sender-uuid");
@@ -148,16 +163,7 @@ fn test_audio_basic_loopback() {
     let dir_send = CString::new("send").unwrap();
     let uuid = CString::new("remote-uuid").unwrap();
 
-    let frames = Box::new(Mutex::new(Vec::<Vec<i16>>::new()));
-    let frames_ptr = Box::into_raw(frames) as *mut c_void;
-
-    unsafe {
-        let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-        let core_guard = guard.get_mut().unwrap();
-        let mut audio_state = core_guard.audio.lock().unwrap();
-        audio_state.user_data = frames_ptr;
-    }
-    ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
+    unsafe { ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback)) };
     unsafe {
         ffi::audio_stream::nrc_audio_start(
             ctx_b_ptr,
@@ -185,16 +191,12 @@ fn test_audio_basic_loopback() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let frames = unsafe { &*frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>() };
-    assert!(
-        wait_for_frames(frames, 1, Duration::from_secs(5)),
-        "未收到音频帧"
-    );
+    assert!(wait_for_frames(1, Duration::from_secs(5)), "未收到音频帧");
 
     ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
     ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
 
-    let captured = frames.lock().unwrap();
+    let captured = RECEIVED_FRAMES.lock().unwrap();
     assert!(!captured.is_empty(), "未捕获到音频帧");
     let energy = rms(&captured[0]);
     assert!(energy > 4000.0, "RMS 过低: {:.1}", energy);
@@ -202,6 +204,7 @@ fn test_audio_basic_loopback() {
 
 #[test]
 fn test_audio_stop_start_idempotent() {
+    let _serial = serial();
     init_logger();
     ensure_tcp_listener();
     let port = get_test_port();
@@ -221,16 +224,9 @@ fn test_audio_stop_start_idempotent() {
     let uuid = CString::new("remote-uuid").unwrap();
 
     for round in 0..2 {
-        let frames = Box::new(Mutex::new(Vec::<Vec<i16>>::new()));
-        let frames_ptr = Box::into_raw(frames) as *mut c_void;
+        reset_frames();
 
-        unsafe {
-            let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-            let core_guard = guard.get_mut().unwrap();
-            let mut audio_state = core_guard.audio.lock().unwrap();
-            audio_state.user_data = frames_ptr;
-        }
-        ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
+        unsafe { ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback)) };
         unsafe {
             ffi::audio_stream::nrc_audio_start(
                 ctx_b_ptr,
@@ -262,9 +258,8 @@ fn test_audio_stop_start_idempotent() {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let frames = unsafe { &*frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>() };
         assert!(
-            wait_for_frames(frames, 1, Duration::from_secs(5)),
+            wait_for_frames(1, Duration::from_secs(5)),
             "第 {} 轮: 未收到音频帧",
             round
         );
@@ -272,16 +267,13 @@ fn test_audio_stop_start_idempotent() {
         ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
         ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
 
-        unsafe {
-            drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>()));
-        }
-
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
 #[test]
 fn test_audio_reconnect_multiple() {
+    let _serial = serial();
     init_logger();
     ensure_tcp_listener();
     let port = get_test_port();
@@ -301,16 +293,9 @@ fn test_audio_reconnect_multiple() {
     let uuid = CString::new("remote-uuid").unwrap();
 
     for round in 0..3 {
-        let frames = Box::new(Mutex::new(Vec::<Vec<i16>>::new()));
-        let frames_ptr = Box::into_raw(frames) as *mut c_void;
+        reset_frames();
 
-        unsafe {
-            let guard = &mut *(ctx_b_ptr as *mut SafeContext);
-            let core_guard = guard.get_mut().unwrap();
-            let mut audio_state = core_guard.audio.lock().unwrap();
-            audio_state.user_data = frames_ptr;
-        }
-        ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback));
+        unsafe { ffi::audio_stream::nrc_register_audio_data_cb(ctx_b_ptr, Some(recv_callback)) };
         unsafe {
             ffi::audio_stream::nrc_audio_start(
                 ctx_b_ptr,
@@ -344,14 +329,13 @@ fn test_audio_reconnect_multiple() {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let frames = unsafe { &*frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>() };
         assert!(
-            wait_for_frames(frames, 5, Duration::from_secs(5)),
+            wait_for_frames(5, Duration::from_secs(5)),
             "第 {} 轮: 帧数不足",
             round
         );
 
-        let captured = frames.lock().unwrap().clone();
+        let captured = RECEIVED_FRAMES.lock().unwrap().clone();
         let avg_rms: f64 = captured.iter().map(|x| rms(x)).sum::<f64>() / captured.len() as f64;
         assert!(
             avg_rms > 4000.0,
@@ -362,10 +346,6 @@ fn test_audio_reconnect_multiple() {
 
         ffi::audio_stream::nrc_audio_stop(ctx_a_ptr);
         ffi::audio_stream::nrc_audio_stop(ctx_b_ptr);
-
-        unsafe {
-            drop(Box::from_raw(frames_ptr.cast::<Mutex<Vec<Vec<i16>>>>()));
-        }
 
         std::thread::sleep(Duration::from_millis(200));
     }

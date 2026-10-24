@@ -1,5 +1,3 @@
-use std::ffi::CString;
-
 use base64::Engine;
 
 use crate::{
@@ -8,7 +6,7 @@ use crate::{
     SafeContext,
 };
 
-use super::send::do_send_via_network;
+use crate::send::do_send_via_network;
 
 fn fire_pairing_cb(
     ctx: &SafeContext,
@@ -18,25 +16,14 @@ fn fire_pairing_cb(
     int_value: i32,
     extra: &str,
 ) {
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return;
         };
-        (g.router.on_pairing, g.router.user_data)
+        g.router.on_pairing.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let type_c = CString::new(msg_type).unwrap_or_default();
-        let data_c = CString::new(data).unwrap_or_default();
-        let extra_c = CString::new(extra).unwrap_or_default();
-        cb_fn(
-            uuid_c.as_ptr(),
-            type_c.as_ptr(),
-            data_c.as_ptr(),
-            int_value,
-            extra_c.as_ptr(),
-            ud,
-        );
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(uuid, msg_type, data, int_value, extra);
     }
 }
 
@@ -101,17 +88,14 @@ fn notify_version_mismatch_once(ctx: &SafeContext, uuid: &str) {
 }
 
 fn fire_data_cb(ctx: &SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return;
         };
-        (g.router.on_data, g.router.user_data)
+        g.router.on_data.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let type_c = CString::new(msg_type).unwrap_or_default();
-        let text_c = CString::new(plaintext).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), type_c.as_ptr(), text_c.as_ptr(), ud);
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(uuid, msg_type, plaintext);
     }
 }
 
@@ -309,7 +293,7 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
                 guard.network.tcp.clone(),
             )
         };
-        let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
+        let local_ip = crate::utils::get_local_ip();
         if !local_uuid.is_empty() && !local_pub.is_empty() {
             let accept = codec::encode_accept(
                 &local_uuid,
@@ -645,7 +629,7 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
                             if let Ok(g) = ctx.lock() {
                                 if g.sender_queue != 0 {
                                     let q = unsafe {
-                                        &*(crate::ffi::handle::get(g.sender_queue)
+                                        &*(crate::handle::get(g.sender_queue)
                                             as *const crate::sender_queue::SenderQueue)
                                     };
                                     let now = std::time::SystemTime::now()
@@ -1060,7 +1044,6 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::{CoreContext, MAX_PAIRING_SESSIONS};
-    use std::os::raw::{c_char, c_void};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -1130,28 +1113,6 @@ mod tests {
         ICON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    extern "C" fn capture_data_cb(
-        _uuid: *const c_char,
-        msg_type: *const c_char,
-        plaintext: *const c_char,
-        _user_data: *mut c_void,
-    ) {
-        use std::ffi::CStr;
-        let read = |p: *const c_char| -> String {
-            if p.is_null() {
-                return String::new();
-            }
-            unsafe { CStr::from_ptr(p) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
-        };
-        DATA_EVENTS
-            .lock()
-            .unwrap()
-            .push((read(msg_type), read(plaintext)));
-    }
-
     /// 构造与本机对端密钥匹配的测试上下文，并注册 on_data 捕获回调
     fn ctx_with_data_cb() -> SafeContext {
         DATA_EVENTS.lock().unwrap().clear();
@@ -1163,8 +1124,14 @@ mod tests {
                 String::new(),
                 base64::engine::general_purpose::STANDARD.encode(TEST_AES_KEY),
             );
-            guard.router.user_data = &DATA_EVENTS as *const DataEvents as *mut c_void;
-            guard.router.on_data = Some(capture_data_cb);
+            guard.router.on_data = Some(std::sync::Arc::new(
+                |_uuid: &str, msg_type: &str, plaintext: &str| {
+                    DATA_EVENTS
+                        .lock()
+                        .unwrap()
+                        .push((msg_type.to_string(), plaintext.to_string()));
+                },
+            ));
         }
         ctx
     }
@@ -1441,37 +1408,20 @@ mod tests {
     type PairingEvents = Mutex<Vec<(String, String, String)>>;
     static PAIRING_EVENTS: PairingEvents = Mutex::new(Vec::new());
 
-    extern "C" fn capture_pairing_cb(
-        _uuid: *const c_char,
-        msg_type: *const c_char,
-        data: *const c_char,
-        _int_value: i32,
-        extra: *const c_char,
-        _user_data: *mut c_void,
-    ) {
-        use std::ffi::CStr;
-        let read = |p: *const c_char| -> String {
-            if p.is_null() {
-                return String::new();
-            }
-            unsafe { CStr::from_ptr(p) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
-        };
-        PAIRING_EVENTS
-            .lock()
-            .unwrap()
-            .push((read(msg_type), read(data), read(extra)));
-    }
-
     fn ctx_with_pairing_cb() -> SafeContext {
         PAIRING_EVENTS.lock().unwrap().clear();
         let ctx = Mutex::new(CoreContext::new());
         {
             let mut guard = ctx.lock().unwrap();
-            guard.router.user_data = &PAIRING_EVENTS as *const PairingEvents as *mut c_void;
-            guard.router.on_pairing = Some(capture_pairing_cb);
+            guard.router.on_pairing = Some(std::sync::Arc::new(
+                |_uuid: &str, msg_type: &str, data: &str, _int_value: i32, extra: &str| {
+                    PAIRING_EVENTS.lock().unwrap().push((
+                        msg_type.to_string(),
+                        data.to_string(),
+                        extra.to_string(),
+                    ));
+                },
+            ));
         }
         ctx
     }

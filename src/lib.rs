@@ -12,16 +12,22 @@ pub mod diff;
 mod discovery;
 pub mod ffi;
 mod filter;
+pub mod handle;
 mod heartbeat;
+mod log_bridge;
 mod models;
 mod network;
 mod persistence;
+mod processing;
 mod protocol;
 pub mod reconnect;
 mod router;
+pub mod send;
 pub mod sender_queue;
+mod service;
 mod state_merge;
 mod timestamp;
+pub mod utils;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -46,7 +52,7 @@ pub struct CoreContext {
     pub dedup: dedup::DedupState,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
-    pub filter: ffi::filter::FilterState,
+    pub filter: filter::FilterState,
     /// 设备运行时状态统一注册表
     pub registry: device_registry::DeviceRegistry,
     /// 按对端 uuid 隔离的配对会话：
@@ -173,7 +179,7 @@ impl CoreContext {
             dedup: dedup::DedupState::new(),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),
-            filter: ffi::filter::FilterState::new(),
+            filter: filter::FilterState::new(),
             registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
             pairing_sessions: HashMap::new(),

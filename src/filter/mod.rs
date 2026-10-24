@@ -159,3 +159,140 @@ mod tests {
         assert!(!config.is_in_filter_list("com.other"));
     }
 }
+
+// ===== 上下文级过滤状态 =====
+
+use std::sync::Mutex;
+
+/// 过滤器状态（存于核心上下文）。
+pub struct FilterState {
+    pub config: Mutex<RemoteFilterConfig>,
+}
+
+impl FilterState {
+    pub fn new() -> Self {
+        Self {
+            config: Mutex::new(RemoteFilterConfig::new()),
+        }
+    }
+}
+
+impl Default for FilterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 应用远端过滤配置 JSON；解析失败返回 `false`。
+pub fn set_config_json(state: &FilterState, config_json: &str) -> bool {
+    let mut cfg = match state.config.lock() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return false;
+    };
+    if let Some(v) = parsed
+        .get("enablePackageGroupMapping")
+        .and_then(|v| v.as_bool())
+    {
+        cfg.enable_package_group_mapping = v;
+    }
+    if let Some(groups) = parsed.get("packageGroups").and_then(|v| v.as_array()) {
+        cfg.package_groups.clear();
+        for g in groups {
+            if let (Some(name), Some(pkgs)) = (
+                g.get("groupName").and_then(|v| v.as_str()),
+                g.get("packages").and_then(|v| v.as_array()),
+            ) {
+                let packages: Vec<String> = pkgs
+                    .iter()
+                    .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                    .collect();
+                cfg.package_groups.push(PackageGroup {
+                    group_name: name.to_string(),
+                    packages,
+                });
+            }
+        }
+    }
+    if let Some(enabled) = parsed.get("groupEnabled").and_then(|v| v.as_object()) {
+        cfg.group_enabled.clear();
+        for (k, v) in enabled {
+            if let Some(b) = v.as_bool() {
+                cfg.group_enabled.insert(k.clone(), b);
+            }
+        }
+    }
+    if let Some(mode) = parsed.get("filterMode").and_then(|v| v.as_u64()) {
+        cfg.filter_mode = mode as u32;
+    }
+    if let Some(list) = parsed.get("filterList").and_then(|v| v.as_array()) {
+        cfg.filter_list.clear();
+        for item in list {
+            if let Some(s) = item.as_str() {
+                let parts: Vec<&str> = s.splitn(2, '|').collect();
+                cfg.filter_list.push(FilterListEntry {
+                    package: parts[0].to_string(),
+                    keyword: parts
+                        .get(1)
+                        .filter(|k| !k.is_empty())
+                        .map(|k| k.to_string()),
+                });
+            }
+        }
+    }
+    if let Some(v) = parsed.get("enablePeerMode").and_then(|v| v.as_bool()) {
+        cfg.enable_peer_mode = v;
+    }
+    if let Some(pkgs) = parsed.get("installedPackages").and_then(|v| v.as_array()) {
+        cfg.installed_packages.clear();
+        for p in pkgs {
+            if let Some(s) = p.as_str() {
+                cfg.installed_packages.push(s.to_string());
+            }
+        }
+    }
+    true
+}
+
+/// 映射远程包名为本地包名；配置锁不可用时回退原值。
+pub fn map_local_package(state: &FilterState, remote_package: &str) -> String {
+    match state.config.lock() {
+        Ok(config) => config.map_to_local_package(remote_package),
+        Err(_) => remote_package.to_string(),
+    }
+}
+
+/// 过滤检查：`true` 表示通过（应展示）。
+pub fn check_mode(state: &FilterState, package: &str, title: &str, text: &str) -> bool {
+    match state.config.lock() {
+        Ok(config) => config.check_filter_mode(package, title, text),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn test_filter_state_new() {
+        let state = FilterState::new();
+        let config = state.config.lock().unwrap();
+        assert!(!config.enable_package_group_mapping);
+        assert_eq!(config.filter_mode, 0);
+    }
+
+    #[test]
+    fn test_set_and_check_filter() {
+        let state = FilterState::new();
+        assert!(set_config_json(
+            &state,
+            r#"{"filterMode":1,"filterList":["com.allowed"]}"#
+        ));
+        assert!(check_mode(&state, "com.allowed", "", ""));
+        assert!(!check_mode(&state, "com.blocked", "", ""));
+    }
+}

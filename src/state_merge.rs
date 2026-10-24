@@ -11,7 +11,6 @@
 //! 但接收端 Rust 会把 DELTA 合并回全量再交给 App。
 
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -485,7 +484,7 @@ pub fn parse_superisland_inbound(uuid: &str, pkg: &str, full_json: &str) -> Valu
     let feature_id = if !feature_key_value.trim().is_empty() {
         feature_key_value.to_string()
     } else {
-        crate::ffi::utils::compute_feature_id_impl(package_name, param_raw, title_raw, text_raw, "")
+        crate::utils::compute_feature_id(package_name, param_raw, title_raw, text_raw, "")
     };
 
     let is_end = terminate_value == TERMINATE_VALUE;
@@ -810,7 +809,7 @@ pub fn enqueue_resync_request(
     if queue_handle == 0 {
         return;
     }
-    let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *const SenderQueue) };
+    let q = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
     let payload = json!({
         "type": "RESEND_FULL",
         "feature": feature_id,
@@ -887,18 +886,18 @@ pub fn handle_state_message(
     let wire_val: Value = serde_json::from_str(&full).unwrap_or(Value::Object(Map::new()));
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return false;
         };
-        (g.router.on_data, g.router.user_data)
+        g.router.on_data.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let mt_c =
-            CString::new(if is_media { "MEDIAPLAY" } else { "SUPERISLAND" }).unwrap_or_default();
-        let wire_c = CString::new(wire).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), mt_c.as_ptr(), wire_c.as_ptr(), ud);
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(
+            uuid,
+            if is_media { "MEDIAPLAY" } else { "SUPERISLAND" },
+            &wire,
+        );
     }
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
     // 无前文时不发 ACK，让发送端超时后强制发全量
@@ -906,7 +905,7 @@ pub fn handle_state_message(
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
             let queue_handle = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
             if queue_handle != 0 {
-                let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
+                let q = unsafe { &*(crate::handle::get(queue_handle) as *mut SenderQueue) };
                 let ack = json!({
                     "type": "SI_ACK",
                     "device": uuid,
@@ -963,22 +962,21 @@ pub fn handle_state_message(
     true
 }
 
-/// 启动后台心跳线程（在 nrc_init 中调用一次）。
+/// 启动后台心跳线程（在上下文创建时调用一次）。
 /// 每秒 tick：锁内收集待查询会话快照 → 释放锁 → 调用平台查询回调（返回状态码）
-/// → 重新加锁处理结果。回调必须在锁外执行，因为平台回调内可能直接调 `nrc_push_*`。
+/// → 重新加锁处理结果。回调必须在锁外执行，因为平台回调内可能直接调 `push_*`。
 pub fn start_heartbeat_thread(ctx_ptr: usize) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
         let now = Instant::now();
-        let (cb, user_data, queries) = {
+        let (cb, queries) = {
             let mut guard = match ctx.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
             (
-                guard.router.on_state_query,
-                guard.router.user_data,
+                guard.router.on_state_query.clone(),
                 guard.state_merge.heartbeat_tick(now),
             )
         };
@@ -991,15 +989,12 @@ pub fn start_heartbeat_thread(ctx_ptr: usize) {
         };
         let mut results: Vec<(String, String, i32)> = Vec::with_capacity(queries.len());
         for (device_uuid, feature_id, is_media) in queries {
-            let uuid_c = CString::new(device_uuid.clone()).unwrap_or_default();
-            let fid_c = CString::new(feature_id.clone()).unwrap_or_default();
-            let code = cb_fn(uuid_c.as_ptr(), fid_c.as_ptr(), is_media as i32, user_data);
+            let code = cb_fn(&device_uuid, &feature_id, is_media);
             results.push((device_uuid, feature_id, code));
         }
         if let Ok(mut guard) = ctx.lock() {
             if guard.sender_queue != 0 {
-                let q =
-                    unsafe { &*(crate::ffi::handle::get(guard.sender_queue) as *mut SenderQueue) };
+                let q = unsafe { &*(crate::handle::get(guard.sender_queue) as *mut SenderQueue) };
                 guard.state_merge.apply_query_results(q, results);
             }
         }
@@ -1010,6 +1005,51 @@ impl Default for StateMerge {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ===== 上下文级状态合并入口 =====
+
+/// 推送全量状态；返回 true 表示已入队。
+pub fn push_state(
+    ctx_ptr: usize,
+    queue_handle: u64,
+    device_uuid: &str,
+    full_json: &str,
+    is_end: bool,
+    is_query: bool,
+    is_media: bool,
+) -> i32 {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return -1;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return -1;
+    };
+    if guard
+        .state_merge
+        .push_state(queue, device_uuid, is_media, full_json, is_end, is_query)
+    {
+        0
+    } else {
+        -1
+    }
+}
+
+/// 解析超级岛入站报文，返回归一结构 JSON 字符串。
+pub fn parse_superisland_inbound_json(device_uuid: &str, pkg: &str, full_json: &str) -> String {
+    parse_superisland_inbound(device_uuid, pkg, full_json).to_string()
+}
+
+/// 解析通知入站报文。
+pub fn parse_notification_inbound_json(full_json: &str) -> String {
+    parse_notification_inbound(full_json).to_string()
+}
+
+/// 解析媒体入站报文。
+pub fn parse_media_inbound_json(full_json: &str) -> String {
+    parse_media_inbound(full_json).to_string()
 }
 
 #[cfg(test)]
@@ -1238,7 +1278,7 @@ mod tests {
 
     #[test]
     fn test_media_need_full_enqueues_resync_request() {
-        use crate::ffi::handle as hdl;
+        use crate::handle as hdl;
         let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
@@ -1277,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_resync_request_triggers_full_resend() {
-        use crate::ffi::handle as hdl;
+        use crate::handle as hdl;
         let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);

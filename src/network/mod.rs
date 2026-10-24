@@ -692,6 +692,124 @@ pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
     Ok(socket)
 }
 
+// ===== 上下文级网络入口 =====
+
+use crate::SafeContext;
+
+/// 启动 TCP 服务器（供统一启动入口调用）。返回 0 表示成功。
+pub fn start_tcp_server_for(ctx_ptr: usize, port: u16) -> i32 {
+    if ctx_ptr == 0 {
+        log::error!("启动 TCP 服务器: 空上下文");
+        return -1;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let (network_state, local_uuid, on_connected, on_disconnected, on_tcp_error) = {
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
+        (
+            guard.network.tcp.clone(),
+            guard
+                .broadcast_info
+                .as_ref()
+                .map(|b| b.uuid.clone())
+                .unwrap_or_default(),
+            guard.router.on_device_connected.clone(),
+            guard.router.on_device_disconnected.clone(),
+            guard.router.on_tcp_error.clone(),
+        )
+    };
+
+    let on_connected_cb = Some(Arc::new(move |uuid: String, ip: String| {
+        // 始终记录 TCP 连接来源 IP 到内部映射（供 oneshot 发送回退）
+        if let Ok(guard) = unsafe { &*(ctx_ptr as *const SafeContext) }.lock() {
+            if let Ok(mut ips) = guard.device_ips.lock() {
+                ips.insert(uuid.clone(), ip.clone());
+            }
+            guard.registry.mark_connected(&uuid, &ip);
+        }
+        if let Some(cb) = on_connected.as_ref() {
+            cb(&uuid, &ip);
+        }
+    }) as Arc<dyn Fn(String, String) + Send + Sync>);
+
+    let on_disconnected_cb = Some(Arc::new(move |uuid: String| {
+        // TCP 断开：登记断开状态，并清理该连接遗留的未完成配对会话。
+        if let Ok(mut guard) = unsafe { &*(ctx_ptr as *const SafeContext) }.lock() {
+            guard.registry.mark_disconnected(&uuid);
+            guard.pairing_sessions.remove(&uuid);
+        }
+        if let Some(cb) = on_disconnected.as_ref() {
+            cb(&uuid);
+        }
+    }) as Arc<dyn Fn(String) + Send + Sync>);
+
+    let on_message_cb = Some(
+        Arc::new(move |uuid: String, msg_type: u8, payload: Vec<u8>| {
+            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+            // 传入会话 uuid：帧内声明的发送方必须与之相同，否则丢弃
+            crate::processing::process_frame(ctx, Some(&uuid), msg_type, &payload);
+        }) as Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>,
+    );
+
+    let on_error_cb = on_tcp_error.map(|cb| {
+        Arc::new(move |error: String| {
+            cb(&error);
+        }) as Arc<dyn Fn(String) + Send + Sync>
+    });
+
+    // TCP 绑定失败时自动重试（覆盖旧进程退出导致端口延迟释放等场景），间隔递增
+    let mut attempts = 0;
+    let tcp_result = loop {
+        match start_tcp_server(
+            network_state.clone(),
+            port,
+            local_uuid.clone(),
+            on_connected_cb.clone(),
+            on_disconnected_cb.clone(),
+            on_message_cb.clone(),
+            on_error_cb.clone(),
+        ) {
+            Ok(_) => break Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 5 {
+                    break Err(e);
+                }
+                log::warn!("启动 TCP 服务器失败（第 {}/5 次）: {}", attempts, e);
+                std::thread::sleep(Duration::from_secs(attempts as u64));
+            }
+        }
+    };
+    match tcp_result {
+        Ok(_) => {
+            log::info!("TCP 服务器已启动，端口: {}", port);
+            0
+        }
+        Err(e) => {
+            log::error!("启动 TCP 服务器失败（已重试 5 次）: {}", e);
+            -1
+        }
+    }
+}
+
+/// 移除设备 TCP 会话。
+pub fn remove_session(ctx: &mut crate::CoreContext, uuid: &str) -> i32 {
+    let network_state = ctx.network.tcp.clone();
+    remove_device_session(network_state, uuid);
+    0
+}
+
+/// 网络变化通知（WiFi 切换、网络恢复等）；`local_ip` 为空表示由 core 自行获取。
+pub fn notify_network_changed(ctx_ptr: usize, local_ip: Option<&str>) {
+    if ctx_ptr == 0 {
+        return;
+    }
+    log::info!("网络变化通知: ip={:?}", local_ip);
+    // 自动启动已知设备扫描（用于网络恢复后自动重连）
+    crate::discovery::start_known_device_scanner_for(ctx_ptr);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

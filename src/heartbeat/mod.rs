@@ -230,24 +230,21 @@ pub fn start_offline_detector(
             }
 
             let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-            let (timeouts, on_timeout_cb, user_data) = {
-                // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+            let (timeouts, on_timeout_cb) = {
+                // 后台线程：通过 lock() 取锁，与扫描回调、导出层共用同一把锁
                 let Ok(guard) = ctx.lock() else {
                     thread::sleep(Duration::from_millis(check_interval_ms));
                     continue;
                 };
                 let timed_out = guard.heartbeat.check_timeouts(timeout_sec);
-                let cb = guard.router.on_device_timeout;
-                let ud = guard.router.user_data;
-                (timed_out, cb, ud)
+                let cb = guard.router.on_device_timeout.clone();
+                (timed_out, cb)
             };
 
             for uuid in &timeouts {
                 log::info!("设备状态变化: 已超时 uuid={}", uuid);
-                if let Some(cb) = on_timeout_cb {
-                    if let Ok(uuid_c) = std::ffi::CString::new(uuid.as_str()) {
-                        cb(uuid_c.as_ptr(), user_data);
-                    }
+                if let Some(cb) = on_timeout_cb.as_ref() {
+                    cb(uuid);
                 }
                 {
                     let Ok(mut guard) = ctx.lock() else {
@@ -405,6 +402,121 @@ impl HeartbeatScheduler {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+// ===== 上下文级心跳与离线检测入口 =====
+
+/// 启动离线检测（供统一启动入口调用）。返回运行开关句柄，0 表示失败。
+pub fn start_offline_detector_for(ctx_ptr: usize, timeout_sec: i64, check_interval_ms: u64) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    match start_offline_detector(ctx_ptr, check_interval_ms, timeout_sec) {
+        Ok(running) => {
+            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+            let Ok(mut guard) = ctx.lock() else {
+                return 0;
+            };
+            let boxed = Box::new(running);
+            let handle = crate::handle::put(Box::into_raw(boxed) as *mut std::os::raw::c_void);
+            guard.offline_detector_handle = handle;
+            handle
+        }
+        Err(_) => 0,
+    }
+}
+
+/// 启动统一心跳调度器（供统一启动入口调用）。
+///
+/// 内部扫描 known_devices：为已配对设备自动启动/停止每设备心跳（AUTO 模式）；
+/// 本机身份参数（uuid/name/battery/device_type）写入 `broadcast_info`。返回句柄，0 表示失败。
+pub fn start_scheduler_for(
+    ctx_ptr: usize,
+    uuid: &str,
+    name: &str,
+    battery: i32,
+    device_type: &str,
+    interval_ms: u64,
+) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return 0;
+    };
+    // 重复启动时先停止旧调度器
+    if guard.heartbeat_scheduler != 0 {
+        let old = crate::handle::take(guard.heartbeat_scheduler)
+            as *mut crate::heartbeat::HeartbeatScheduler;
+        if !old.is_null() {
+            let boxed = unsafe { Box::from_raw(old) };
+            boxed.stop();
+        }
+        guard.heartbeat_scheduler = 0;
+        for (_, h) in guard.heartbeat_scheduler_handles.drain() {
+            h.stop();
+        }
+    }
+    let local_uuid = uuid.to_string();
+    guard.broadcast_info = Some(crate::BroadcastInfo {
+        uuid: uuid.to_string(),
+        name_b64,
+        battery,
+        device_type: device_type.to_string(),
+    });
+    // 同步广播信息到 TCP 层（供发现请求响应使用）
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
+    // 同步本机 uuid 到持久化（读取接口前自动落盘）与 TCP 层状态
+    // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
+    if !local_uuid.is_empty() {
+        guard.ensure_persistence_loaded();
+        if guard.local_uuid.is_empty() {
+            guard.local_uuid = local_uuid.clone();
+            guard.mark_persistence_dirty();
+        }
+        guard.persistence_activated = true;
+    }
+    crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
+
+    match HeartbeatScheduler::start(ctx_ptr, interval_ms) {
+        Ok(scheduler) => {
+            let boxed = Box::new(scheduler);
+            let handle = crate::handle::put(Box::into_raw(boxed) as *mut std::os::raw::c_void);
+            guard.heartbeat_scheduler = handle;
+            handle
+        }
+        Err(e) => {
+            log::error!("启动心跳调度器失败: {}", e);
+            0
+        }
+    }
+}
+
+/// 更新心跳调度器本机参数（更新 broadcast_info，全部 handle 由调度线程同步）。
+pub fn update_scheduler_params(
+    ctx: &crate::SafeContext,
+    name: &str,
+    battery: i32,
+    device_type: &str,
+) {
+    let Ok(mut guard) = ctx.lock() else {
+        return;
+    };
+    if let Some(ref mut b) = guard.broadcast_info {
+        if !name.is_empty() {
+            b.name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+        }
+        if battery.abs() <= 100 {
+            b.battery = battery;
+        }
+        if !device_type.is_empty() {
+            b.device_type = device_type.to_string();
+        }
+    }
+    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
 }
 
 #[cfg(test)]

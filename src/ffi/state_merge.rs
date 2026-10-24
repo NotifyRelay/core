@@ -1,18 +1,10 @@
-//! 状态合并引擎的 FFI 接口
-//!
-//! 平台侧只需：
-//! - 调用 `nrc_push_superisland_state` / `nrc_push_media_state` 传入全量状态；
-//! - 接收端合并后的全量通过既有的 `nrc_set_on_data_cb`（`SUPERISLAND` / `MEDIAPLAY`）传出，
-//!   无需注册新的输出回调。
-//!   所有差异计算、合并、ACK 与心跳都在 Rust 内闭环。
+//! 状态合并 C ABI 委托。
 
-use std::os::raw::c_char;
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 
-use crate::ffi::common::{from_cstr, to_cstr};
-use crate::sender_queue::SenderQueue;
-use crate::SafeContext;
+use super::common::{from_cstr, to_cstr};
 
+/// 推送超级岛全量状态。
 #[no_mangle]
 pub extern "C" fn nrc_push_superisland_state(
     ctx_ptr: *mut c_void,
@@ -33,6 +25,7 @@ pub extern "C" fn nrc_push_superisland_state(
     )
 }
 
+/// 推送媒体全量状态。
 #[no_mangle]
 pub extern "C" fn nrc_push_media_state(
     ctx_ptr: *mut c_void,
@@ -65,28 +58,24 @@ fn push_state_impl(
     if ctx_ptr.is_null() || queue_handle == 0 || device_uuid.is_null() || full_json.is_null() {
         return -1;
     }
+    // SAFETY: 上方已排除空指针；字符串由调用方保证以 NUL 结尾。
     let uuid = unsafe { from_cstr(device_uuid) };
     let full = unsafe { from_cstr(full_json) };
-    let queue = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
-    let mut guard = match unsafe { &*(ctx_ptr as *mut SafeContext) }.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
-    if guard
-        .state_merge
-        .push_state(queue, uuid, is_media, full, is_end != 0, is_query != 0)
-    {
-        0
-    } else {
-        -1
-    }
+    crate::state_merge::push_state(
+        ctx_ptr as usize,
+        queue_handle,
+        uuid,
+        full,
+        is_end != 0,
+        is_query != 0,
+        is_media,
+    )
 }
 
-/// 超级岛入站解析 FFI：纯字符串输入/输出，无 ctx。
+/// 解析超级岛入站报文，返回归一结构 JSON。
 ///
-/// 平台传入 `device_uuid`（来自 on_data 回调，不在 wire 内）、`pkg`（已解析包名：
-/// Android 传映射后 mappedPkg，Win 传原始 packageName）与 `full_json`（wire/全量 JSON），
-/// 返回归一结构 JSON 字符串。调用方须用 `nrc_free_string` 释放返回的 char*。
+/// # Safety
+/// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_parse_superisland_inbound(
     device_uuid: *const c_char,
@@ -100,10 +89,10 @@ pub unsafe extern "C" fn nrc_parse_superisland_inbound(
     to_cstr(&result.to_string())
 }
 
-/// 通知入站解析 FFI：纯字符串输入/输出，无 ctx。
+/// 解析通知入站报文。
 ///
-/// 平台传入 `full_json`（解密后的通知全量 JSON），返回归一结构 JSON 字符串。
-/// 调用方须用 `nrc_free_string` 释放返回的 char*。
+/// # Safety
+/// `full_json` 须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_parse_notification_inbound(full_json: *const c_char) -> *mut c_char {
     let full = unsafe { from_cstr(full_json) };
@@ -111,10 +100,10 @@ pub unsafe extern "C" fn nrc_parse_notification_inbound(full_json: *const c_char
     to_cstr(&result.to_string())
 }
 
-/// 媒体入站解析 FFI：纯字符串输入/输出，无 ctx。
+/// 解析媒体入站报文。
 ///
-/// 平台传入 `full_json`（解密后的媒体全量 JSON），返回归一结构 JSON 字符串。
-/// 调用方须用 `nrc_free_string` 释放返回的 char*。
+/// # Safety
+/// `full_json` 须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_parse_media_inbound(full_json: *const c_char) -> *mut c_char {
     let full = unsafe { from_cstr(full_json) };

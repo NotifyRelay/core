@@ -1,6 +1,7 @@
 pub mod aes;
 pub mod ecdh;
 pub mod hkdf;
+pub mod ops;
 pub mod spake2;
 
 use base64::Engine;

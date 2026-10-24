@@ -949,3 +949,186 @@ mod tests {
         );
     }
 }
+
+// ===== 上下文级发送队列入口 =====
+
+/// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
+const SENT_DEDUP_TTL_MS: i64 = 3000;
+
+/// 参与发送去重的通知类 header（仅通知通道存在重复发送语义）
+fn is_notification_header(header: &str) -> bool {
+    header == "DATA_NOTIFICATION"
+}
+
+/// 规范化帧类型标识：非空且不以 DATA_ 开头时补前缀（接收端只识别 DATA_*）
+pub fn normalize_header(header: &str) -> String {
+    if !header.is_empty() && !header.starts_with("DATA_") {
+        format!("DATA_{}", header)
+    } else {
+        header.to_string()
+    }
+}
+
+/// 创建发送队列并登记句柄（供统一启动入口调用）。返回句柄，0 表示失败。
+pub fn create_with_ctx(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let queue = Box::new(SenderQueue::new());
+    queue.set_ctx_ptr(ctx_ptr);
+    let handle = crate::handle::put(Box::into_raw(queue) as *mut std::os::raw::c_void);
+
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    if let Ok(mut guard) = ctx.lock() {
+        guard.sender_queue = handle;
+    }
+
+    handle
+}
+
+/// 启动队列后台工作者（供统一启动入口调用）。
+pub fn start_worker_for(ctx_ptr: usize, queue_handle: u64) {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    queue.start_worker(ctx_ptr);
+}
+
+/// 写入一条待发送报文（header 规范化、去重键推导与发送去重均在此完成）。
+///
+/// 发送去重仅作用于通知类消息（`DATA_NOTIFICATION`）：其他通道无重复语义。
+/// 返回：1=已入队 0=命中去重丢弃（仅通知类） -1=参数无效或队列未初始化。
+pub fn enqueue_message(
+    ctx_ptr: usize,
+    queue_handle: u64,
+    device_uuid: &str,
+    header: &str,
+    plaintext: &str,
+) -> i32 {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return -1;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    let hdr = normalize_header(header);
+
+    let is_notification = is_notification_header(&hdr);
+
+    let dedup_key = if is_notification {
+        let key = crate::dedup::compute_dedup_key(device_uuid, plaintext);
+        let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+        let dedup_ok = match ctx.lock() {
+            Ok(mut g) => {
+                g.dedup.maybe_cleanup();
+                g.dedup.check_and_pend(&key, SENT_DEDUP_TTL_MS)
+            }
+            Err(_) => return -1,
+        };
+        if !dedup_ok {
+            return 0;
+        }
+        Some(key)
+    } else {
+        None
+    };
+
+    // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
+    // 断线期间的通知累积是有益的，恢复后应完整补收（实时状态的丢弃在 state_merge / sender_queue 内处理）。
+    //
+    // 仅对 DATA_NOTIFICATION 注入：其他通道（图标/应用列表/控制等）的模型未声明 `ts`，
+    // 注入会触发 `normalize_or_keep` 的"往返丢字段"兜底并产生无谓告警，且这些通道无时效语义。
+    let plaintext = if is_notification {
+        crate::timestamp::inject_ts(plaintext, crate::timestamp::now_ms())
+    } else {
+        plaintext.to_string()
+    };
+
+    queue.enqueue(SendItem {
+        device_uuid: device_uuid.to_string(),
+        header: hdr,
+        plaintext,
+        dedup_key,
+        retries_left: 0,
+        coalesce_key: None,
+    });
+    // 补清理队列丢弃项遗留的去重键（此处未持有 ctx 锁）
+    queue.flush_orphan_keys();
+    1
+}
+
+/// 读取上下文中的发送队列句柄（未启动时为 0）。
+pub fn handle_of(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    match ctx.lock() {
+        Ok(guard) => guard.sender_queue,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn create_ctx() -> Mutex<crate::CoreContext> {
+        let p = std::env::temp_dir()
+            .join(format!("nrsq_ctx_{}", std::process::id()))
+            .join("rust_core.db");
+        Mutex::new(crate::CoreContext::with_db_override(p))
+    }
+
+    #[test]
+    fn normalize_header_cases() {
+        assert_eq!(normalize_header("ICON_REQUEST"), "DATA_ICON_REQUEST");
+        assert_eq!(normalize_header("DATA_JSON"), "DATA_JSON");
+        assert_eq!(normalize_header("DATA_"), "DATA_");
+        assert_eq!(normalize_header(""), "");
+    }
+
+    #[test]
+    fn enqueue_message_params_and_dedup() {
+        let ctx = create_ctx();
+        let ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+
+        // 空上下文 / 队列未初始化 → -1
+        assert_eq!(enqueue_message(0, 0, "", "", ""), -1);
+        assert_eq!(enqueue_message(ptr, 0, "", "", ""), -1);
+
+        let queue_handle = create_with_ctx(ptr);
+        assert_ne!(queue_handle, 0);
+
+        let body = r#"{"a":1}"#;
+        let body2 = r#"{"a":2}"#;
+
+        // 通知：首次入队 → 1
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body),
+            1
+        );
+        // 通知：同一 (uuid, plaintext) 在 TTL 内重复 → 0
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body),
+            0
+        );
+        // 通知：不同 plaintext → 1
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body2),
+            1
+        );
+        // 非通知通道不去重：同一负载连续两次都入队
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "ICON_REQUEST", body),
+            1
+        );
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "ICON_REQUEST", body),
+            1
+        );
+
+        let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+        assert_eq!(queue.pending_count(), 4);
+    }
+}

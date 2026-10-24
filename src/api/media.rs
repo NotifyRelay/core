@@ -1,6 +1,5 @@
-//! 音频、剪贴板、状态合并与应用同步（带上下文）的委托实现。
+//! 音频、剪贴板、状态合并与应用同步的导出实现。
 
-use super::conv::{cs, take_cstr};
 use super::Core;
 
 #[uniffi::export]
@@ -16,42 +15,29 @@ impl Core {
         channels: i32,
         remote_uuid: String,
     ) -> i32 {
-        let d = cs(&direction);
-        let u = cs(&remote_uuid);
-        unsafe {
-            crate::ffi::audio_stream::nrc_audio_start(
-                self.ctx_ptr(),
-                d.as_ptr(),
-                port,
-                sample_rate,
-                channels,
-                u.as_ptr(),
-            )
-        }
+        crate::audio_stream::start(
+            self.ctx(),
+            &direction,
+            port,
+            sample_rate,
+            channels,
+            &remote_uuid,
+        )
     }
 
     /// 写入一帧 PCM 数据。
     pub fn audio_write_frame(&self, pcm_data: Vec<u8>) -> i32 {
-        if pcm_data.is_empty() {
-            return -1;
-        }
-        unsafe {
-            crate::ffi::audio_stream::nrc_audio_write_frame(
-                self.ctx_ptr(),
-                pcm_data.as_ptr(),
-                pcm_data.len() as i32,
-            )
-        }
+        crate::audio_stream::write_pcm_frame(self.ctx(), &pcm_data)
     }
 
     /// 停止音频流。
     pub fn audio_stop(&self) -> i32 {
-        crate::ffi::audio_stream::nrc_audio_stop(self.ctx_ptr())
+        crate::audio_stream::stop_stream(self.ctx())
     }
 
     /// 音频流是否活跃。
     pub fn audio_is_active(&self) -> i32 {
-        crate::ffi::audio_stream::nrc_audio_is_active(self.ctx_ptr())
+        i32::from(crate::audio_stream::is_active(self.ctx()))
     }
 
     // ===== 剪贴板 =====
@@ -66,32 +52,27 @@ impl Core {
         force: bool,
     ) -> Option<String> {
         let queue = self.queue_handle();
-        let t = cs(&targets_json);
-        let m = cs(&mime);
-        let c = cs(&content);
-        unsafe {
-            take_cstr(crate::ffi::clipboard::nrc_clipboard_on_changed(
-                self.ctx_ptr(),
-                queue,
-                t.as_ptr(),
-                m.as_ptr(),
-                c.as_ptr(),
-                now_ms,
-                if force { 1 } else { 0 },
-            ))
+        if queue == 0 {
+            return Some(r#"{"action":"skipped","reason":"invalid ctx or queue"}"#.to_string());
         }
+        Some(crate::clipboard::on_changed_for(
+            self.ctx_ptr() as usize,
+            queue,
+            &targets_json,
+            &mime,
+            &content,
+            now_ms,
+            force,
+        ))
     }
 
     /// 剪贴板内容接收。
     pub fn clipboard_on_received(&self, payload_json: String, now_ms: i64) -> Option<String> {
-        let p = cs(&payload_json);
-        unsafe {
-            take_cstr(crate::ffi::clipboard::nrc_clipboard_on_received(
-                self.ctx_ptr(),
-                p.as_ptr(),
-                now_ms,
-            ))
-        }
+        Some(crate::clipboard::on_received_for(
+            self.ctx_ptr() as usize,
+            &payload_json,
+            now_ms,
+        ))
     }
 
     // ===== 状态合并推送 =====
@@ -104,16 +85,14 @@ impl Core {
         is_end: bool,
         is_query: bool,
     ) -> bool {
-        let queue = self.queue_handle();
-        let u = cs(&device_uuid);
-        let f = cs(&full_json);
-        crate::ffi::state_merge::nrc_push_superisland_state(
-            self.ctx_ptr(),
-            queue,
-            u.as_ptr(),
-            f.as_ptr(),
-            if is_end { 1 } else { 0 },
-            if is_query { 1 } else { 0 },
+        crate::state_merge::push_state(
+            self.ctx_ptr() as usize,
+            self.queue_handle(),
+            &device_uuid,
+            &full_json,
+            is_end,
+            is_query,
+            false,
         ) == 0
     }
 
@@ -125,16 +104,14 @@ impl Core {
         is_end: bool,
         is_query: bool,
     ) -> bool {
-        let queue = self.queue_handle();
-        let u = cs(&device_uuid);
-        let f = cs(&full_json);
-        crate::ffi::state_merge::nrc_push_media_state(
-            self.ctx_ptr(),
-            queue,
-            u.as_ptr(),
-            f.as_ptr(),
-            if is_end { 1 } else { 0 },
-            if is_query { 1 } else { 0 },
+        crate::state_merge::push_state(
+            self.ctx_ptr() as usize,
+            self.queue_handle(),
+            &device_uuid,
+            &full_json,
+            is_end,
+            is_query,
+            true,
         ) == 0
     }
 
@@ -151,22 +128,16 @@ impl Core {
         source_device_uuid: String,
         now_ms: i64,
     ) -> Option<String> {
-        let a = cs(&packages_json);
-        let b = cs(&installed_json);
-        let c = cs(&cached_json);
-        let d = cs(&app_device_json);
-        let e = cs(&source_device_uuid);
-        unsafe {
-            take_cstr(crate::ffi::app_sync::nrc_app_sync_prepare_icon_request(
-                self.ctx_ptr(),
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_ptr(),
-                d.as_ptr(),
-                e.as_ptr(),
-                now_ms,
-            ))
-        }
+        Some(crate::app_sync::request_icons_for(
+            self.ctx_ptr() as usize,
+            &packages_json,
+            &installed_json,
+            &cached_json,
+            &app_device_json,
+            &source_device_uuid,
+            now_ms,
+            false,
+        ))
     }
 
     /// 图标请求聚合入口：先解除同批包名的旧登记，再过滤并构造报文。
@@ -180,27 +151,20 @@ impl Core {
         source_device_uuid: String,
         now_ms: i64,
     ) -> Option<String> {
-        let a = cs(&packages_json);
-        let b = cs(&installed_json);
-        let c = cs(&cached_json);
-        let d = cs(&app_device_json);
-        let e = cs(&source_device_uuid);
-        unsafe {
-            take_cstr(crate::ffi::app_sync::nrc_app_sync_request_icons(
-                self.ctx_ptr(),
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_ptr(),
-                d.as_ptr(),
-                e.as_ptr(),
-                now_ms,
-            ))
-        }
+        Some(crate::app_sync::request_icons_for(
+            self.ctx_ptr() as usize,
+            &packages_json,
+            &installed_json,
+            &cached_json,
+            &app_device_json,
+            &source_device_uuid,
+            now_ms,
+            true,
+        ))
     }
 
     /// 清除已完成的图标请求登记。
     pub fn app_sync_clear_icon_pending(&self, packages_json: String) {
-        let p = cs(&packages_json);
-        unsafe { crate::ffi::app_sync::nrc_app_sync_clear_icon_pending(self.ctx_ptr(), p.as_ptr()) }
+        crate::app_sync::clear_icon_pending_for(self.ctx_ptr() as usize, &packages_json);
     }
 }

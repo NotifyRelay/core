@@ -204,8 +204,7 @@ impl ReconnectState {
                                 .as_ref()
                                 .map(|i| i.device_type.clone())
                                 .unwrap_or_default();
-                            let local_ip =
-                                crate::ffi::utils::get_local_ip_impl().unwrap_or_default();
+                            let local_ip = crate::utils::get_local_ip();
                             codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt)
                         };
 
@@ -251,4 +250,59 @@ impl ReconnectState {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+// ===== 上下文级重连入口 =====
+
+/// 创建重连状态机并登记句柄（供统一启动入口调用）。返回句柄，0 表示失败。
+pub fn create_state_for(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let state = Box::new(ReconnectState::new());
+    let handle = crate::handle::put(Box::into_raw(state) as *mut std::os::raw::c_void);
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    if let Ok(mut guard) = ctx.lock() {
+        guard.reconnect_state = handle;
+    }
+    handle
+}
+
+/// 添加重连目标（状态机由统一启动入口创建，内部从上下文获取）。
+pub fn add_target(ctx: &mut crate::CoreContext, uuid: &str, ip: &str) {
+    // 忽略本机自身，避免自我重连
+    let is_self = ctx
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid == uuid)
+        .unwrap_or(false);
+    if is_self {
+        return;
+    }
+    let state_handle = ctx.reconnect_state;
+    if state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.add_target(uuid, ip);
+}
+
+/// 移除重连目标。
+pub fn remove_target(ctx: &mut crate::CoreContext, uuid: &str) {
+    let state_handle = ctx.reconnect_state;
+    if state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.remove_target(uuid);
+}
+
+/// 启动重连检测（供统一启动入口调用）。
+pub fn start_for(ctx_ptr: usize, state_handle: u64, interval_secs: u64, max_retries: u32) {
+    if ctx_ptr == 0 || state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.configure(interval_secs, max_retries);
+    state.start(ctx_ptr);
 }

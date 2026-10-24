@@ -116,7 +116,7 @@ impl DiscoveryState {
                             (
                                 bi.map(|i| i.uuid.clone()).unwrap_or_default(),
                                 bi.map(|i| i.battery).unwrap_or(0),
-                                crate::ffi::utils::get_local_ip_impl().unwrap_or_default(),
+                                crate::utils::get_local_ip(),
                             )
                         };
                         let dt = {
@@ -165,4 +165,37 @@ impl DiscoveryState {
             })
             .expect("启动发现扫描线程失败");
     }
+}
+
+// ===== 上下文级发现入口 =====
+
+/// 登记已知设备（已配对设备信息）；忽略本机自身。
+pub fn add_known_device(ctx: &mut crate::CoreContext, uuid: &str, ip: &str) {
+    // 忽略本机自身，避免自我扫描连接
+    let is_self = ctx
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid == uuid)
+        .unwrap_or(false);
+    if is_self {
+        return;
+    }
+    ctx.discovery.add_known_device(uuid, ip);
+}
+
+/// 移除已知设备。
+pub fn remove_known_device(ctx: &mut crate::CoreContext, uuid: &str) {
+    ctx.discovery.remove_known_device(uuid);
+}
+
+/// 启动已知设备自动扫描（网络变化后调用）。
+pub fn start_known_device_scanner_for(ctx_ptr: usize) {
+    if ctx_ptr == 0 {
+        return;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    let Ok(guard) = ctx.lock() else {
+        return;
+    };
+    guard.discovery.start_known_device_scanner(ctx_ptr);
 }

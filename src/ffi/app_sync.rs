@@ -1,8 +1,10 @@
-use std::os::raw::{c_char, c_void};
+//! 应用同步 C ABI 委托。
+
+use std::os::raw::c_char;
 
 use super::common::{from_cstr, to_cstr};
 
-/// 图标请求入参（已解除 C 侧指针的原始入参集合）。
+/// 图标请求入参（C 侧原始参数的聚合）。
 struct IconRequestArgs {
     packages_json: *const c_char,
     installed_json: *const c_char,
@@ -12,56 +14,37 @@ struct IconRequestArgs {
     now_ms: i64,
 }
 
-/// 解析图标请求入参并在上下文锁内构造报文。
-/// release_pending 为真时先解除同批包名的旧登记，再交给 prepare 重新判定。
-unsafe fn request_icons_impl(
-    ctx_ptr: *mut c_void,
+unsafe fn request_icons(
+    ctx_ptr: *mut std::os::raw::c_void,
     args: IconRequestArgs,
     release_pending: bool,
 ) -> *mut c_char {
     if ctx_ptr.is_null() {
         return to_cstr("{}");
     }
-    let packages = parse_str_array(from_cstr(args.packages_json));
-    let installed = parse_str_array(from_cstr(args.installed_json));
-    let cached = parse_str_array(from_cstr(args.cached_json));
-    let app_device = parse_map(from_cstr(args.app_device_json));
-    let source = from_cstr(args.source_device_uuid);
-
-    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    let guard = match ctx.get_mut() {
-        Ok(g) => g,
-        Err(_) => return to_cstr("{}"),
-    };
-    if release_pending {
-        crate::app_sync::clear_icon_pending(&mut guard.app_sync, &packages);
-    }
-    let result = crate::app_sync::prepare_icon_request(
-        &mut guard.app_sync,
-        &packages,
-        &installed,
-        &cached,
-        &app_device,
+    let packages_json = unsafe { from_cstr(args.packages_json) };
+    let installed_json = unsafe { from_cstr(args.installed_json) };
+    let cached_json = unsafe { from_cstr(args.cached_json) };
+    let app_device_json = unsafe { from_cstr(args.app_device_json) };
+    let source = unsafe { from_cstr(args.source_device_uuid) };
+    let result = crate::app_sync::request_icons_for(
+        ctx_ptr as usize,
+        packages_json,
+        installed_json,
+        cached_json,
+        app_device_json,
         source,
         args.now_ms,
+        release_pending,
     );
     to_cstr(&result)
 }
 
-/// 批量过滤并构造图标请求报文（Rust 内部维护 pending 状态与超时清理）。
-///
-/// 参数：
-/// - packages_json: 候选包名数组 JSON
-/// - installed_json: 本机已安装包名数组 JSON
-/// - cached_json: 已缓存图标包名数组 JSON
-/// - app_device_json: 包名 -> 来源设备 UUID 数组 的映射 JSON（可能为空对象 {}）
-/// - source_device_uuid: 当前来源设备 UUID
-/// - now_ms: 当前时间戳（毫秒）
-///
-/// 返回 JSON（ICON_REQUEST 报文）；无需请求时返回 {}
+/// # Safety
+/// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_prepare_icon_request(
-    ctx_ptr: *mut c_void,
+    ctx_ptr: *mut std::os::raw::c_void,
     packages_json: *const c_char,
     installed_json: *const c_char,
     cached_json: *const c_char,
@@ -69,32 +52,25 @@ pub unsafe extern "C" fn nrc_app_sync_prepare_icon_request(
     source_device_uuid: *const c_char,
     now_ms: i64,
 ) -> *mut c_char {
-    let args = IconRequestArgs {
-        packages_json,
-        installed_json,
-        cached_json,
-        app_device_json,
-        source_device_uuid,
-        now_ms,
-    };
-    request_icons_impl(ctx_ptr, args, false)
+    request_icons(
+        ctx_ptr,
+        IconRequestArgs {
+            packages_json,
+            installed_json,
+            cached_json,
+            app_device_json,
+            source_device_uuid,
+            now_ms,
+        },
+        false,
+    )
 }
 
-/// 图标请求聚合入口：先解除同批包名的旧登记，再过滤并构造图标请求报文。
-///
-/// 参数：
-/// - packages_json: 候选包名数组 JSON
-/// - installed_json: 本机已安装包名数组 JSON
-/// - cached_json: 已缓存图标包名数组 JSON
-/// - app_device_json: 包名 -> 来源设备 UUID 数组 的映射 JSON（可能为空对象 {}）
-/// - source_device_uuid: 当前来源设备 UUID
-/// - now_ms: 当前时间戳（毫秒）
-///
-/// 返回 JSON（ICON_REQUEST 报文，与 nrc_app_sync_prepare_icon_request 一致）；无需请求时返回 {}
-/// 每次调用自带旧登记解除，调用方无需再调用 nrc_app_sync_clear_icon_pending。
+/// # Safety
+/// 同上。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_request_icons(
-    ctx_ptr: *mut c_void,
+    ctx_ptr: *mut std::os::raw::c_void,
     packages_json: *const c_char,
     installed_json: *const c_char,
     cached_json: *const c_char,
@@ -102,141 +78,61 @@ pub unsafe extern "C" fn nrc_app_sync_request_icons(
     source_device_uuid: *const c_char,
     now_ms: i64,
 ) -> *mut c_char {
-    let args = IconRequestArgs {
-        packages_json,
-        installed_json,
-        cached_json,
-        app_device_json,
-        source_device_uuid,
-        now_ms,
-    };
-    request_icons_impl(ctx_ptr, args, true)
+    request_icons(
+        ctx_ptr,
+        IconRequestArgs {
+            packages_json,
+            installed_json,
+            cached_json,
+            app_device_json,
+            source_device_uuid,
+            now_ms,
+        },
+        true,
+    )
 }
 
-/// 清除已完成的图标请求登记（收到响应或关联成功后调用）
+/// # Safety
+/// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_clear_icon_pending(
-    ctx_ptr: *mut c_void,
+    ctx_ptr: *mut std::os::raw::c_void,
     packages_json: *const c_char,
 ) {
     if ctx_ptr.is_null() {
         return;
     }
-    let packages = parse_str_array(from_cstr(packages_json));
-    let ctx = &mut *(ctx_ptr as *mut crate::SafeContext);
-    if let Ok(g) = ctx.get_mut() {
-        crate::app_sync::clear_icon_pending(&mut g.app_sync, &packages);
-    }
+    let packages_json = unsafe { from_cstr(packages_json) };
+    crate::app_sync::clear_icon_pending_for(ctx_ptr as usize, packages_json);
 }
 
-/// 解析图标响应报文（ICON_RESPONSE）。
-/// 返回 JSON：{"icons":[{"packageName":"..","iconData":".."}],"missing":[".."]}
+/// # Safety
+/// `payload_json` 须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_parse_icon_response(
     payload_json: *const c_char,
 ) -> *mut c_char {
-    let payload = from_cstr(payload_json);
-    let result = crate::app_sync::parse_icon_response(payload);
-    to_cstr(&result)
+    let payload = unsafe { from_cstr(payload_json) };
+    to_cstr(&crate::app_sync::parse_icon_response(payload))
 }
 
-/// 构造应用列表请求报文（APP_LIST_REQUEST）。
-/// 参数 scope: 范围（如 "user"）
-/// 返回 JSON：{"type":"APP_LIST_REQUEST","scope":"..","time":now}
+/// # Safety
+/// `scope` 须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_build_applist_request(
     scope: *const c_char,
     now_ms: i64,
 ) -> *mut c_char {
-    let scope_str = from_cstr(scope);
-    let result = crate::app_sync::build_applist_request(scope_str, now_ms);
-    to_cstr(&result)
+    let scope = unsafe { from_cstr(scope) };
+    to_cstr(&crate::app_sync::build_applist_request(scope, now_ms))
 }
 
-/// 解析应用列表响应报文（APP_LIST_RESPONSE）。
-/// 返回 JSON：{"apps":[{"packageName":"..","appName":".."}],"scope":"..","total":N}
+/// # Safety
+/// `payload_json` 须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_app_sync_parse_applist_response(
     payload_json: *const c_char,
 ) -> *mut c_char {
-    let payload = from_cstr(payload_json);
-    let result = crate::app_sync::parse_applist_response(payload);
-    to_cstr(&result)
-}
-
-fn parse_str_array(s: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(s)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|x| !x.is_empty())
-        .collect()
-}
-
-fn parse_map(s: &str) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-        if let Some(obj) = v.as_object() {
-            for (k, val) in obj {
-                if let Some(arr) = val.as_array() {
-                    let uuids: Vec<String> = arr
-                        .iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .filter(|x| !x.is_empty())
-                        .collect();
-                    map.insert(k.clone(), uuids);
-                }
-            }
-        }
-    }
-    map
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn to_cstr_test(s: &str) -> *const c_char {
-        std::ffi::CString::new(s).unwrap().into_raw()
-    }
-
-    fn free_cstr(p: *const c_char) {
-        unsafe {
-            let _ = std::ffi::CString::from_raw(p as *mut c_char);
-        }
-    }
-
-    #[test]
-    fn test_prepare_icon_request_ffi() {
-        let ctx = crate::SafeContext::new(crate::CoreContext::new());
-        let ctx_ptr = &ctx as *const crate::SafeContext as *mut std::os::raw::c_void;
-
-        let p = to_cstr_test(r#"["com.a","com.b"]"#);
-        let i = to_cstr_test(r#"["com.b"]"#);
-        let c = to_cstr_test(r#"[]"#);
-        let m = to_cstr_test(r#"{}"#);
-        let s = to_cstr_test("dev1");
-        let result = unsafe { nrc_app_sync_prepare_icon_request(ctx_ptr, p, i, c, m, s, 1000) };
-        let out = unsafe { from_cstr(result).to_string() };
-        assert!(out.contains("com.a"));
-        assert!(!out.contains("com.b"));
-        free_cstr(p);
-        free_cstr(i);
-        free_cstr(c);
-        free_cstr(m);
-        free_cstr(s);
-        free_cstr(result);
-    }
-
-    #[test]
-    fn test_parse_icon_response_ffi() {
-        let payload = to_cstr_test(
-            r#"{"icons":[{"packageName":"com.a","iconData":"A"}],"missing":["com.b"]}"#,
-        );
-        let result = unsafe { nrc_app_sync_parse_icon_response(payload) };
-        let out = unsafe { from_cstr(result).to_string() };
-        assert!(out.contains("\"com.a\""));
-        assert!(out.contains("\"com.b\""));
-        free_cstr(payload);
-        free_cstr(result);
-    }
+    let payload = unsafe { from_cstr(payload_json) };
+    to_cstr(&crate::app_sync::parse_applist_response(payload))
 }
