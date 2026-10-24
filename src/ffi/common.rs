@@ -42,6 +42,18 @@ pub fn init_log_bridge() {
     });
 }
 
+/// 日志回调类型（供其它模块构造转发函数）。
+pub type LogCbFn = LogCb;
+
+/// 直接安装日志回调（内部使用，避免经过 C ABI 名称）。
+pub fn set_log_callback_internal(cb: Option<LogCb>) {
+    let val = match cb {
+        Some(f) => f as usize,
+        None => 0,
+    };
+    LOG_CB.store(val, Ordering::Release);
+}
+
 #[no_mangle]
 pub extern "C" fn nrc_set_log_callback(cb: Option<LogCb>) {
     let val = match cb {

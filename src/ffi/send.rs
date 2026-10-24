@@ -865,3 +865,17 @@ pub unsafe extern "C" fn nrc_connect_device(
     log::warn!("连接设备: 重试耗尽 uuid={}", tu);
     -1
 }
+
+/// 读取上下文中的发送队列句柄（未启动时为 0）。
+///
+/// 供 UniFFI 委托层使用，避免其直接访问 `CoreContext` 字段。
+pub(crate) fn queue_handle_of(ctx_ptr: *mut c_void) -> u64 {
+    if ctx_ptr.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    match ctx.lock() {
+        Ok(guard) => guard.sender_queue,
+        Err(_) => 0,
+    }
+}
