@@ -29,12 +29,48 @@ type DiscoveredEvent = (String, String, u16, i32, String, String);
 /// 记录 on_device_discovered 回调事件的全局容器（回调为 extern "C"，无法捕获上下文）
 static DISCOVERED: Mutex<Vec<DiscoveredEvent>> = Mutex::new(Vec::new());
 
+/// 进程内已创建的临时库目录；进程退出时统一清理，避免在 TEMP 下堆积。
+static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// 清理本进程及历史遗留的全部测试临时库目录。
+fn prune_temp_dirs() {
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        for dir in dirs.drain(..) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("nrctx_udp_") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 注册进程退出清理（只注册一次）。
+fn register_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn on_exit() {
+            prune_temp_dirs();
+        }
+        // SAFETY: 回调只做文件删除，不访问其他全局状态
+        unsafe { libc::atexit(on_exit) };
+    });
+}
+
 fn create_ctx() -> SafeContext {
     let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = std::env::temp_dir()
-        .join(format!("nrctx_udp_{}_{}", std::process::id(), n))
-        .join("rust_core.db");
-    Mutex::new(CoreContext::with_db_override(p))
+    let dir = std::env::temp_dir().join(format!("nrctx_udp_{}_{}", std::process::id(), n));
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        dirs.push(dir.clone());
+    }
+    register_cleanup_once();
+    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
 }
 
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
