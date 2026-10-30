@@ -72,6 +72,7 @@ pub unsafe extern "C" fn nrc_dedup(
 
 /// 入站内容去重（10s 窗口；键与 TTL 由 core 持有）。
 ///
+/// 键为「应用名 + 标题 + 正文」。
 /// action=0 纯查询：1=窗口内已见 / 0=未见（不写状态）；action=1 标记已见：0；
 /// action=2 清除全部内容键：0；空上下文或 action 非法：-1。
 ///
@@ -81,10 +82,15 @@ pub unsafe extern "C" fn nrc_dedup(
 pub unsafe extern "C" fn nrc_content_dedup(
     ctx_ptr: *mut c_void,
     action: i32,
+    app_name: *const c_char,
     title: *const c_char,
     text: *const c_char,
 ) -> i32 {
-    let key = crate::dedup::content_key(unsafe { from_cstr(title) }, unsafe { from_cstr(text) });
+    let key = crate::dedup::content_key(
+        unsafe { from_cstr(app_name) },
+        unsafe { from_cstr(title) },
+        unsafe { from_cstr(text) },
+    );
     with_ctx_or(ctx_ptr, -1, |guard| match action {
         0 => i32::from(
             guard
@@ -108,16 +114,20 @@ pub unsafe extern "C" fn nrc_content_dedup(
 /// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_should_deduplicate(
+    new_app_name: *const c_char,
     new_title: *const c_char,
     new_text: *const c_char,
+    old_app_name: *const c_char,
     old_title: *const c_char,
     old_text: *const c_char,
 ) -> i32 {
+    let na = unsafe { from_cstr(new_app_name) };
     let nt = unsafe { from_cstr(new_title) };
     let ntx = unsafe { from_cstr(new_text) };
+    let oa = unsafe { from_cstr(old_app_name) };
     let ot = unsafe { from_cstr(old_title) };
     let otx = unsafe { from_cstr(old_text) };
-    i32::from(crate::utils::should_deduplicate(nt, ntx, ot, otx))
+    i32::from(crate::utils::should_deduplicate(na, nt, ntx, oa, ot, otx))
 }
 
 /// # Safety

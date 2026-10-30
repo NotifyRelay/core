@@ -12,15 +12,24 @@ pub fn compute_feature_id(
     crate::utils::compute_feature_id(&super_pkg, &param_v2_raw, &title, &text, &instance_id)
 }
 
-/// 相似度是否达到去重阈值。
+/// 相似度是否达到去重阈值：应用名须指向同一应用。
 #[uniffi::export]
 pub fn should_deduplicate(
+    new_app_name: String,
     new_title: String,
     new_text: String,
+    old_app_name: String,
     old_title: String,
     old_text: String,
 ) -> bool {
-    crate::utils::should_deduplicate(&new_title, &new_text, &old_title, &old_text)
+    crate::utils::should_deduplicate(
+        &new_app_name,
+        &new_title,
+        &new_text,
+        &old_app_name,
+        &old_title,
+        &old_text,
+    )
 }
 
 /// 由共享密钥派生 FTP 凭据。

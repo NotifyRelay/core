@@ -173,39 +173,41 @@ fn test_compute_feature_id_distinguishes_inputs() {
 fn test_content_dedup_action_semantics() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("App");
     let title = cstr("Title");
     let text = cstr("Body");
 
     // 未标记 → 0（未见）
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
     // 标记已见 → 0
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, title, text) },
         0
     );
     // 窗口内已见 → 1（纯查询不改变状态，重复查询结果一致）
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
     // 清除内容键 → 0，之后未见
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 2, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 2, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
 
     unsafe {
+        free_cstr(app);
         free_cstr(title);
         free_cstr(text);
     }
@@ -215,34 +217,36 @@ fn test_content_dedup_action_semantics() {
 fn test_content_dedup_edge_cases() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("");
     let title = cstr("");
     let text = cstr("");
 
     // 空上下文 → -1
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(std::ptr::null_mut(), 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(std::ptr::null_mut(), 0, app, title, text) },
         -1
     );
     // 非法 action → -1
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 99, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 99, app, title, text) },
         -1
     );
     // 空 title/text 仍可用
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
 
     unsafe {
+        free_cstr(app);
         free_cstr(title);
         free_cstr(text);
     }
@@ -252,17 +256,28 @@ fn test_content_dedup_edge_cases() {
 fn test_content_dedup_key_isolation() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("App");
     let t1 = cstr("A");
     let x1 = cstr("1");
     let t2 = cstr("A");
     let x2 = cstr("2");
 
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 1, t1, x1) }, 0);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, t1, x1) },
+        0
+    );
     // 键不同的 (title,text) 互不影响
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t2, x2) }, 0);
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t1, x1) }, 1);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, t2, x2) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, t1, x1) },
+        1
+    );
 
     unsafe {
+        free_cstr(app);
         free_cstr(t1);
         free_cstr(x1);
         free_cstr(t2);
@@ -341,17 +356,43 @@ fn test_dedup_keys_independent() {
 
 #[test]
 fn test_should_deduplicate_identical_returns_1() {
+    let na = cstr("App");
     let nt = cstr("Hello");
     let ntx = cstr("World");
+    let oa = cstr("App");
     let ot = cstr("Hello");
     let otx = cstr("World");
     assert_eq!(
-        unsafe { ffi::utils::nrc_should_deduplicate(nt, ntx, ot, otx) },
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
         1
     );
     unsafe {
+        free_cstr(na);
         free_cstr(nt);
         free_cstr(ntx);
+        free_cstr(oa);
+        free_cstr(ot);
+        free_cstr(otx);
+    }
+}
+
+#[test]
+fn test_should_deduplicate_different_app_returns_0() {
+    let na = cstr("QQ");
+    let nt = cstr("Hello");
+    let ntx = cstr("World");
+    let oa = cstr("WeChat");
+    let ot = cstr("Hello");
+    let otx = cstr("World");
+    assert_eq!(
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
+        0
+    );
+    unsafe {
+        free_cstr(na);
+        free_cstr(nt);
+        free_cstr(ntx);
+        free_cstr(oa);
         free_cstr(ot);
         free_cstr(otx);
     }
@@ -359,17 +400,21 @@ fn test_should_deduplicate_identical_returns_1() {
 
 #[test]
 fn test_should_deduplicate_completely_different_returns_0() {
+    let na = cstr("App");
     let nt = cstr("Completely different title");
     let ntx = cstr("Completely different text body that is very long");
+    let oa = cstr("App");
     let ot = cstr("Something else entirely");
     let otx = cstr("Another message that shares no words with the other");
     assert_eq!(
-        unsafe { ffi::utils::nrc_should_deduplicate(nt, ntx, ot, otx) },
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
         0
     );
     unsafe {
+        free_cstr(na);
         free_cstr(nt);
         free_cstr(ntx);
+        free_cstr(oa);
         free_cstr(ot);
         free_cstr(otx);
     }
@@ -378,7 +423,10 @@ fn test_should_deduplicate_completely_different_returns_0() {
 #[test]
 fn test_should_deduplicate_empty_both_returns_1() {
     let e = cstr("");
-    assert_eq!(unsafe { ffi::utils::nrc_should_deduplicate(e, e, e, e) }, 1);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_should_deduplicate(e, e, e, e, e, e) },
+        1
+    );
     unsafe { free_cstr(e) };
 }
 

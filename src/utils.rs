@@ -97,13 +97,33 @@ fn combined_similarity(new_title: &str, new_text: &str, old_title: &str, old_tex
     (title_sim + text_sim) / 2.0
 }
 
-/// 相似度是否达到去重阈值（0.8）。
+/// 应用名是否指向同一应用：归一化后相等或互相包含。
+///
+/// 两侧均为空时视为同一应用。
+pub fn same_app(new_app_name: &str, old_app_name: &str) -> bool {
+    let a = new_app_name.trim().to_lowercase();
+    let b = old_app_name.trim().to_lowercase();
+    if a.is_empty() && b.is_empty() {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.contains(&b) || b.contains(&a)
+}
+
+/// 相似度是否达到去重阈值（0.8）：应用名须指向同一应用，标题与正文按加权相似度判定。
 pub fn should_deduplicate(
+    new_app_name: &str,
     new_title: &str,
     new_text: &str,
+    old_app_name: &str,
     old_title: &str,
     old_text: &str,
 ) -> bool {
+    if !same_app(new_app_name, old_app_name) {
+        return false;
+    }
     combined_similarity(new_title, new_text, old_title, old_text) >= 0.8
 }
 
@@ -220,12 +240,46 @@ mod tests {
 
     #[test]
     fn test_should_deduplicate() {
-        assert!(should_deduplicate("Hello", "World", "Hello", "World"));
+        assert!(should_deduplicate(
+            "QQ", "Hello", "World", "QQ", "Hello", "World"
+        ));
         assert!(!should_deduplicate(
+            "QQ",
             "Completely different title",
             "Completely different text body that is very long",
+            "QQ",
             "Something else entirely",
             "Another message that shares no words with the other",
+        ));
+    }
+
+    #[test]
+    fn test_should_deduplicate_requires_same_app() {
+        assert!(!should_deduplicate(
+            "QQ", "Hello", "World", "WeChat", "Hello", "World"
+        ));
+    }
+
+    #[test]
+    fn test_same_app_normalizes_and_accepts_containment() {
+        assert!(same_app("QQ", "qq"));
+        assert!(same_app("  QQ  ", "QQ"));
+        assert!(same_app("QQ", "QQ音乐"));
+        assert!(same_app("", ""));
+        assert!(!same_app("", "QQ"));
+        assert!(!same_app("QQ", "WeChat"));
+    }
+
+    #[test]
+    fn test_should_deduplicate_accepts_subset_text() {
+        // 一方为另一方的子集时按 0.9 计，超过阈值
+        assert!(should_deduplicate(
+            "QQ",
+            "张三",
+            "在吗",
+            "QQ",
+            "张三",
+            "在吗？我刚看到你的消息"
         ));
     }
 

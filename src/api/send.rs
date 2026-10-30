@@ -328,8 +328,8 @@ impl Core {
     }
 
     /// 入站内容去重：0=纯查询 / 1=标记已见 / 2=清除内容键。
-    pub fn content_dedup(&self, action: i32, title: String, text: String) -> i32 {
-        let key = crate::dedup::content_key(&title, &text);
+    pub fn content_dedup(&self, action: i32, app_name: String, title: String, text: String) -> i32 {
+        let key = crate::dedup::content_key(&app_name, &title, &text);
         let Ok(mut guard) = self.ctx().lock() else {
             return -1;
         };
