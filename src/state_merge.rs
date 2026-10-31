@@ -11,6 +11,7 @@
 //! 但接收端 Rust 会把 DELTA 合并回全量再交给 App。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -67,6 +68,29 @@ pub enum MergeOutcome {
     Dropped,
 }
 
+/// 同会话下发锁上限：超出时回收未被持有的条目。
+const DELIVERY_LOCKS_MAX: usize = 256;
+
+/// 会话键（`device_uuid|feature_id`）→ 下发锁。
+///
+/// 锁覆盖「合并 → 平台回调」全过程；锁序恒为 delivery → ctx。
+static DELIVERY_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// 取指定会话的下发锁（不存在时创建）。
+fn delivery_lock(key: &str) -> Arc<Mutex<()>> {
+    let map = DELIVERY_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = locks.get(key) {
+        return existing.clone();
+    }
+    if locks.len() >= DELIVERY_LOCKS_MAX {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key.to_string(), lock.clone());
+    lock
+}
+
 pub struct StateMerge {
     senders: HashMap<String, SenderState>,
     receivers: HashMap<String, ReceiverState>,
@@ -95,6 +119,18 @@ impl StateMerge {
                 remote_uuid,
                 feature_id
             );
+        }
+    }
+
+    /// 入站报文的会话 feature id：媒体为固定会话键，超级岛取 wire 的 `featureKeyValue`。
+    pub fn incoming_feature_id(is_media: bool, v: &Value) -> String {
+        if is_media {
+            MEDIA_KEY.to_string()
+        } else {
+            v.get("featureKeyValue")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
         }
     }
 
@@ -224,14 +260,7 @@ impl StateMerge {
         payload: &str,
     ) -> Option<MergeOutcome> {
         let v: Value = serde_json::from_str(payload).ok()?;
-        let feature_id = if is_media {
-            MEDIA_KEY.to_string()
-        } else {
-            v.get("featureKeyValue")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
+        let feature_id = Self::incoming_feature_id(is_media, &v);
         if feature_id.is_empty() {
             return None;
         }
@@ -847,6 +876,17 @@ pub fn handle_state_message(
         Ok(v) => v,
         Err(_) => return false,
     };
+    // 同会话「合并 → 平台回调」整体互斥，锁序恒为 delivery → ctx；
+    // 覆盖合并与回调之间已释放 ctx 锁的窗口。无 featureId 的报文不参与串行化。
+    let feature_id = StateMerge::incoming_feature_id(is_media, &v);
+    let session_lock = if feature_id.is_empty() {
+        None
+    } else {
+        Some(delivery_lock(&StateMerge::key(uuid, &feature_id)))
+    };
+    let _delivery_guard = session_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     if v.get("type").and_then(|x| x.as_str()) == Some("SI_ACK") {
         let fid = v
             .get("featureKeyValue")
@@ -1518,5 +1558,87 @@ mod tests {
             .to_string(),
         );
         assert_eq!(v["title"], "t", "通知解析不受时间戳影响");
+    }
+
+    /// 同会话并发下发：不得重叠，且按时间戳单调递增、末次为最新状态。
+    #[test]
+    fn test_concurrent_media_states_deliver_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Probe {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+        }
+
+        let probe = Arc::new(Probe {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let delivered: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let ctx = Arc::new(Mutex::new(CoreContext::new()));
+        {
+            let probe_cb = probe.clone();
+            let delivered_cb = delivered.clone();
+            let mut guard = ctx.lock().unwrap();
+            guard.router.on_data = Some(Arc::new(
+                move |_uuid: &str, _msg_type: &str, plaintext: &str| {
+                    let in_flight = probe_cb.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    probe_cb
+                        .max_in_flight
+                        .fetch_max(in_flight, Ordering::SeqCst);
+                    // 单次下发窗口 5ms
+                    std::thread::sleep(Duration::from_millis(5));
+                    let title = serde_json::from_str::<Value>(plaintext)
+                        .ok()
+                        .and_then(|v| v.get("title").and_then(|x| x.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    delivered_cb
+                        .lock()
+                        .unwrap()
+                        .push(title.trim_start_matches("track").parse().unwrap_or(-1));
+                    probe_cb.in_flight.fetch_sub(1, Ordering::SeqCst);
+                },
+            ));
+        }
+
+        let base = crate::timestamp::now_ms();
+        let mut handles = Vec::new();
+        for index in 0..8i64 {
+            let ctx = ctx.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = json!({
+                    "type": "MEDIA_PLAY",
+                    "title": format!("track{}", index),
+                    "text": "artist",
+                    "coverUrl": "",
+                    "isPlaying": true,
+                    "ts": base + index,
+                })
+                .to_string();
+                handle_state_message(&ctx, "order-peer", true, &payload);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let sequence = delivered.lock().unwrap().clone();
+        assert_eq!(
+            probe.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "同会话下发不得并发"
+        );
+        assert!(
+            sequence.windows(2).all(|pair| pair[0] < pair[1]),
+            "下发必须按时间戳单调递增: {:?}",
+            sequence
+        );
+        assert_eq!(
+            sequence.last().copied(),
+            Some(7),
+            "末次下发必须是时间戳最新的状态: {:?}",
+            sequence
+        );
     }
 }

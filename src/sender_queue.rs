@@ -521,7 +521,7 @@ impl SenderQueue {
 
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        let (key_arr, local_uuid) = {
+        let (key_arr, local_uuid, tcp, ip) = {
             // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
             let Ok(guard) = ctx.lock() else {
                 return Err(());
@@ -532,7 +532,14 @@ impl SenderQueue {
                 .as_ref()
                 .map(|i| i.uuid.clone())
                 .unwrap_or_default();
-            (key, uuid)
+            let tcp = guard.network.tcp.clone();
+            let ip = guard
+                .device_ips
+                .lock()
+                .ok()
+                .and_then(|ips| ips.get(&item.device_uuid).cloned())
+                .unwrap_or_default();
+            (key, uuid, tcp, ip)
         };
 
         let key_arr = match key_arr {
@@ -560,35 +567,34 @@ impl SenderQueue {
         };
         let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
 
-        // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
-        let ip = {
-            let Ok(guard) = ctx.lock() else {
-                return Ok(false);
+        // 会话优先：与心跳复用同一条 TCP 会话；无会话或会话写失败时回落 oneshot。
+        // 独立作用域：只在会话发送期间持有 TCP 状态锁，避免阻塞下面的 oneshot 建连。
+        let session_result = {
+            let Ok(mut tcp) = tcp.lock() else {
+                return Err(());
             };
-            guard
-                .device_ips
-                .lock()
-                .ok()
-                .and_then(|ips| ips.get(&item.device_uuid).cloned())
-                .unwrap_or_default()
+            tcp.send_through_session(&item.device_uuid, &msg)
         };
-        if !ip.is_empty() && ip != "0.0.0.0" {
-            // 媒体类消息用短超时快速失败，避免长时间占用并发槽位
-            let timeout_ms = if Self::is_media_header(&item.header) {
-                Self::MEDIA_TIMEOUT_MS
-            } else {
-                Self::DEFAULT_TIMEOUT_MS
-            };
-            Ok(crate::network::oneshot_send_only(
-                &msg,
-                &ip,
-                codec::DEFAULT_TCP_PORT,
-                timeout_ms,
-            ))
-        } else {
-            log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
-            Ok(false)
+        if let Ok(true) = session_result {
+            return Ok(true);
         }
+
+        if ip.is_empty() || ip == "0.0.0.0" {
+            log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
+            return Ok(false);
+        }
+        // 媒体类消息用短超时快速失败，避免长时间占用并发槽位
+        let timeout_ms = if Self::is_media_header(&item.header) {
+            Self::MEDIA_TIMEOUT_MS
+        } else {
+            Self::DEFAULT_TIMEOUT_MS
+        };
+        Ok(crate::network::oneshot_send_only(
+            &msg,
+            &ip,
+            codec::DEFAULT_TCP_PORT,
+            timeout_ms,
+        ))
     }
 
     pub fn stop(&self) {
@@ -1130,5 +1136,71 @@ mod ctx_tests {
 
         let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
         assert_eq!(queue.pending_count(), 4);
+    }
+
+    /// 会话优先：已存在会话时经该会话写帧；未登记 device_ips 时 oneshot 回落不可用。
+    #[test]
+    fn try_send_prefers_existing_session() {
+        use crate::network::TcpSession;
+        use crate::protocol::binary_codec;
+        use crate::protocol::header::MessageType;
+        use base64::Engine as _;
+        use std::net::{TcpListener, TcpStream};
+
+        let ctx = create_ctx();
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        let peer_uuid = "session-peer";
+
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.crypto.set_device_key(
+                peer_uuid.to_string(),
+                String::new(),
+                base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            );
+        }
+
+        // 回环连接：服务端一侧登记为对端会话，客户端一侧读取实际写出的帧
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.network.tcp.lock().unwrap().sessions.insert(
+                peer_uuid.to_string(),
+                TcpSession {
+                    stream: server_stream,
+                    uuid: peer_uuid.to_string(),
+                    ip: "127.0.0.1".to_string(),
+                    conn_id: 1,
+                },
+            );
+        }
+
+        let item = SendItem {
+            device_uuid: peer_uuid.to_string(),
+            header: "DATA_NOTIFICATION".to_string(),
+            plaintext: r#"{"title":"t"}"#.to_string(),
+            dedup_key: None,
+            retries_left: 0,
+            coalesce_key: None,
+        };
+        assert!(
+            SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+            "已存在会话时必须经会话发送"
+        );
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = client;
+        let (msg_type, payload) = binary_codec::read_frame(&mut reader).unwrap();
+        assert_eq!(msg_type, MessageType::NOTIFICATION);
+        let text = String::from_utf8(payload).unwrap();
+        // 首段为 wire header，后续依次为本机 uuid / 版本 / 公钥 / 密文
+        let parts: Vec<&str> = text.splitn(5, ':').collect();
+        assert_eq!(parts[0], "DATA_NOTIFICATION", "会话发送的应是 DATA 帧");
+        assert_eq!(parts.len(), 5, "DATA 帧应为 5 段: {}", text);
     }
 }

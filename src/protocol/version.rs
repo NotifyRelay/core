@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn core_version_is_semver() {
         assert!(major_minor(CORE_VERSION).is_some());
-        assert_eq!(major_minor(CORE_VERSION), Some((0, 2)));
+        assert_eq!(major_minor(CORE_VERSION), Some((0, 3)));
     }
 
     #[test]

@@ -252,6 +252,9 @@ fn accept_loop(
     }
 }
 
+/// 已建立会话的写超时（毫秒）：对端不读取时写操作以错误结束而非无限阻塞。
+const SESSION_WRITE_TIMEOUT_MS: u64 = 3000;
+
 /// 处理单个连接（二进制帧协议）
 fn handle_connection(
     mut stream: TcpStream,
@@ -265,6 +268,10 @@ fn handle_connection(
     let ip = addr.ip().to_string();
 
     stream.set_nonblocking(false).expect("设置阻塞模式失败");
+    // 读方向保持阻塞（由帧长度驱动）；仅写方向设上界
+    stream
+        .set_write_timeout(Some(Duration::from_millis(SESSION_WRITE_TIMEOUT_MS)))
+        .ok();
 
     let reader_stream = stream.try_clone().expect("克隆流失败");
     let mut reader = BufReader::new(reader_stream);
