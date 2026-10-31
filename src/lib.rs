@@ -168,6 +168,8 @@ pub struct BroadcastInfo {
 
 pub struct BroadcastHandle {
     pub running: Arc<AtomicBool>,
+    /// mDNS 发现句柄（停止时注销并关闭 daemon）
+    pub mdns: Option<Arc<std::sync::Mutex<crate::discovery::mdns::MdnsDiscovery>>>,
 }
 
 impl CoreContext {
@@ -302,6 +304,23 @@ impl CoreContext {
             None => {
                 // 文件存在但打开失败：不标记 persistence_loaded，下次重试
                 log::warn!("持久化库存在但打开失败，将在下次调用时重试");
+            }
+        }
+    }
+
+    /// 把当前 broadcast_info 的电量同步到 mDNS 服务记录。
+    ///
+    /// mDNS 的 TXT 记录在注册时固化，电量变化必须重注册才会被对端看到。
+    /// 电源事件与参数更新路径都经此刷新，避免对端读到过期电量。
+    pub fn refresh_mdns_battery(&mut self) {
+        let Some(battery) = self.broadcast_info.as_ref().map(|b| b.battery) else {
+            return;
+        };
+        if let Some(handle) = self.broadcast_handle.as_ref() {
+            if let Some(mdns) = handle.mdns.as_ref() {
+                if let Ok(mut guard) = mdns.lock() {
+                    guard.update_battery(battery);
+                }
             }
         }
     }

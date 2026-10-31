@@ -6,7 +6,7 @@ use crate::{
     SafeContext,
 };
 
-use crate::send::do_send_via_network;
+use crate::send::send_via_quic;
 
 fn fire_pairing_cb(
     ctx: &SafeContext,
@@ -36,11 +36,12 @@ fn fire_pairing_cb(
 /// 2. 触发本机 `on_pairing("REJECT")` 与 `on_pairing("RESULT")`，data/extra 携带 reason。
 fn reject_with_reason(ctx: &SafeContext, uuid: &str, reason: &str) {
     let network = match ctx.lock() {
-        Ok(guard) => guard.network.tcp.clone(),
+        Ok(guard) => guard.network.transport.clone(),
         Err(_) => return,
     };
-    let reject = codec::encode_reject_with_reason(uuid, reason);
-    do_send_via_network(&network, uuid, &reject);
+    let reject = codec::reject_payload_with_reason(uuid, reason);
+    let _ = &network;
+    send_via_quic(ctx, uuid, crate::processing::CTRL_REJECT, &reject);
     fire_pairing_cb(
         ctx,
         uuid,
@@ -290,19 +291,15 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
                 guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                 bi.map(|b| b.battery).unwrap_or(0),
                 bi.map(|b| b.device_type.clone()).unwrap_or_default(),
-                guard.network.tcp.clone(),
+                guard.network.transport.clone(),
             )
         };
         let local_ip = crate::utils::get_local_ip();
         if !local_uuid.is_empty() && !local_pub.is_empty() {
-            let accept = codec::encode_accept(
-                &local_uuid,
-                &local_pub,
-                &local_ip,
-                local_battery,
-                &local_type,
-            );
-            do_send_via_network(&network, &uuid_str, &accept);
+            let _ = (&local_ip, local_battery, &local_type);
+            let accept = codec::accept_payload(&local_uuid, &local_pub);
+            let _ = &network;
+            send_via_quic(ctx, &uuid_str, crate::processing::CTRL_ACCEPT, &accept);
             log::info!("配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT", uuid_str);
         }
     }
@@ -684,12 +681,8 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
     }
 
     {
-        let ack = codec::encode_ack(&uuid);
-        let network = match ctx.lock() {
-            Ok(guard) => guard.network.tcp.clone(),
-            Err(_) => return -1,
-        };
-        do_send_via_network(&network, &uuid, &ack);
+        let ack = codec::ack_payload(&uuid);
+        send_via_quic(ctx, &uuid, crate::processing::CTRL_ACK, &ack);
     }
     0
 }
@@ -704,7 +697,7 @@ fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let network = match ctx.lock() {
         Ok(mut guard) => {
             guard.pairing_sessions.remove(&uuid);
-            guard.network.tcp.clone()
+            guard.network.transport.clone()
         }
         Err(_) => return -1,
     };
@@ -726,8 +719,9 @@ fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
         &reason,
     );
     {
-        let ack = codec::encode_ack(&uuid);
-        do_send_via_network(&network, &uuid, &ack);
+        let _ = &network;
+        let ack = codec::ack_payload(&uuid);
+        send_via_quic(ctx, &uuid, crate::processing::CTRL_ACK, &ack);
     }
     0
 }
@@ -745,6 +739,12 @@ fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
         return -1;
     };
     guard.heartbeat.record(&hb.uuid);
+    log::debug!(
+        "收到心跳: uuid={}, battery={}, type={}",
+        hb.uuid,
+        hb.battery,
+        hb.device_type
+    );
     drop(guard);
     let name_decoded = String::from_utf8(
         base64::engine::general_purpose::STANDARD
@@ -1496,13 +1496,10 @@ mod tests {
         let _serial = icon_test_guard();
         let ctx = ctx_with_pairing_cb();
 
-        let frame =
-            codec::encode_reject_with_reason("peer-x", codec::RejectReason::VERSION_MISMATCH);
-        // 帧头 5 字节（type + length LE），payload 紧随其后
-        let decoded = crate::protocol::binary_codec::read_frame(&mut &frame[..]).unwrap();
-        assert_eq!(decoded.0, MessageType::REJECT);
+        let payload =
+            codec::reject_payload_with_reason("peer-x", codec::RejectReason::VERSION_MISMATCH);
         assert_eq!(
-            process_frame(&ctx, None, decoded.0, &decoded.1),
+            process_frame(&ctx, None, MessageType::REJECT, payload.as_bytes()),
             0,
             "REJECT 应被正常处理"
         );

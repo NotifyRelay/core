@@ -806,50 +806,15 @@ fn send_control(
         format!(r#"{{"type":"MEDIA_CONTROL","action":"{}"}}"#, action)
     };
 
-    let key_arr = match ctx.crypto.get_aes_key(remote_uuid) {
-        Some(k) => k,
-        None => {
-            log::warn!("音频流: 未找到对端密钥或密钥无效 uuid={}", remote_uuid);
-            return;
-        }
-    };
-
-    let local_uuid = ctx
-        .broadcast_info
-        .as_ref()
-        .map(|i| i.uuid.clone())
-        .unwrap_or_default();
-
-    // DATA 通道加密统一绑定 core 版本 AAD（与 sender_queue / process_data 一致）
-    if let Ok(encrypted) = crate::crypto::aes::encrypt_with_aad(
-        &key_arr,
-        payload.as_bytes(),
-        &crate::protocol::version::data_aad(),
-    ) {
-        let msg = crate::protocol::codec::encode_data_message(
-            "DATA_MEDIA_CONTROL",
-            &local_uuid,
-            "",
-            &encrypted,
-        );
-        let ip = ctx.audio.lock().unwrap().peer_ip.clone();
-
-        if !ip.is_empty() && ip != "0.0.0.0" {
-            if crate::network::oneshot_send_only(
-                &msg,
-                &ip,
-                crate::protocol::codec::DEFAULT_TCP_PORT,
-                3000,
-            ) {
-                log::info!("音频流: 已发送控制消息 action={}", action);
-            } else {
-                log::warn!("音频流: oneshot 发送控制消息失败 action={}", action);
+    // QUIC 已由 TLS 1.3 提供加密，直接发送明文业务载荷
+    match ctx.quic.as_ref() {
+        Some(transport) => {
+            match transport.send(remote_uuid, "DATA_MEDIA_CONTROL", payload.as_bytes()) {
+                Ok(()) => log::info!("音频流: 已发送控制消息 action={}", action),
+                Err(e) => log::warn!("音频流: 发送控制消息失败 action={}, error={}", action, e),
             }
-        } else {
-            log::warn!("音频流: 无有效IP发送控制消息 uuid={}", remote_uuid);
         }
-    } else {
-        log::error!("音频流: 加密控制消息失败");
+        None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
     }
 }
 

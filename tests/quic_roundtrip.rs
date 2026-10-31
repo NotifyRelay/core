@@ -39,6 +39,7 @@ fn send_reaches_receiver_with_header_and_payload() {
 
     // A 作为发送端
     let client = QuicTransport::new().expect("创建客户端");
+    client.set_local_cert(cert_a);
     client
         .connect("device-b", "127.0.0.1", port, Some(&fp_b))
         .expect("连接");
@@ -92,6 +93,7 @@ fn concurrent_sends_each_deliver_intact() {
         .expect("启动服务端");
 
     let client = QuicTransport::new().expect("创建客户端");
+    client.set_local_cert(cert_a);
     client
         .connect("device-b", "127.0.0.1", port, Some(&fp_b))
         .expect("连接");

@@ -6,7 +6,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 
-use crate::network;
 use crate::protocol::codec;
 use crate::SafeContext;
 
@@ -80,7 +79,7 @@ pub const HEARTBEAT_MODE_TCP: i32 = 1;
 impl HeartbeatHandle {
     /// 启动心跳发送线程
     pub fn start(
-        _ctx_ptr: usize,
+        ctx_ptr: usize,
         uuid: &str,
         name: &str,
         battery: i32,
@@ -88,7 +87,7 @@ impl HeartbeatHandle {
         ip: &str,
         interval_ms: u64,
         _mode: i32,
-        network_state: Arc<Mutex<crate::network::TcpServerState>>,
+        network_state: Arc<Mutex<crate::network::TransportState>>,
     ) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
@@ -103,7 +102,7 @@ impl HeartbeatHandle {
 
         let r = running.clone();
         let p = params.clone();
-        let net = network_state.clone();
+        let _net = network_state.clone();
 
         thread::Builder::new()
             .name("heartbeat-sender".to_string())
@@ -136,29 +135,23 @@ impl HeartbeatHandle {
                         continue;
                     }
 
-                    // TCP 备用心跳：优先通过已有会话发送，无会话时 oneshot
-                    let msg =
-                        codec::encode_heartbeat_tcp(&uuid, &name_b64, port, battery, &device_type);
+                    // QUIC 心跳：header 表类型，载荷为 JSON（与旧心跳解码器完全兼容）
+                    let hb = crate::protocol::binary_codec::HeartbeatPayload {
+                        uuid: uuid.clone(),
+                        name: name_b64.clone(),
+                        port,
+                        battery,
+                        device_type: device_type.clone(),
+                    };
+                    let payload = serde_json::to_string(&hb).unwrap_or_default();
                     let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                    // 独立作用域：只在此获取 net 锁并保存会话发送结果，
-                    // 锁在离开作用域后立即释放，避免下面耗时的 oneshot（最长 3s 建连）
-                    // 阻塞 TcpServerState 的其他操作（新连接登记、会话清理等）
-                    let session_result = {
-                        let Ok(mut tcp) = net.lock() else {
+                    let sent = match HeartbeatHandle::send_heartbeat(
+                        ctx_ptr, &uuid, &ip_str, &payload, port,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => {
                             thread::sleep(Duration::from_millis(next_interval_ms));
                             continue;
-                        };
-                        tcp.send_through_session(&uuid, &msg)
-                    };
-                    let sent = match session_result {
-                        Ok(true) => true, // 通过已有会话发送成功
-                        // 无会话 / 会话写入失败：fallback 到 oneshot（锁已释放）
-                        Ok(false) | Err(()) => {
-                            if !ip_str.is_empty() {
-                                network::oneshot_send_only(&msg, &ip_str, port, 3000)
-                            } else {
-                                false
-                            }
                         }
                     };
 
@@ -176,6 +169,55 @@ impl HeartbeatHandle {
             .map_err(|e| format!("启动心跳发送线程失败: {}", e))?;
 
         Ok(Self { running, params })
+    }
+
+    /// 发送一次心跳：优先走已建立的 QUIC 会话；无会话时按已知 IP 主动建连后发送。
+    ///
+    /// 返回 `Ok(true)` 表示已交付传输层；`Ok(false)` 表示当前不可达（触发退避）；
+    /// `Err(())` 表示上下文取锁失败（心跳线程按不可达处理）。
+    fn send_heartbeat(
+        ctx_ptr: usize,
+        uuid: &str,
+        ip: &str,
+        payload: &str,
+        port: u16,
+    ) -> Result<bool, ()> {
+        let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+
+        // 1) 已有会话直接发
+        let (transport, connected) = {
+            let Ok(guard) = ctx.lock() else {
+                return Err(());
+            };
+            match guard.quic.as_ref() {
+                Some(t) => (Some(t.clone()), t.is_connected(uuid)),
+                None => (None, false),
+            }
+        };
+        let Some(transport) = transport else {
+            log::debug!("心跳: QUIC 传输层未启动 uuid={}", uuid);
+            return Ok(false);
+        };
+        if connected
+            && transport
+                .send(uuid, crate::processing::CTRL_HEARTBEAT, payload.as_bytes())
+                .is_ok()
+        {
+            return Ok(true);
+        }
+
+        // 2) 无会话：按已知 IP 建连后重试一次
+        if ip.is_empty() || ip == "0.0.0.0" {
+            log::debug!("心跳: 无会话且无已知 IP uuid={}", uuid);
+            return Ok(false);
+        }
+        if transport.connect(uuid, ip, port, None).is_err() {
+            log::debug!("心跳: QUIC 建连失败 uuid={}, ip={}", uuid, ip);
+            return Ok(false);
+        }
+        Ok(transport
+            .send(uuid, crate::processing::CTRL_HEARTBEAT, payload.as_bytes())
+            .is_ok())
     }
 
     /// 更新心跳参数（电池、名称、目标 IP 等）
@@ -255,7 +297,7 @@ pub fn start_offline_detector(
                     // 单语句内完成内部锁获取与调用：避免 MutexGuard 经由 deref 临时量的借用生命周期不足
                     let _ = guard
                         .network
-                        .tcp
+                        .transport
                         .lock()
                         .map(|mut tcp| tcp.remove_session(uuid));
                 }
@@ -363,7 +405,7 @@ impl HeartbeatScheduler {
                             ip,
                             interval_ms,
                             HEARTBEAT_MODE_TCP,
-                            guard.network.tcp.clone(),
+                            guard.network.transport.clone(),
                         ) {
                             Ok(h) => {
                                 log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);
@@ -468,7 +510,10 @@ pub fn start_scheduler_for(
         device_type: device_type.to_string(),
     });
     // 同步广播信息到 TCP 层（供发现请求响应使用）
-    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
+    crate::network::set_broadcast_info(
+        guard.network.transport.clone(),
+        guard.broadcast_info.clone(),
+    );
     // 同步本机 uuid 到持久化（读取接口前自动落盘）与 TCP 层状态
     // 仅库值缺失时采用平台传入值：uuid 已由 Rust 生成持有，空值或与库值冲突时均不得覆盖库值
     if !local_uuid.is_empty() {
@@ -479,7 +524,7 @@ pub fn start_scheduler_for(
         }
         guard.persistence_activated = true;
     }
-    crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
+    crate::network::set_local_uuid(guard.network.transport.clone(), &local_uuid);
 
     match HeartbeatScheduler::start(ctx_ptr, interval_ms) {
         Ok(scheduler) => {
@@ -516,7 +561,12 @@ pub fn update_scheduler_params(
             b.device_type = device_type.to_string();
         }
     }
-    crate::network::set_broadcast_info(guard.network.tcp.clone(), guard.broadcast_info.clone());
+    crate::network::set_broadcast_info(
+        guard.network.transport.clone(),
+        guard.broadcast_info.clone(),
+    );
+    // 电量变化必须同步到 mDNS TXT 记录，否则对端发现时读到的仍是启动时电量
+    guard.refresh_mdns_battery();
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ fn two_identities_connect_over_quic() {
     // 两个独立身份（模拟两台设备）
     let (secret_a, pub_a) = ecdh::generate_keypair();
     let (secret_b, _pub_b) = ecdh::generate_keypair();
-    let _cert_a = cert::derive_cert(&secret_a, "device-a").expect("派生 A 证书");
+    let cert_a = cert::derive_cert(&secret_a, "device-a").expect("派生 A 证书");
     let cert_b = cert::derive_cert(&secret_b, "device-b").expect("派生 B 证书");
     // 服务端出示的是 B 的证书，客户端必须用 B 的指纹校验
     let fp_b = cert_b.fingerprint.clone();
@@ -44,6 +44,7 @@ fn two_identities_connect_over_quic() {
 
     // A 作为客户端，携带 B 的指纹进行校验
     let client = QuicTransport::new().expect("创建客户端传输层");
+    client.set_local_cert(cert_a);
     client
         .connect("device-b", "127.0.0.1", port, Some(&fp_b))
         .expect("A 连接 B");
@@ -75,7 +76,9 @@ fn fingerprint_mismatch_rejects_connection() {
 
     let client = QuicTransport::new().expect("创建客户端传输层");
     // 故意用 A 的指纹去连 B：必须失败
-    let result = client.connect("device-b", "127.0.0.1", port, Some(&cert_a.fingerprint));
+    let fp_a = cert_a.fingerprint.clone();
+    client.set_local_cert(cert_a);
+    let result = client.connect("device-b", "127.0.0.1", port, Some(&fp_a));
     assert!(result.is_err(), "指纹不匹配必须拒绝连接");
 
     client.shutdown();
@@ -96,6 +99,7 @@ fn frame_transfers_over_real_quic_stream() {
         .expect("启动服务端");
 
     let client = QuicTransport::new().expect("创建客户端传输层");
+    client.set_local_cert(cert_a);
     client
         .connect("device-b", "127.0.0.1", port, Some(&fp_b))
         .expect("连接");

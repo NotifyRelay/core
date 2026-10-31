@@ -1,19 +1,20 @@
-use super::binary_codec;
 use super::version;
-use crate::protocol::header::{FeatureFlag, MessageType};
+use crate::protocol::header::FeatureFlag;
 
 pub const DEFAULT_TCP_PORT: u16 = 23333;
 
-pub fn encode_pairing_init(
+/// 配对初始化载荷（QUIC 控制帧 `CTRL_PAIRING_INIT` 的明文）。
+///
+/// 字段顺序须与 `processing::process_pairing_init` 解析一致：
+/// uuid : coreVersion : spake2_pub : ip : battery : device_type
+pub fn pairing_init_payload(
     uuid: &str,
     spake2_pub: &str,
     ip: &str,
     battery: i32,
     device_type: &str,
-) -> Vec<u8> {
-    // 字段顺序须与 processing::process_pairing_init 解析一致：
-    // uuid : coreVersion : spake2_pub : ip : battery : device_type
-    let payload = if battery >= 0 {
+) -> String {
+    if battery >= 0 {
         format!(
             "{}:{}:{}:{}:{}+:{}",
             uuid,
@@ -34,21 +35,21 @@ pub fn encode_pairing_init(
             battery,
             device_type
         )
-    };
-    binary_codec::encode_pairing_frame(MessageType::PAIRING_INIT, &payload)
+    }
 }
 
-pub fn encode_pairing_resp(
+/// 配对响应载荷（QUIC 控制帧 `CTRL_PAIRING_RESP` 的明文）。
+///
+/// 字段顺序：uuid : coreVersion : spake2_pub : lt_pub : ip : battery : device_type
+pub fn pairing_resp_payload(
     uuid: &str,
     spake2_pub: &str,
     lt_pub: &str,
     ip: &str,
     battery: i32,
     device_type: &str,
-) -> Vec<u8> {
-    // 字段顺序须与 processing::process_pairing_resp 解析一致：
-    // uuid : coreVersion : spake2_pub : lt_pub : ip : battery : device_type
-    let payload = if battery >= 0 {
+) -> String {
+    if battery >= 0 {
         format!(
             "{}:{}:{}:{}:{}:{}+:{}",
             uuid,
@@ -60,7 +61,6 @@ pub fn encode_pairing_resp(
             device_type
         )
     } else {
-        // 同 encode_pairing_init：负数电量保留负号（abs() 会丢失符号）
         format!(
             "{}:{}:{}:{}:{}:{}:{}",
             uuid,
@@ -71,23 +71,25 @@ pub fn encode_pairing_resp(
             battery,
             device_type
         )
-    };
-    binary_codec::encode_pairing_frame(MessageType::PAIRING_RESP, &payload)
+    }
 }
 
-pub fn encode_accept(
-    uuid: &str,
-    lt_pub_key: &str,
-    _ip: &str,
-    _battery: i32,
-    _device_type: &str,
-) -> Vec<u8> {
-    // 接收方在 ACCEPT 阶段需要发起方的长期公钥以完成长期密钥派生，
-    // 否则 device_keys.remote_pub_key 为空，导致 Kotlin 侧 deriveSharedSecret 失败。
-    // 负载格式与配对消息帧一致：uuid:coreVersion:enc_lt_pub
-    // （base64 不含冒号，splitn(3, ':') 安全）。
-    let payload = format!("{}:{}:{}", uuid, version::CORE_VERSION, lt_pub_key);
-    binary_codec::encode_pairing_frame(MessageType::ACCEPT, &payload)
+/// ACCEPT 载荷（QUIC 控制帧 `CTRL_ACCEPT` 的明文）：uuid : coreVersion : enc_lt_pub。
+///
+/// 接收方在 ACCEPT 阶段需要发起方的长期公钥以完成长期密钥派生，
+/// 否则 `device_keys.remote_pub_key` 为空，导致平台侧 deriveSharedSecret 失败。
+pub fn accept_payload(uuid: &str, lt_pub_key: &str) -> String {
+    format!("{}:{}:{}", uuid, version::CORE_VERSION, lt_pub_key)
+}
+
+/// REJECT 载荷：`uuid` 或 `uuid:reason`。
+pub fn reject_payload(uuid: &str) -> String {
+    uuid.to_string()
+}
+
+/// 带原因的 REJECT 载荷。
+pub fn reject_payload_with_reason(uuid: &str, reason: &str) -> String {
+    format!("{}:{}", uuid, reason)
 }
 
 /// 拒绝原因码（REJECT 负载第二段），供平台端把失败原因明确呈现给用户，
@@ -101,16 +103,77 @@ impl RejectReason {
     pub const REJECTED: &'static str = "rejected";
 }
 
-pub fn encode_reject(uuid: &str) -> Vec<u8> {
-    binary_codec::encode_control_frame(MessageType::REJECT, uuid)
+/// ACK 载荷：对方 uuid。
+pub fn ack_payload(uuid: &str) -> String {
+    uuid.to_string()
 }
 
-/// 编码带原因的 REJECT 帧：`uuid:reason`。
-///
-/// 兼容旧接收端：旧端只取首段作为 uuid（`splitn(2, ':')`），多余段被忽略；
-/// 新接收端解析出 reason 后通过 `on_pairing("REJECT")` 的 data 字段上抛。
-pub fn encode_reject_with_reason(uuid: &str, reason: &str) -> Vec<u8> {
-    binary_codec::encode_control_frame(MessageType::REJECT, &format!("{}:{}", uuid, reason))
+/// 握手载荷（JSON，QUIC 控制帧 `CTRL_HANDSHAKE` 的明文）。
+pub fn handshake_payload(uuid: &str, ip: &str, battery: i32, device_type: &str) -> String {
+    let flags = FeatureFlag::supported();
+    let hb = super::binary_codec::HeartbeatPayload {
+        uuid: uuid.to_string(),
+        name: String::new(),
+        port: DEFAULT_TCP_PORT,
+        battery,
+        device_type: device_type.to_string(),
+    };
+    // 握手与心跳共用同一 JSON 结构，额外补充 IP 与特性位
+    serde_json::json!({
+        "uuid": hb.uuid,
+        "deviceName": "",
+        "ip": ip,
+        "port": hb.port,
+        "battery": hb.battery,
+        "deviceType": hb.device_type,
+        "coreVersion": version::CORE_VERSION,
+        "featureFlag": flags,
+    })
+    .to_string()
+}
+
+/// 心跳载荷（JSON，QUIC 控制帧 `CTRL_HEARTBEAT` 的明文）。
+pub fn heartbeat_payload(
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+) -> String {
+    serde_json::json!({
+        "uuid": uuid,
+        "name": name_b64,
+        "port": port,
+        "battery": battery,
+        "device_type": device_type,
+    })
+    .to_string()
+}
+
+/// 发现请求报文（UDP 广播用，非 QUIC 通道）。
+pub fn encode_discovery_request(
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+) -> String {
+    format!("{}:{}:{}:{}:{}", uuid, name_b64, port, battery, device_type)
+}
+
+/// 解析发现请求报文。
+pub fn decode_discovery_request(line: &str) -> Option<(String, String, u16, i32, String)> {
+    let parts: Vec<&str> = line.splitn(5, ':').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].parse().ok()?,
+        parts[3].trim_end_matches('+').parse().ok()?,
+        parts[4].to_string(),
+    ))
 }
 
 /// 解析 REJECT 负载为 `(uuid, reason)`；旧格式（仅 uuid）原因回落为 `rejected`。
@@ -133,138 +196,71 @@ pub fn decode_reject_payload(payload: &[u8]) -> Option<(String, String)> {
     Some((uuid.to_string(), reason.to_string()))
 }
 
-pub fn encode_ack(uuid: &str) -> Vec<u8> {
-    binary_codec::encode_control_frame(MessageType::ACK, uuid)
-}
-
-pub fn encode_handshake(uuid: &str, ip: &str, battery: i32, device_type: &str) -> Vec<u8> {
-    let flags = FeatureFlag::supported();
-    binary_codec::encode_handshake_frame(uuid, ip, device_type, battery, &flags)
-}
-
-pub fn encode_heartbeat_tcp(
-    uuid: &str,
-    name: &str,
-    port: u16,
-    battery: i32,
-    device_type: &str,
-) -> Vec<u8> {
-    binary_codec::encode_heartbeat_frame(uuid, name, port, battery, device_type)
-}
-
-pub fn encode_data_message(
-    header: &str,
-    local_uuid: &str,
-    local_pub_key: &str,
-    encrypted_payload: &str,
-) -> Vec<u8> {
-    let msg_type = binary_codec::data_header_to_type(header);
-    // 保留调用方给定的 header：DATA_ICON_RESPONSE 与 DATA_ICON_REQUEST 共用
-    // PACKAGE_INFO 类型，只有 header 能区分请求/响应方向
-    binary_codec::encode_data_frame(
-        header,
-        msg_type,
-        local_uuid,
-        local_pub_key,
-        encrypted_payload,
-    )
-}
-
-/// 编码发现请求（格式同UDP广播：uuid:name_b64:port:battery:device_type）
-pub fn encode_discovery_request(
-    uuid: &str,
-    name_b64: &str,
-    port: u16,
-    battery: i32,
-    device_type: &str,
-) -> String {
-    let battery_str = if battery >= 0 {
-        format!("+{}", battery)
-    } else {
-        format!("{}", battery)
-    };
-    format!(
-        "{}:{}:{}:{}:{}",
-        uuid, name_b64, port, battery_str, device_type
-    )
-}
-
-/// 解码发现请求
-pub fn decode_discovery_request(line: &str) -> Option<(String, String, u16, i32, String)> {
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    let uuid = parts[0].to_string();
-    let name_b64 = parts[1].to_string();
-    let port = parts[2].parse().ok()?;
-    let battery = parts[3].parse().unwrap_or(0);
-    let device_type = parts[4].to_string();
-    Some((uuid, name_b64, port, battery, device_type))
-}
-
-/// 编码发现响应（格式同请求：uuid:name_b64:port:battery:device_type）
-pub fn encode_discovery_response(
-    uuid: &str,
-    name_b64: &str,
-    port: u16,
-    battery: i32,
-    device_type: &str,
-) -> String {
-    encode_discovery_request(uuid, name_b64, port, battery, device_type)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 帧负载（跳过 5 字节帧头）
-    fn payload(frame: &[u8]) -> String {
-        String::from_utf8_lossy(&frame[5..]).to_string()
-    }
-
-    #[test]
-    fn data_frame_carries_version_in_plaintext() {
-        let frame = encode_data_message("DATA_NOTIFICATION", "uuid-1", "", "enc");
-        let text = payload(&frame);
-        let parts: Vec<&str> = text.splitn(5, ':').collect();
-        assert_eq!(parts.len(), 5, "DATA 帧应为 5 段: {}", text);
-        assert_eq!(parts[0], "DATA_NOTIFICATION");
-        assert_eq!(parts[1], "uuid-1");
-        assert_eq!(parts[2], version::CORE_VERSION);
-        assert_eq!(parts[3], "");
-        assert_eq!(parts[4], "enc");
-    }
-
     #[test]
     fn pairing_init_carries_version_as_second_field() {
-        let frame = encode_pairing_init("uuid-a", "spake", "1.2.3.4", 50, "phone");
-        let text = payload(&frame);
+        let text = pairing_init_payload("uuid-a", "spake", "1.2.3.4", 50, "phone");
         assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
     }
 
     #[test]
     fn pairing_resp_carries_version_as_second_field() {
-        let frame = encode_pairing_resp("uuid-b", "spake", "enc", "1.2.3.4", 50, "pc");
-        let text = payload(&frame);
+        let text = pairing_resp_payload("uuid-b", "spake", "enc", "1.2.3.4", 50, "pc");
         assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
     }
 
     #[test]
     fn accept_carries_version_as_second_field() {
-        let frame = encode_accept("uuid-a", "enc_lt", "", 0, "");
-        let text = payload(&frame);
+        let text = accept_payload("uuid-a", "enc_lt");
         assert_eq!(text.split(':').nth(1), Some(version::CORE_VERSION));
     }
 
     #[test]
     fn handshake_carries_core_version() {
-        let frame = encode_handshake("uuid-1", "127.0.0.1", 50, "desktop");
-        let text = payload(&frame);
+        let text = handshake_payload("uuid-1", "127.0.0.1", 50, "desktop");
         assert!(
             text.contains(&format!("\"coreVersion\":\"{}\"", version::CORE_VERSION)),
             "HANDSHAKE 必须携带 coreVersion: {}",
             text
         );
+        let v: serde_json::Value = serde_json::from_str(&text).expect("握手载荷应是合法 JSON");
+        assert_eq!(v["uuid"], "uuid-1");
+        assert_eq!(v["ip"], "127.0.0.1");
+    }
+
+    #[test]
+    fn heartbeat_carries_expected_fields() {
+        let text = heartbeat_payload("uuid-h", "bmFtZQ==", 23333, -20, "pc");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("心跳载荷应是合法 JSON");
+        assert_eq!(v["uuid"], "uuid-h");
+        assert_eq!(v["port"], 23333);
+        assert_eq!(v["battery"], -20, "放电电量须保留负号");
+        assert_eq!(v["device_type"], "pc");
+    }
+
+    #[test]
+    fn reject_reason_roundtrip() {
+        let text = reject_payload_with_reason("uuid-r", RejectReason::VERSION_MISMATCH);
+        let (uuid, reason) = decode_reject_payload(text.as_bytes()).expect("解析 REJECT");
+        assert_eq!(uuid, "uuid-r");
+        assert_eq!(reason, RejectReason::VERSION_MISMATCH);
+        // 无原因时回落为 rejected
+        let (_, reason2) =
+            decode_reject_payload(reject_payload("uuid-r").as_bytes()).expect("解析");
+        assert_eq!(reason2, RejectReason::REJECTED);
+    }
+
+    #[test]
+    fn discovery_roundtrip() {
+        let line = encode_discovery_request("uuid-d", "bmFtZQ==", 23333, 80, "phone");
+        let (uuid, name, port, battery, dt) = decode_discovery_request(&line).expect("解析发现");
+        assert_eq!(uuid, "uuid-d");
+        assert_eq!(name, "bmFtZQ==");
+        assert_eq!(port, 23333);
+        assert_eq!(battery, 80);
+        assert_eq!(dt, "phone");
     }
 }

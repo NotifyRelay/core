@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::crypto::aes;
 use crate::protocol::codec;
 use crate::SafeContext;
 
@@ -68,10 +67,6 @@ impl Drop for TaskGuard {
 impl SenderQueue {
     const MAX_CONCURRENT: usize = 5;
     const MAX_RETRIES: u32 = 3;
-    /// 媒体类消息连接超时（毫秒）：过期状态无重发价值，快速失败
-    const MEDIA_TIMEOUT_MS: u32 = 800;
-    /// 普通消息连接超时（毫秒）
-    const DEFAULT_TIMEOUT_MS: u32 = 3000;
     /// 失败退避冷却上限（秒）
     const MAX_COOLDOWN_SECS: u64 = 5;
     /// orphan_keys 上限（超出丢弃最旧记录，正常路径每轮 worker 即清空）
@@ -1159,6 +1154,7 @@ mod ctx_tests {
 
         let (secret_a, _) = ecdh::generate_keypair();
         let (secret_b, _) = ecdh::generate_keypair();
+        let cert_a = cert::derive_cert(&secret_a, "peer-a").expect("A 证书");
         let cert_b = cert::derive_cert(&secret_b, "peer-b").expect("B 证书");
         let fp_b = cert_b.fingerprint.clone();
 
@@ -1178,6 +1174,7 @@ mod ctx_tests {
 
         // 本机：作为客户端连上对端，并把传输层放进上下文
         let client = QuicTransport::new().expect("创建客户端");
+        client.set_local_cert(cert_a);
         client
             .connect("peer", "127.0.0.1", port, Some(&fp_b))
             .expect("连接");

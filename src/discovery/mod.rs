@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+pub mod mdns;
+
 use crate::network;
 use crate::protocol::codec;
 use crate::SafeContext;
@@ -129,18 +131,20 @@ impl DiscoveryState {
                                 .unwrap_or_default()
                         };
                         let handshake =
-                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt);
+                            codec::handshake_payload(&local_uuid, &local_ip, local_battery, &dt);
 
-                        let resp = network::oneshot_send_receive_bin(
+                        let resp = network::request_response_over_quic(
+                            ctx_ptr,
+                            crate::processing::CTRL_HANDSHAKE,
                             &handshake,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
                             3000,
                         );
-                        if let Some((msg_type, payload)) = resp {
+                        if let Some((resp_header, payload)) = resp {
                             // REJECT 表示对端明确拒绝（如 core 版本不兼容）：
                             // 不能视为"在线"，否则设备会被错误标记为可用并反复握手。
-                            if msg_type == crate::protocol::header::MessageType::REJECT {
+                            if resp_header == crate::processing::CTRL_REJECT {
                                 let reason = codec::decode_reject_payload(&payload)
                                     .map(|(_, r)| r)
                                     .unwrap_or_else(|| "unknown".to_string());

@@ -72,6 +72,27 @@ pub fn derive_cert(secret: &SecretKey, device_uuid: &str) -> Result<DerivedCert,
     })
 }
 
+/// 从对端证书 DER 中解析出发起方的设备 uuid。
+///
+/// 证书 CN 形如 `notifyrelay:{uuid}`（见 [derive_cert]），
+/// 入站连接据此识别对端身份，避免用 IP:端口之类的临时标识冒充设备。
+pub fn device_uuid_from_cert(cert_der: &[u8]) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()?
+        .as_str()
+        .ok()?
+        .to_string();
+    let uuid = cn.strip_prefix("notifyrelay:")?.to_string();
+    if uuid.is_empty() {
+        None
+    } else {
+        Some(uuid)
+    }
+}
+
 /// 设备 uuid 可能含非法 DNS 字符，仅保留字母数字，其余替换为连字符。
 fn sanitize(uuid: &str) -> String {
     let cleaned: String = uuid
@@ -131,6 +152,15 @@ mod tests {
             derived.fingerprint, other.fingerprint,
             "uuid 不参与绑定值计算"
         );
+    }
+
+    /// 证书必须能反解出写入的设备 uuid（入站识别对端身份的依据）。
+    #[test]
+    fn cert_carries_device_uuid() {
+        let (secret, _) = ecdh::generate_keypair();
+        let derived = derive_cert(&secret, "device-abc-123").expect("派生证书");
+        let uuid = device_uuid_from_cert(&derived.cert_der).expect("解析出 uuid");
+        assert_eq!(uuid, "device-abc-123");
     }
 
     /// 不同私钥必须产生不同绑定值。

@@ -205,19 +205,21 @@ impl ReconnectState {
                                 .map(|i| i.device_type.clone())
                                 .unwrap_or_default();
                             let local_ip = crate::utils::get_local_ip();
-                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt)
+                            codec::handshake_payload(&local_uuid, &local_ip, local_battery, &dt)
                         };
 
-                        let resp = crate::network::oneshot_send_receive_bin(
+                        let resp = crate::network::request_response_over_quic(
+                            ctx_ptr,
+                            crate::processing::CTRL_HANDSHAKE,
                             &handshake_msg,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
                             5000,
                         );
-                        if let Some((msg_type, payload)) = resp {
+                        if let Some((resp_header, payload)) = resp {
                             // REJECT 表示对端明确拒绝（如 core 版本不兼容）：不得记为在线，
                             // 否则不兼容设备会被反复判定为已连接，掩盖真实失败原因。
-                            if msg_type == crate::protocol::header::MessageType::REJECT {
+                            if resp_header == crate::processing::CTRL_REJECT {
                                 let reason = codec::decode_reject_payload(&payload)
                                     .map(|(_, r)| r)
                                     .unwrap_or_else(|| "unknown".to_string());

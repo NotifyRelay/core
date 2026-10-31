@@ -3,11 +3,8 @@
 //! 全部为领域实现，入参/出参均为 Rust 类型；C ABI 与 UniFFI 的适配分别由
 //! `ffi::send` 与 `api` 完成。
 
-use std::io::{BufReader, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -15,7 +12,7 @@ use base64::Engine;
 use crate::utils::encode_name_b64;
 use crate::{
     crypto::{aes, hkdf, spake2},
-    protocol::codec,
+    protocol::{codec, header::MessageType},
     BroadcastHandle, BroadcastInfo, CoreContext, SafeContext,
 };
 
@@ -44,56 +41,43 @@ pub(crate) fn send_via_quic(ctx: &SafeContext, uuid: &str, header: &str, plainte
     }
 }
 
-/// 发送控制帧（握手/配对/ACCEPT/REJECT 等）到指定设备。
-///
-/// QUIC 承载：header 表示控制帧类型，明文为载荷文本。
-pub(crate) fn send_control(ctx: &SafeContext, uuid: &str, header: &str, payload: &str) -> bool {
-    send_via_quic(ctx, uuid, header, payload)
-}
-
-/// 通过已建立的会话发送消息（旧 TCP 帧接口，保留供尚未迁移的调用点）。
-pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, data: &[u8]) -> bool {
-    do_send_via_network(&ctx.network.tcp, uuid, data)
-}
-
-/// 仅持有 TCP 状态锁执行发送；调用方无需在网络 I/O 期间持有 CoreContext 锁。
-pub(crate) fn do_send_via_network(
-    network: &Arc<std::sync::Mutex<crate::network::TcpServerState>>,
-    uuid: &str,
-    data: &[u8],
-) -> bool {
-    match network.lock() {
-        Ok(mut tcp) => {
-            if let Some(session) = tcp.sessions.get_mut(uuid) {
-                if let Err(e) = session.stream.write_all(data) {
-                    log::error!("发送消息失败 uuid={}, error={}", uuid, e);
-                    false
-                } else {
-                    true
-                }
-            } else {
-                log::warn!("设备未连接 uuid={}", uuid);
-                false
-            }
-        }
+/// 通过已建立的会话发送一条控制帧（header + 明文）。
+pub(crate) fn do_send_control(ctx: &CoreContext, uuid: &str, header: &str, payload: &str) -> bool {
+    let Some(transport) = ctx.quic.as_ref() else {
+        log::warn!(
+            "发送失败: QUIC 传输层未就绪 uuid={}, header={}",
+            uuid,
+            header
+        );
+        return false;
+    };
+    match transport.send(uuid, header, payload.as_bytes()) {
+        Ok(()) => true,
         Err(e) => {
-            log::error!("加锁失败: {}", e);
+            log::warn!("发送失败 uuid={}, header={}, error={}", uuid, header, e);
             false
         }
     }
 }
 
-/// 通过 Oneshot TCP 发送，并处理响应
-fn oneshot_send_and_process(ctx: &SafeContext, ip: &str, port: u16, payload: &[u8]) -> i32 {
-    let resp = crate::network::oneshot_send_receive_bin(payload, ip, port, 5000);
+/// 向指定地址发起一次性请求并处理响应（QUIC 双向流）。
+fn oneshot_send_and_process(
+    ctx: &SafeContext,
+    ip: &str,
+    port: u16,
+    header: &str,
+    payload: &str,
+) -> i32 {
+    let ctx_ptr = ctx as *const SafeContext as usize;
+    let resp = crate::network::request_response_over_quic(ctx_ptr, header, payload, ip, port, 5000);
     match resp {
-        Some((msg_type, payload)) => {
-            // oneshot 直连：无会话 uuid 可比对
-            crate::processing::process_frame(ctx, None, msg_type, &payload);
+        Some((resp_header, resp_payload)) => {
+            // 一次性直连：无会话 uuid 可比对
+            crate::processing::process_header_frame(ctx, None, &resp_header, &resp_payload);
             0
         }
         None => {
-            log::error!("oneshot 发送/接收失败 ip={}, port={}", ip, port);
+            log::error!("一次性请求失败 ip={}, port={}", ip, port);
             -1
         }
     }
@@ -111,19 +95,25 @@ pub fn send_handshake(
     device_type: &str,
 ) -> i32 {
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
-    let msg = codec::encode_handshake(uuid, local_ip, battery, device_type);
+    let payload = codec::handshake_payload(uuid, local_ip, battery, device_type);
 
-    // 尝试通过已有 TCP 会话发送
+    // 优先走已建立会话
     let sent = match ctx.lock() {
-        Ok(guard) => do_send(&guard, uuid, &msg),
+        Ok(guard) => do_send_control(&guard, uuid, crate::processing::CTRL_HANDSHAKE, &payload),
         Err(_) => false,
     };
     if sent {
         return 0;
     }
 
-    // 否则通过 oneshot 发送到 target_ip:port
-    oneshot_send_and_process(ctx, target_ip, port, &msg)
+    // 否则向 target_ip 发起一次性请求
+    oneshot_send_and_process(
+        ctx,
+        target_ip,
+        port,
+        crate::processing::CTRL_HANDSHAKE,
+        &payload,
+    )
 }
 
 /// 发送配对结果回调并清理临时状态
@@ -160,8 +150,6 @@ pub fn send_pairing_init(
 
     let local_ip = crate::utils::get_local_ip();
     let (prover, spake2_pub) = spake2::generate_prover_session(expected_code);
-    let init_frame =
-        codec::encode_pairing_init(local_uuid, &spake2_pub, &local_ip, battery, device_type);
 
     let target_ip = {
         let Ok(mut guard) = ctx.lock() else {
@@ -187,52 +175,37 @@ pub fn send_pairing_init(
         return -1;
     }
 
-    let addr = format!("{}:{}", target_ip, port);
-    let sock_addr = match addr.parse::<std::net::SocketAddr>() {
-        Ok(a) => a,
-        Err(_) => {
-            log::error!("配对发起: 地址解析失败 addr={}", addr);
-            fire_pairing_result(ctx, target_uuid, 0, "address_parse_failed");
-            return -1;
-        }
-    };
-    let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("配对发起: 连接目标超时, err={}", e);
-            fire_pairing_result(ctx, target_uuid, 0, "connection_timeout");
+    // 配对走 QUIC：发 PAIRING_INIT 并等待同流回复的 PAIRING_RESP
+    let init_payload =
+        codec::pairing_init_payload(local_uuid, &spake2_pub, &local_ip, battery, device_type);
+    let ctx_ptr = ctx as *const SafeContext as usize;
+    let resp = match crate::network::request_response_over_quic(
+        ctx_ptr,
+        crate::processing::CTRL_PAIRING_INIT,
+        &init_payload,
+        &target_ip,
+        port,
+        60_000,
+    ) {
+        Some(r) => r,
+        None => {
+            log::error!("配对发起: 等待 PAIRING_RESP 失败或超时");
+            fire_pairing_result(ctx, target_uuid, 0, "pairing_resp_timeout");
+            let reject = codec::reject_payload(local_uuid);
+            let _ = crate::network::send_once_over_quic(
+                ctx_ptr,
+                crate::processing::CTRL_REJECT,
+                &reject,
+                &target_ip,
+                port,
+                5000,
+            );
             return -1;
         }
     };
 
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    {
-        let mut writer = &stream;
-        if writer.write_all(&init_frame).is_err() {
-            log::error!("配对发起: 发送 PAIRING_INIT 失败");
-            fire_pairing_result(ctx, target_uuid, 0, "send_pairing_init_failed");
-            return -1;
-        }
-        let _ = writer.flush();
-    }
-
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    let resp = {
-        let mut reader = BufReader::new(&stream);
-        match crate::protocol::binary_codec::read_frame(&mut reader) {
-            Ok((t, p)) => (t, p),
-            Err(e) => {
-                log::error!("配对发起: 读取 PAIRING_RESP 失败或连接关闭: {}", e);
-                fire_pairing_result(ctx, target_uuid, 0, "pairing_resp_timeout");
-                let reject_msg = codec::encode_reject(local_uuid);
-                let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
-                return -1;
-            }
-        }
-    };
-
-    // 配对发起方在自己建立的连接上读取响应：无会话 uuid 可比对
-    crate::processing::process_frame(ctx, None, resp.0, &resp.1);
+    // 配对发起方读到的响应无会话 uuid 可比对
+    crate::processing::process_frame(ctx, None, MessageType::PAIRING_RESP, &resp.1);
 
     let (ks, peer_lt_pub) = {
         let Ok(mut g) = ctx.lock() else {
@@ -264,8 +237,7 @@ pub fn send_pairing_init(
         };
         // 用 K_s 加密本机 lt_pub，避免明文传输（K_s 仅用于本次公钥传输）
         let enc_lt = aes::encrypt(&aes_key, local_pub_b64.as_bytes()).unwrap_or_default();
-        // 数据通道密钥由长期 ECDH 派生（与重连路径一致），K_s 不再作为会话密钥；
-        // 派生失败（本机长期私钥缺失/对端公钥非法）时回落 K_s，保证两端仍对称可用
+        // 数据通道密钥由长期 ECDH 派生（与重连路径一致），K_s 不再作为会话密钥
         let (b64, key_bytes) = match derived_key {
             Some(k) => (base64::engine::general_purpose::STANDARD.encode(k), Some(k)),
             None => {
@@ -276,7 +248,6 @@ pub fn send_pairing_init(
                 )
             }
         };
-        // K_s 使命完成，清零，避免长期驻留内存
         crate::crypto::zeroize_key(&mut aes_key);
         {
             let Ok(mut guard) = ctx.lock() else {
@@ -293,40 +264,35 @@ pub fn send_pairing_init(
             );
             guard.pairing_sessions.remove(target_uuid);
         }
-        let accept_line =
-            codec::encode_accept(local_uuid, &enc_lt, &local_ip, battery, device_type);
-        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        if stream.write_all(&accept_line).is_err() || stream.flush().is_err() {
-            log::warn!("配对发起: 发送 ACCEPT 失败");
-        } else {
-            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            let mut ack_reader = BufReader::new(&stream);
-            match crate::protocol::binary_codec::read_frame(&mut ack_reader) {
-                Ok((t, _)) if t == crate::protocol::header::MessageType::ACK => {
-                    log::info!("配对发起: 收到 ACK 确认");
-                }
-                Ok((t, _)) => {
-                    log::warn!("配对发起: 收到非 ACK 响应 type={}", t);
-                }
-                Err(_) => {
-                    log::warn!("配对发起: 未收到 ACK 确认");
-                }
-            }
+
+        // 发送 ACCEPT 并等待 ACK
+        let accept = codec::accept_payload(local_uuid, &enc_lt);
+        let acked = crate::network::request_response_over_quic(
+            ctx_ptr,
+            crate::processing::CTRL_ACCEPT,
+            &accept,
+            &target_ip,
+            port,
+            10_000,
+        );
+        match acked {
+            Some(_) => log::info!("配对发起: 收到 ACK 确认"),
+            None => log::warn!("配对发起: 未收到 ACK 确认"),
         }
         fire_pairing_result(ctx, target_uuid, 1, "ok");
         return 0;
     }
 
     log::warn!("配对发起: SPAKE2 会话密钥或对方公钥缺失");
-    let reject_msg = codec::encode_reject(local_uuid);
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    if stream.write_all(&reject_msg).is_ok() && stream.flush().is_ok() {
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let mut ack_reader = BufReader::new(&stream);
-        let _ = crate::protocol::binary_codec::read_frame(&mut ack_reader);
-    } else {
-        let _ = crate::network::oneshot_send_only(&reject_msg, &target_ip, port, 5000);
-    }
+    let reject = codec::reject_payload(local_uuid);
+    let _ = crate::network::send_once_over_quic(
+        ctx_ptr,
+        crate::processing::CTRL_REJECT,
+        &reject,
+        &target_ip,
+        port,
+        5000,
+    );
     fire_pairing_result(ctx, target_uuid, 0, "session_missing");
     0
 }
@@ -435,11 +401,11 @@ pub fn send_pairing_resp(
             if !stored {
                 return -1;
             }
-            codec::encode_pairing_resp(uuid, &spake2_pub, &enc_lt, &local_ip, battery, device_type)
+            codec::pairing_resp_payload(uuid, &spake2_pub, &enc_lt, &local_ip, battery, device_type)
         }
         Err(e) => {
             log::error!("发送 PAIRING_RESP: SPAKE2 verifier 完成失败: {}", e);
-            Vec::new()
+            String::new()
         }
     };
     if msg.is_empty() {
@@ -447,11 +413,18 @@ pub fn send_pairing_resp(
         return -1;
     }
 
-    let network = match ctx.lock() {
-        Ok(guard) => guard.network.tcp.clone(),
-        Err(_) => return -1,
+    let sent = match ctx.lock() {
+        Ok(guard) => do_send_control(
+            &guard,
+            &target_uuid,
+            crate::processing::CTRL_PAIRING_RESP,
+            &msg,
+        ),
+        Err(_) => false,
     };
-    do_send_via_network(&network, &target_uuid, &msg);
+    if !sent {
+        log::warn!("发送 PAIRING_RESP 失败 target={}", target_uuid);
+    }
     0
 }
 
@@ -460,9 +433,9 @@ pub fn send_accept(
     ctx: &SafeContext,
     target_uuid: &str,
     lt_pub_key: &str,
-    ip: &str,
-    battery: i32,
-    device_type: &str,
+    _ip: &str,
+    _battery: i32,
+    _device_type: &str,
 ) {
     let Ok(guard) = ctx.lock() else {
         return;
@@ -476,20 +449,31 @@ pub fn send_accept(
         log::warn!("send_accept: 本机 uuid 未设置（broadcast_info 为空），跳过发送 ACCEPT");
         return;
     }
-    let msg = codec::encode_accept(&local_uuid, lt_pub_key, ip, battery, device_type);
-    do_send(&guard, target_uuid, &msg);
+    let payload = codec::accept_payload(&local_uuid, lt_pub_key);
+    let sent = do_send_control(
+        &guard,
+        target_uuid,
+        crate::processing::CTRL_ACCEPT,
+        &payload,
+    );
+    if !sent {
+        log::warn!("send_accept: 发送 ACCEPT 失败 target={}", target_uuid);
+    }
 }
 
 /// 发送 REJECT 并清理该对端的配对会话。
 pub fn send_reject(ctx: &SafeContext, uuid: &str) {
-    let network = match ctx.lock() {
+    let payload = codec::reject_payload(uuid);
+    let sent = match ctx.lock() {
         Ok(mut guard) => {
             guard.pairing_sessions.remove(uuid);
-            guard.network.tcp.clone()
+            do_send_control(&guard, uuid, crate::processing::CTRL_REJECT, &payload)
         }
-        Err(_) => return,
+        Err(_) => false,
     };
-    do_send_via_network(&network, uuid, &codec::encode_reject(uuid));
+    if !sent {
+        log::warn!("send_reject: 发送 REJECT 失败 uuid={}", uuid);
+    }
 }
 
 /// UDP 广播发现周期：2 秒。
@@ -499,12 +483,13 @@ pub fn send_reject(ctx: &SafeContext, uuid: &str) {
 /// 应用网络异常，才切换到 TCP 扫描；现恢复 UDP 广播。移动网络（蜂窝）下无局域网广播域，
 /// UDP 广播不可达属预期行为，设备间连接仍由心跳 / known_device_scanner 等定向 TCP 通道
 /// 负责，请勿为「移动网络下也能发现」改回全段 TCP 扫描（防回归）。
+#[allow(dead_code)]
 pub(crate) const BROADCAST_INTERVAL_MS: u64 = 2000;
 
 /// 统一处理「发现到的设备」：登记注册表、记录 device_ips，并触发平台 on_device_discovered 回调。
 /// UDP 广播发现路径与（保留的）TCP 发现请求应答路径共用同一消费链，保证发现结果上抛语义一致。
 /// 仅在发现线程中调用，必须通过 ctx.lock() 取锁（不得用 get_mut() 绕过互斥）。
-fn consume_discovered_device(
+pub(crate) fn consume_discovered_device(
     ctx_ref: &SafeContext,
     uuid: &str,
     name_b64: &str,
@@ -540,6 +525,9 @@ fn consume_discovered_device(
     if let Ok(mut ips) = guard.device_ips.lock() {
         ips.insert(uuid.to_string(), ip.to_string());
     }
+    // 关键：登记到 known_devices，否则心跳调度器不会为它启动心跳，
+    // 该设备永远停留在「已发现但离线」状态（多设备场景下表现为随机一台掉线）。
+    guard.discovery.add_known_device(uuid, ip);
     let cb = guard.router.on_device_discovered.clone();
     // 回调前释放锁：平台端回调内可能再次调用 core 接口（如拉取设备快照）
     drop(guard);
@@ -586,21 +574,20 @@ pub fn periodic_broadcast(
             let d = device_type.to_string();
 
             let running = Arc::new(AtomicBool::new(true));
-            let r = running.clone();
 
             let Ok(mut guard) = ctx.lock() else {
                 return -1;
             };
             let local_uuid = u.clone();
             guard.broadcast_info = Some(BroadcastInfo {
-                uuid: u,
+                uuid: u.clone(),
                 name_b64: n_b64,
                 battery,
-                device_type: d,
+                device_type: d.clone(),
             });
             // 同步广播信息到 TCP 层（供发现请求响应使用）
             crate::network::set_broadcast_info(
-                guard.network.tcp.clone(),
+                guard.network.transport.clone(),
                 guard.broadcast_info.clone(),
             );
             // 同步本机 uuid 到持久化与 TCP 层状态（防御平台端 StartTcpServer 早于广播启动的情况）
@@ -613,125 +600,46 @@ pub fn periodic_broadcast(
                 }
                 guard.persistence_activated = true;
             }
-            crate::network::set_local_uuid(guard.network.tcp.clone(), &local_uuid);
+            crate::network::set_local_uuid(guard.network.transport.clone(), &local_uuid);
 
             if guard.broadcast_handle.is_some() {
                 return 0;
             }
             drop(guard);
 
-            match thread::Builder::new()
-                .name("periodic-discovery".to_string())
-                .spawn(move || {
-                    // UDP 广播发现线程：
-                    // - 以 BROADCAST_INTERVAL_MS 为周期广播本机发现信息（每个可广播本机地址各发一条）；
-                    // - 其余时间分片监听 UDP 广播端口，收到对端广播即解析并走统一消费链
-                    //   （registry 登记 / device_ips 记录 / on_device_discovered 回调）。
-                    // 移动网络（蜂窝）下无局域网广播域，广播不可达属预期，勿改回全段 TCP 扫描。
-                    let mut sender = crate::network::UdpDiscoverySender::new();
-                    // 监听 socket 绑定失败（如端口被其他实例占用）时不阻塞广播发送，退化为仅发送
-                    let listener = match crate::network::bind_udp_discovery_listener() {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            log::warn!("UDP 广播发现: 绑定监听端口失败（退化为仅发送）: {}", e);
-                            None
-                        }
-                    };
-
-                    // 首次进入循环即广播一次，缩短平台开启发现后的首个发现周期
-                    let mut last_broadcast = Instant::now()
-                        .checked_sub(Duration::from_millis(BROADCAST_INTERVAL_MS))
-                        .unwrap_or_else(Instant::now);
-                    let mut buf = [0u8; 2048];
-
-                    loop {
-                        if !r.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-                        // 1) 到点广播本机发现信息
-                        if last_broadcast.elapsed() >= Duration::from_millis(BROADCAST_INTERVAL_MS)
-                        {
-                            let msg = {
-                                // 后台线程统一走 lock() 取锁，避免裸指针 + get_mut()
-                                // 绕过互斥导致 CoreContext 数据竞争
-                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                                let Ok(guard) = ctx.lock() else {
-                                    continue;
-                                };
-                                match &guard.broadcast_info {
-                                    Some(i) => codec::encode_discovery_request(
-                                        &i.uuid,
-                                        &i.name_b64,
-                                        codec::DEFAULT_TCP_PORT,
-                                        i.battery,
-                                        &i.device_type,
-                                    ),
-                                    None => String::new(),
-                                }
-                            };
-                            if !msg.is_empty() {
-                                // 逐个本机可广播地址各发一条：出口网卡由绑定的源地址决定，
-                                // 不依赖 255.255.255.255 的路由选择，避免多网卡下单链路发送
-                                let sent = sender.send(&msg);
-                                if sent == 0 {
-                                    log::debug!("UDP 广播发现: 本轮无可用发送接口");
-                                }
-                            }
-                            last_broadcast = Instant::now();
-                        }
-
-                        // 2) 分片监听对端广播（读超时 100ms，兼顾定时广播的及时性）
-                        if let Some(sock) = listener.as_ref() {
-                            match sock.recv_from(&mut buf) {
-                                Ok((n, src)) => {
-                                    let line = match std::str::from_utf8(&buf[..n]) {
-                                        Ok(s) => s.trim().to_string(),
-                                        Err(_) => continue,
-                                    };
-                                    if line.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some((uuid, name_b64, port, battery, device_type)) =
-                                        codec::decode_discovery_request(&line)
-                                    {
-                                        if !uuid.is_empty() {
-                                            let ctx_ref =
-                                                unsafe { &*(ctx_ptr as *const SafeContext) };
-                                            consume_discovered_device(
-                                                ctx_ref,
-                                                &uuid,
-                                                &name_b64,
-                                                port,
-                                                battery,
-                                                &device_type,
-                                                &src.ip().to_string(),
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e)
-                                    if e.kind() == std::io::ErrorKind::WouldBlock
-                                        || e.kind() == std::io::ErrorKind::TimedOut
-                                        || e.kind() == std::io::ErrorKind::Interrupted => {}
-                                Err(e) => {
-                                    log::debug!("UDP 广播发现: 接收错误: {}", e);
-                                }
-                            }
-                        } else {
-                            // 无监听 socket 时退避，避免忙等
-                            thread::sleep(Duration::from_millis(100));
-                        }
-                    }
-                }) {
-                Ok(_) => {
+            // mDNS 发现：注册本机服务 + 订阅同类型服务事件（替代 UDP 广播）
+            let port = {
+                let Ok(guard) = ctx.lock() else {
+                    return -1;
+                };
+                guard.network.port
+            };
+            let discovery_port = if port == 0 {
+                crate::protocol::codec::DEFAULT_TCP_PORT
+            } else {
+                port
+            };
+            let result = crate::discovery::mdns::MdnsDiscovery::start(
+                ctx_ptr,
+                &u,
+                name,
+                discovery_port,
+                battery,
+                &d,
+            );
+            match result {
+                Ok(handle) => {
                     if let Ok(mut guard) = ctx.lock() {
-                        guard.broadcast_handle = Some(BroadcastHandle { running });
+                        guard.broadcast_handle = Some(BroadcastHandle {
+                            running,
+                            mdns: Some(std::sync::Arc::new(std::sync::Mutex::new(handle))),
+                        });
                     }
                     0
                 }
                 Err(e) => {
-                    log::error!("启动发现线程失败: {}", e);
+                    log::error!("启动 mDNS 发现失败: {}", e);
+                    running.store(false, Ordering::Relaxed);
                     -1
                 }
             }
@@ -747,13 +655,16 @@ pub fn periodic_broadcast(
                 if let Some(name) = name {
                     info.name_b64 = encode_name_b64(name);
                 }
-                if battery >= 0 {
+                // 负数表示放电，是有效状态；仅超出 [-100,100] 才视为未知
+                if battery.abs() <= 100 {
                     info.battery = battery;
                 }
                 if let Some(device_type) = device_type {
                     info.device_type = device_type.to_string();
                 }
             }
+            // 电量/名称/类型变化同步到 mDNS TXT 记录
+            guard.refresh_mdns_battery();
             0
         }
         _ => -1,
@@ -821,32 +732,40 @@ pub fn connect_device(
         return -1;
     }
 
-    let msg = codec::encode_handshake(&local_uuid, &local_ip, battery, device_type);
+    let payload = codec::handshake_payload(&local_uuid, &local_ip, battery, device_type);
 
+    let ptr = ctx as *const SafeContext as usize;
     for attempt in 0..MAX_RETRIES {
-        let resp = crate::network::oneshot_send_receive_bin(&msg, target_ip, PORT, TIMEOUT_MS);
+        let resp = crate::network::request_response_over_quic(
+            ptr,
+            crate::processing::CTRL_HANDSHAKE,
+            &payload,
+            target_ip,
+            PORT,
+            TIMEOUT_MS,
+        );
         match resp {
-            Some((msg_type, payload)) => {
-                if msg_type == crate::protocol::header::MessageType::ACCEPT {
+            Some((resp_header, resp_payload)) => {
+                if resp_header == crate::processing::CTRL_ACCEPT {
                     log::info!(
                         "连接设备: 握手成功 uuid={}, 第 {} 次尝试",
                         target_uuid,
                         attempt + 1
                     );
-                    crate::processing::process_frame(ctx, None, msg_type, &payload);
+                    crate::processing::process_header_frame(ctx, None, &resp_header, &resp_payload);
                     return 0;
                 }
-                if msg_type == crate::protocol::header::MessageType::REJECT {
+                if resp_header == crate::processing::CTRL_REJECT {
                     log::warn!("连接设备: 对端拒绝 uuid={}", target_uuid);
-                    crate::processing::process_frame(ctx, None, msg_type, &payload);
+                    crate::processing::process_header_frame(ctx, None, &resp_header, &resp_payload);
                     return -1;
                 }
                 log::warn!(
-                    "连接设备: 收到非预期响应(type={}) uuid={}, 重试",
-                    msg_type,
+                    "连接设备: 收到非预期响应(header={}) uuid={}, 重试",
+                    resp_header,
                     target_uuid
                 );
-                crate::processing::process_frame(ctx, None, msg_type, &payload);
+                crate::processing::process_header_frame(ctx, None, &resp_header, &resp_payload);
             }
             None => {
                 log::warn!(

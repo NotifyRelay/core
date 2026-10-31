@@ -155,7 +155,7 @@ impl Core {
 
     // ===== 网络与服务 =====
 
-    /// 移除指定设备的 TCP 会话。
+    /// 移除指定设备的连接。
     pub fn remove_device_session(&self, uuid: String) -> i32 {
         let Ok(mut guard) = self.ctx().lock() else {
             return -1;

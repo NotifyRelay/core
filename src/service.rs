@@ -54,8 +54,19 @@ pub fn start_core(ctx_ptr: usize, params: StartCoreParams<'_>) -> u64 {
         env!("CARGO_PKG_VERSION")
     );
 
-    // 先启动 TCP/UDP（需在广播信息就绪前设置本机 uuid 用于自我连接拒绝）
-    if crate::network::start_tcp_server_for(ctx_ptr, params.tcp_port) != 0 {
+    // 先落本机身份：传输服务端要据此派生身份证书（CN 携带 uuid），
+    // 晚于本步骤会导致证书身份为空、对端无法识别来源设备。
+    {
+        let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+        if let Ok(mut guard) = ctx.lock() {
+            if guard.local_uuid.is_empty() && !params.uuid.is_empty() {
+                guard.local_uuid = params.uuid.to_string();
+            }
+        }
+    }
+
+    // 再启动 QUIC 服务端
+    if crate::network::start_transport_server(ctx_ptr, params.tcp_port) != 0 {
         // TCP 绑定失败不阻塞其他组件：发送队列/心跳照常启动，
         // 出站发送由发送队列 worker 独立负责，网络恢复后重连状态机会补建连接
         log::warn!("start_core: TCP 服务器启动失败，继续启动其他组件");
