@@ -106,6 +106,7 @@ impl DiscoveryState {
                         if connected {
                             continue;
                         }
+                        log::debug!("发现扫描: 判定离线并发起握手 uuid={}, ip={}", uuid, ip);
                         has_offline = true;
 
                         // 尝试握手建立连接（携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示）
@@ -135,10 +136,11 @@ impl DiscoveryState {
 
                         let resp = network::request_response_over_quic(
                             ctx_ptr,
-                            crate::processing::CTRL_HANDSHAKE,
-                            &handshake,
+                            &uuid,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
+                            crate::processing::CTRL_HANDSHAKE,
+                            &handshake,
                             3000,
                         );
                         if let Some((resp_header, payload)) = resp {

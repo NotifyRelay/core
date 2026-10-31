@@ -210,10 +210,11 @@ impl ReconnectState {
 
                         let resp = crate::network::request_response_over_quic(
                             ctx_ptr,
-                            crate::processing::CTRL_HANDSHAKE,
-                            &handshake_msg,
+                            &uuid,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
+                            crate::processing::CTRL_HANDSHAKE,
+                            &handshake_msg,
                             5000,
                         );
                         if let Some((resp_header, payload)) = resp {

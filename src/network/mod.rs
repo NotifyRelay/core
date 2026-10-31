@@ -129,50 +129,134 @@ fn resident_transport(ctx: &crate::SafeContext) -> Option<Arc<crate::quic::QuicT
     Some(transport)
 }
 
-/// 请求-响应：向指定地址发起一次 QUIC 双向流请求，等待同流回复。
+/// 请求-响应：在**已建立的长连接**上开一条流，发帧并等待同流回复。
 ///
-/// 复用常驻传输层的连接：已连接则直接开流，未连接才建连（连接被缓存）。
+/// 语义修正（此前是短连接模型，错误）：
+/// - 连接由 `ensure_link` 保证存在，本函数**从不主动拨号**；
+/// - 同一条 QUIC 连接可并发承载多条流，探测/心跳/业务各自开流、互不阻塞；
+/// - 返回 `None` 表示连接不可用或超时，调用方据此判定对端不可达。
 pub fn request_response_over_quic(
     ctx_ptr: usize,
-    header: &str,
-    payload: &str,
+    uuid: &str,
     ip: &str,
     port: u16,
+    header: &str,
+    payload: &str,
     timeout_ms: u32,
 ) -> Option<(String, Vec<u8>)> {
     let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
-    let transport = resident_transport(ctx)?;
-    // 以目标地址作为会话键：探测阶段尚不知道对端 uuid
-    let key = format!("addr:{ip}:{port}");
-    if !transport.is_connected(&key) && transport.connect(&key, ip, port, None).is_err() {
-        log::debug!("请求失败: QUIC 建连失败 addr={}:{}", ip, port);
-        return None;
-    }
+    let transport = ensure_link(ctx, uuid, ip, port)?;
     transport
-        .request(&key, header, payload.as_bytes(), u64::from(timeout_ms))
+        .request(uuid, header, payload.as_bytes(), u64::from(timeout_ms))
         .ok()?
 }
 
-/// 单向发送：复用常驻传输层连接发送一帧。
+/// 单向发送：在长连接上开一条流发送一帧（不等待回复）。
 pub fn send_once_over_quic(
     ctx_ptr: usize,
-    header: &str,
-    payload: &str,
+    uuid: &str,
     ip: &str,
     port: u16,
-    _timeout_ms: u32,
+    header: &str,
+    payload: &str,
 ) -> bool {
     let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
-    let Some(transport) = resident_transport(ctx) else {
-        log::debug!("send_once_over_quic: 传输层不可用 addr={}:{}", ip, port);
+    let Some(transport) = ensure_link(ctx, uuid, ip, port) else {
         return false;
     };
-    let key = format!("addr:{ip}:{port}");
-    if !transport.is_connected(&key) && transport.connect(&key, ip, port, None).is_err() {
-        log::debug!("send_once_over_quic: QUIC 建连失败 addr={}:{}", ip, port);
-        return false;
+    transport.send(uuid, header, payload.as_bytes()).is_ok()
+}
+
+/// 确保到该设备存在长连接（幂等）。
+///
+/// 多地址策略：同一设备可能有多个地址（mDNS 通告、已知设备表、连接来源 IP），
+/// 其中部分不可达。此处**汇总全部来源、去重后逐个尝试**，任一成功即建立长连接：
+/// 1. 已连接 → 直接返回；
+/// 2. 候选 = mDNS 通告 ∪ device_ips ∪ known_devices ∪ 调用方传入 ip；
+/// 3. 失败过的地址排最后（仍参与尝试，网络环境可能已变）。
+///
+/// 这是全仓唯一的建连入口，避免「每条消息一次拨号」的短连接行为。
+fn ensure_link(
+    ctx: &crate::SafeContext,
+    uuid: &str,
+    ip: &str,
+    port: u16,
+) -> Option<Arc<crate::quic::QuicTransport>> {
+    let transport = resident_transport(ctx)?;
+    if transport.is_connected(uuid) {
+        return Some(transport);
     }
-    transport.send(&key, header, payload.as_bytes()).is_ok()
+
+    // 汇总全部已知地址来源：任何单一来源都可能过期或不完整
+    // （曾因只看 mDNS 表，把蜂窝地址当成唯一候选而永久连不上局域网对端）。
+    let mut candidates: Vec<String> = Vec::new();
+    let push = |addr: String, list: &mut Vec<String>| {
+        let a = crate::utils::normalize_ip(&addr);
+        if !a.is_empty() && a != "0.0.0.0" && !list.contains(&a) {
+            list.push(a);
+        }
+    };
+    {
+        let Ok(guard) = ctx.lock() else {
+            return None;
+        };
+        if let Ok(m) = guard.device_addrs.lock() {
+            if let Some(list) = m.get(uuid) {
+                for a in list {
+                    push(a.clone(), &mut candidates);
+                }
+            }
+        }
+        if let Ok(m) = guard.device_ips.lock() {
+            if let Some(a) = m.get(uuid) {
+                push(a.clone(), &mut candidates);
+            }
+        }
+        if let Some(a) = guard.discovery.get_known_devices().get(uuid) {
+            push(a.clone(), &mut candidates);
+        }
+    }
+    push(ip.to_string(), &mut candidates);
+
+    if candidates.is_empty() {
+        log::debug!("建连失败: 无候选地址 uuid={}", uuid);
+        return None;
+    }
+
+    // 失败过的地址排到最后，仍参与尝试（网络环境可能已变化）
+    let failed: std::collections::HashSet<String> = ctx
+        .lock()
+        .ok()
+        .and_then(|g| g.failed_ips.lock().ok().and_then(|m| m.get(uuid).cloned()))
+        .unwrap_or_default();
+    candidates.sort_by_key(|addr| failed.contains(addr));
+
+    for addr in &candidates {
+        if transport.connect(uuid, addr, port, None).is_ok() {
+            if let Ok(guard) = ctx.lock() {
+                if let Ok(mut f) = guard.failed_ips.lock() {
+                    f.remove(uuid);
+                }
+                // 记录本次可用地址，供后续优先复用
+                if let Ok(mut ips) = guard.device_ips.lock() {
+                    ips.insert(uuid.to_string(), addr.clone());
+                }
+            }
+            return Some(transport);
+        }
+        log::debug!("建连失败: 地址不可达 uuid={}, addr={}:{}", uuid, addr, port);
+        if let Ok(guard) = ctx.lock() {
+            if let Ok(mut f) = guard.failed_ips.lock() {
+                f.entry(uuid.to_string()).or_default().insert(addr.clone());
+            }
+        }
+    }
+    log::debug!(
+        "建连失败: 全部地址均不可达 uuid={}, tried={:?}",
+        uuid,
+        candidates
+    );
+    None
 }
 
 // ===== 上下文级网络入口 =====
@@ -236,7 +320,10 @@ pub fn start_transport_server(ctx_ptr: usize, port: u16) -> i32 {
         }
     };
 
-    let on_connected_cb = Arc::new(move |uuid: String, ip: String| {
+    let on_connected_cb = Arc::new(move |uuid: String, peer: String| {
+        // 入站回调给出的是 SocketAddr（ip:port）；device_ips 必须只存纯 IP，
+        // 否则后续拼成 "ip:port:23333" 建连必然失败。
+        let ip = crate::utils::normalize_ip(&peer);
         if let Ok(guard) = unsafe { &*(ctx_ptr as *const SafeContext) }.lock() {
             if let Ok(mut ips) = guard.device_ips.lock() {
                 ips.insert(uuid.clone(), ip.clone());

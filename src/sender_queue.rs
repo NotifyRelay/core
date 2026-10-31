@@ -554,6 +554,7 @@ impl SenderQueue {
         }
 
         // 无会话：尝试按已知 IP 主动建立 QUIC 连接后再发
+        let ip = crate::utils::normalize_ip(&ip);
         if ip.is_empty() || ip == "0.0.0.0" {
             log::warn!("发送队列: 无有效IP且无会话 uuid={}", item.device_uuid);
             return Ok(false);

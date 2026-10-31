@@ -16,12 +16,40 @@ static LOG_INIT: Once = Once::new();
 
 struct PlatformLogBridge;
 
+/// 不应转发到平台的日志判定。
+///
+/// 1. \`mdns_sd\` 自身的调试输出与业务无关，量大且无价值；
+/// 2. 纯调栈打点（形如 \`-> xxx;\` / \`<- xxx;\`）是历史遗留的调用追踪，
+///    频率极高会把有意义的启动/业务日志挤出 logcat 缓冲区，
+///    导致线上排查时看不到关键信息；
+/// 3. 空消息无信息量。
+fn should_skip(record: &log::Record) -> bool {
+    // Trace 级一律不转发：core 内部依赖的第三方（quinn/tokio）会输出大量
+    // 调栈追踪，对平台排障无价值且会挤掉关键日志。
+    if record.level() > log::Level::Debug {
+        return true;
+    }
+    if record.target().starts_with("mdns_sd") {
+        return true;
+    }
+    // 纯调栈打点：长度很短且以箭头开头/结尾
+    let msg = record.args().to_string();
+    let trimmed = msg.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let is_arrow = (trimmed.starts_with("->") || trimmed.starts_with("<-"))
+        && trimmed.ends_with(';')
+        && trimmed.len() <= 64;
+    is_arrow
+}
+
 impl log::Log for PlatformLogBridge {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
     fn log(&self, record: &log::Record) {
-        if record.target().starts_with("mdns_sd") {
+        if should_skip(record) {
             return;
         }
         let val = LOG_CB.load(Ordering::Relaxed);
@@ -29,7 +57,7 @@ impl log::Log for PlatformLogBridge {
             return;
         }
         let cb: LogCb = unsafe { std::mem::transmute(val) };
-        if let Ok(c_msg) = CString::new(format!("{}", record.args())) {
+        if let Ok(c_msg) = CString::new(record.args().to_string()) {
             cb(record.level() as i32, c_msg.as_ptr());
         }
     }
@@ -42,6 +70,7 @@ static LOG_BRIDGE: PlatformLogBridge = PlatformLogBridge;
 pub fn init() {
     LOG_INIT.call_once(|| {
         log::set_logger(&LOG_BRIDGE).ok();
+        // 上限设 Debug：更低的 Trace 由 should_skip 过滤，不进入平台通道
         log::set_max_level(log::LevelFilter::Debug);
     });
 }

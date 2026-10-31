@@ -69,6 +69,24 @@ pub struct QuicTransport {
     cert: Mutex<Option<DerivedCert>>,
     /// 监听端口（0 表示未启动）
     port: Mutex<u16>,
+    /// 入站帧分发池（固定线程数）。
+    ///
+    /// 入站回调下游可能同步调用 send()，而 send() 走 block_on，
+    /// 在 tokio 工作线程上直接执行会 panic；但又不能每帧新建线程——
+    /// 实测会累积数十个 quic-dispatch 线程直至耗尽线程资源。
+    /// 故用固定大小线程池（有界队列）串行/并行消费。
+    dispatch_pool: Arc<Mutex<Option<threadpool::ThreadPool>>>,
+}
+
+impl QuicTransport {
+    /// 取（必要时创建）入站帧分发池。
+    fn dispatch_pool(&self) -> threadpool::ThreadPool {
+        let mut guard = self.dispatch_pool.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(threadpool::ThreadPool::new(4));
+        }
+        guard.as_ref().expect("刚插入").clone()
+    }
 }
 
 impl QuicTransport {
@@ -87,6 +105,7 @@ impl QuicTransport {
             conns: Arc::new(Mutex::new(HashMap::new())),
             cert: Mutex::new(None),
             port: Mutex::new(0),
+            dispatch_pool: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -153,11 +172,13 @@ impl QuicTransport {
         let conns = self.conns.clone();
         let on_conn = Arc::new(on_conn);
         let on_frame = Arc::new(on_frame);
+        let dispatch_pool = self.dispatch_pool();
         self.rt.spawn(async move {
             while let Some(incoming) = endpoint_clone.accept().await {
                 let conns = conns.clone();
                 let on_conn = on_conn.clone();
                 let on_frame = on_frame.clone();
+                let dispatch_pool = dispatch_pool.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else {
                         log::warn!("QUIC 入站握手失败");
@@ -229,15 +250,13 @@ impl QuicTransport {
                                         // 关键：on_frame 的下游可能同步调用 send()，
                                         // 而 send() 内部走 block_on。若在 tokio 工作线程上直接执行，
                                         // 会触发 "Cannot start a runtime from within a runtime" 而 panic。
-                                        // 故投递到独立线程，运行时线程只负责收发字节。
+                                        // 故投递到固定分发池（不能每帧新建线程，会耗尽线程资源）。
                                         let on_frame = on_frame.clone();
                                         let uuid = uuid.clone();
-                                        std::thread::Builder::new()
-                                            .name("quic-dispatch".to_string())
-                                            .spawn(move || {
-                                                on_frame(uuid, header, payload);
-                                            })
-                                            .ok();
+                                        let pool = dispatch_pool.clone();
+                                        pool.execute(move || {
+                                            on_frame(uuid, header, payload);
+                                        });
                                     } else {
                                         log::warn!(
                                             "QUIC 入站帧无法确定设备身份, 已丢弃: header={}",
@@ -262,9 +281,16 @@ impl QuicTransport {
         Ok(bound)
     }
 
-    /// 主动连接到对端。
+    /// 确保与设备之间存在一条**长连接**（幂等）。
     ///
-    /// `expected_fingerprint` 非空时校验对端证书公钥指纹（配对期交换的值）。
+    /// 语义：
+    /// - 已存在活跃连接 → 直接返回，不拨号、不建流；
+    /// - 不存在 → 按给定地址拨号一次，成功后登记；
+    /// - 连接键统一为**设备 uuid**，地址只是拨号参数。
+    ///
+    /// QUIC 是长连接协议：一条连接可承载任意多条并发流，
+    /// 因此探测、心跳、业务发送都应复用同一条连接，只在流上区分。
+    /// 反复拨号会带来握手开销、对端连接表抖动与「随机离线」。
     pub fn connect(
         &self,
         uuid: &str,
@@ -272,11 +298,26 @@ impl QuicTransport {
         port: u16,
         expected_fingerprint: Option<&str>,
     ) -> Result<(), QuicError> {
+        if self.is_connected(uuid) {
+            return Ok(());
+        }
+        // 该地址上已有到同一设备的活跃连接（可能是对端先连入的入站连接），直接登记别名
         let addr: SocketAddr = format!("{ip}:{port}")
             .parse()
             .map_err(|e| QuicError::Connect(format!("目标地址非法 {ip}:{port}: {e}")))?;
+        {
+            let mut map = self.conns.lock().map_err(|_| QuicError::NotReady)?;
+            let hit = map
+                .iter()
+                .find(|(_, c)| c.close_reason().is_none() && c.remote_address() == addr)
+                .map(|(k, c)| (k.clone(), c.clone()));
+            if let Some((key, conn)) = hit {
+                map.insert(uuid.to_string(), conn);
+                log::debug!("QUIC 复用已连该地址的连接 uuid={} via {}", uuid, key);
+                return Ok(());
+            }
+        }
 
-        // 取本机证书用于双向认证；未启动服务端时无证书，无法参与 mTLS
         let local_cert = {
             let guard = self.cert.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|c| DerivedCert {
@@ -314,43 +355,26 @@ impl QuicTransport {
                 .map_err(|e| QuicError::Connect(format!("QUIC 握手失败: {e}")))
         })?;
 
-        // 连接建立后按「对端证书 uuid」与「调用方键」双重登记。
-        //
-        // 为什么要双键：探测阶段调用方只知道地址（addr:ip:port），
-        // 业务阶段只知道 uuid。若各建一条连接，同一对端会存在两条，
-        // 表现为「连接反复建立又关闭」，且随机一条被对端超时判定离线。
-        let peer_uuid = peer_cert_uuid(&conn);
-        let reused = {
-            let mut map = match self.conns.lock() {
-                Ok(m) => m,
-                Err(_) => return Err(QuicError::NotReady),
-            };
-            // 已有可用连接则直接复用，新连接立即关闭
-            let occupied = map
-                .iter()
-                .any(|(_, c)| c.close_reason().is_none() && std::ptr::eq(c, &conn));
-            let existing_alive = match peer_uuid.as_deref() {
-                Some(p) => map.get(p).is_some_and(|c| c.close_reason().is_none()),
-                None => false,
-            };
-            let key_alive = map.get(uuid).is_some_and(|c| c.close_reason().is_none());
-            if existing_alive || key_alive {
-                true
-            } else {
-                map.insert(uuid.to_string(), conn.clone());
-                if let Some(p) = peer_uuid.as_deref() {
-                    map.insert(p.to_string(), conn.clone());
-                }
-                let _ = occupied;
-                false
+        // 以对端证书 uuid 作为规范键（与入站侧一致），调用方 uuid 作别名
+        let canonical = peer_cert_uuid(&conn).unwrap_or_else(|| uuid.to_string());
+        {
+            let mut map = self.conns.lock().map_err(|_| QuicError::NotReady)?;
+            // 竞态兜底：并发拨号时可能已有别的连接登记进来，保留先到者
+            let existing = map
+                .get(&canonical)
+                .filter(|c| c.close_reason().is_none())
+                .cloned();
+            if let Some(existing) = existing {
+                conn.close(0u32.into(), b"duplicate");
+                map.insert(uuid.to_string(), existing);
+                return Ok(());
             }
-        };
-        if reused {
-            conn.close(0u32.into(), b"duplicate");
-            log::debug!("QUIC 已有可用连接，复用而不新建 uuid={}", uuid);
-            return Ok(());
+            if canonical != uuid {
+                map.insert(uuid.to_string(), conn.clone());
+            }
+            map.insert(canonical.clone(), conn);
         }
-        log::info!("QUIC 已连接 {} ({}:{})", uuid, ip, port);
+        log::info!("QUIC 长连接已建立 {} ({}:{})", canonical, ip, port);
         Ok(())
     }
 

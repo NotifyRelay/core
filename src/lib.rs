@@ -70,6 +70,16 @@ pub struct CoreContext {
     pub broadcast_handle: Option<BroadcastHandle>,
     /// UUID → IP 映射（从 TCP 连接等收集）
     pub device_ips: Mutex<HashMap<String, String>>,
+    /// UUID → 该设备 mDNS 通告的全部可用地址（按优先级排序）。
+    ///
+    /// mDNS 会同时通告 IPv4/IPv6/多网卡地址，其中部分不可达。
+    /// 建连时按顺序逐个尝试，任一成功即可——不应只挑一个地址死磕。
+    pub device_addrs: Mutex<HashMap<String, Vec<String>>>,
+    /// UUID → 已确认不可达的地址集合。
+    ///
+    /// mDNS 会通告多个地址（含虚拟网卡、跨网段地址），其中部分不可达。
+    /// 建连失败后记入此处，后续尝试时排到最后（而非永久拉黑）。
+    pub failed_ips: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     // 新增字段
     /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳）
     pub heartbeat_scheduler: u64,
@@ -188,6 +198,8 @@ impl CoreContext {
             filter: filter::FilterState::new(),
             registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
+            device_addrs: Mutex::new(HashMap::new()),
+            failed_ips: Mutex::new(HashMap::new()),
             pairing_sessions: HashMap::new(),
             pairing_code: None,
             pairing_code_expiry: None,

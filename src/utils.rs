@@ -5,6 +5,18 @@
 use base64::Engine;
 use sha2::Digest;
 
+/// 归一化地址为纯 IP：剥离 `:port` / `[v6]:port`，保持已是纯 IP 的输入不变。
+///
+/// `device_ips` 表与所有出站拨号都要求纯 IP；
+/// 混入端口会让拼出的 `ip:port:23333` 非法，导致建连必然失败。
+pub fn normalize_ip(peer: &str) -> String {
+    let trimmed = peer.trim();
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return addr.ip().to_string();
+    }
+    trimmed.to_string()
+}
+
 /// 计算「岛」的特征 ID（与平台侧实现对齐）。
 ///
 /// 优先取 `param` 内的 `chatInfo.title` / `baseInfo.title|content` / `highlightInfo.title`；
@@ -179,11 +191,34 @@ pub fn generate_random_password() -> String {
 }
 
 /// 本机局域网 IP；无可用接口时返回空串。
+///
+/// 注意：多网卡（WSL/虚拟机/VPN）时此函数只返回其中一个，
+/// 若需判断「对端地址是否与本机同网段」，请用 [local_ipv4_addrs] 取全集。
 pub fn get_local_ip() -> String {
     local_ip_address::local_ip()
         .ok()
         .map(|ip| ip.to_string())
         .unwrap_or_default()
+}
+
+/// 枚举本机全部可用 IPv4 地址（排除环回与链路本地址）。
+///
+/// 多网卡环境下单值 [get_local_ip] 可能命中虚拟网卡，
+/// 用全集判断同网段才能正确识别「对端地址是否与本机直连可达」。
+pub fn local_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
+    let Ok(ifas) = local_ip_address::list_afinet_netifas() else {
+        return Vec::new();
+    };
+    ifas.into_iter()
+        .filter_map(|(_, ip)| match ip {
+            std::net::IpAddr::V4(v4)
+                if !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified() =>
+            {
+                Some(v4)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// 设备名 base64 编码（发现/心跳通道统一使用）。
@@ -194,6 +229,23 @@ pub fn encode_name_b64(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 入站回调给出的是 "ip:port"，必须归一化为纯 IP。
+    /// 混入端口会拼出 "ip:port:23333" 让拨号必然失败（曾致设备随机离线）。
+    #[test]
+    fn normalize_ip_strips_port() {
+        assert_eq!(normalize_ip("192.168.31.119:58170"), "192.168.31.119");
+        assert_eq!(normalize_ip("[fe80::1]:23333"), "fe80::1");
+        // 已是纯 IP：原样返回
+        assert_eq!(normalize_ip("192.168.31.135"), "192.168.31.135");
+        assert_eq!(
+            normalize_ip("fe80::dc20:a8ff:fe66:9c92"),
+            "fe80::dc20:a8ff:fe66:9c92"
+        );
+        // 空值/异常输入不 panic
+        assert_eq!(normalize_ip(""), "");
+        assert_eq!(normalize_ip("not-an-ip"), "not-an-ip");
+    }
 
     #[test]
     fn test_compute_feature_id_with_instance_id() {

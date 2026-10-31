@@ -71,6 +71,12 @@ pub struct HeartbeatHandle {
     pub running: Arc<AtomicBool>,
     // 保存心跳参数引用，供更新用
     params: Arc<HeartbeatSenderParams>,
+    /// 发送线程句柄：用于判断线程是否真的存活。
+    ///
+    /// `running` 只是「请求停止」的标志，创建时即为 true，线程死亡不会自动置位；
+    /// 若只用它判断，线程异常退出后会留下僵尸 handle，调度器误以为心跳正常，
+    /// 导致该设备永远收不到本机心跳（表现为对端显示本机离线）。
+    thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 /// 心跳发送模式（TCP 备用：定向发送到目标设备）
@@ -104,7 +110,7 @@ impl HeartbeatHandle {
         let p = params.clone();
         let _net = network_state.clone();
 
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("heartbeat-sender".to_string())
             .spawn(move || {
                 let mut next_interval_ms = interval_ms;
@@ -168,7 +174,22 @@ impl HeartbeatHandle {
             })
             .map_err(|e| format!("启动心跳发送线程失败: {}", e))?;
 
-        Ok(Self { running, params })
+        Ok(Self {
+            running,
+            params,
+            thread: Arc::new(Mutex::new(Some(spawned))),
+        })
+    }
+
+    /// 发送线程是否仍在运行（用于识别僵尸 handle）。
+    pub fn is_alive(&self) -> bool {
+        match self.thread.lock() {
+            Ok(g) => match g.as_ref() {
+                Some(t) => !t.is_finished(),
+                None => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// 发送一次心跳：优先走已建立的 QUIC 会话；无会话时按已知 IP 主动建连后发送。
@@ -207,11 +228,13 @@ impl HeartbeatHandle {
         }
 
         // 2) 无会话：按已知 IP 建连后重试一次
+        // 地址可能是 "ip:port" 形式，建连前统一归一化为纯 IP
+        let ip = crate::utils::normalize_ip(ip);
         if ip.is_empty() || ip == "0.0.0.0" {
             log::debug!("心跳: 无会话且无已知 IP uuid={}", uuid);
             return Ok(false);
         }
-        if transport.connect(uuid, ip, port, None).is_err() {
+        if transport.connect(uuid, &ip, port, None).is_err() {
             log::debug!("心跳: QUIC 建连失败 uuid={}, ip={}", uuid, ip);
             return Ok(false);
         }
@@ -321,120 +344,143 @@ pub struct HeartbeatScheduler {
 }
 
 impl HeartbeatScheduler {
-    pub fn start(ctx_ptr: usize, interval_ms: u64) -> Result<Self, String> {
+    pub fn start(
+        ctx_ptr: usize,
+        interval_ms: u64,
+        network_state: Arc<Mutex<crate::network::TransportState>>,
+    ) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
 
         thread::Builder::new()
             .name("heartbeat-scheduler".to_string())
-            .spawn(move || loop {
-                if !r.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // 每轮工作在一个块内完成，避免长期持有 ctx 锁（MutexGuard 临时量随块结束释放）
-                {
-                    // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+            .spawn(move || {
+                while r.load(Ordering::Relaxed) {
+                    // 第一段（持锁）：读取身份/设备表、回收失效 handle、更新参数
                     let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                    let Ok(mut guard) = ctx.lock() else {
-                        thread::sleep(Duration::from_millis(interval_ms));
-                        continue;
-                    };
 
-                    // 本机身份参数来自 broadcast_info（由 FFI 写入）
-                    let (local_uuid, local_name_b64, local_battery, local_device_type) = guard
-                        .broadcast_info
-                        .as_ref()
-                        .map(|b| {
-                            (
-                                b.uuid.clone(),
-                                b.name_b64.clone(),
-                                b.battery,
-                                b.device_type.clone(),
+                    let mut to_start: Vec<(String, String)> = Vec::new();
+                    let (local_uuid, local_name, local_battery, local_device_type);
+
+                    {
+                        let Ok(mut guard) = ctx.lock() else {
+                            thread::sleep(Duration::from_millis(interval_ms));
+                            continue;
+                        };
+
+                        let (uuid, name_b64, battery, device_type) = guard
+                            .broadcast_info
+                            .as_ref()
+                            .map(|b| {
+                                (
+                                    b.uuid.clone(),
+                                    b.name_b64.clone(),
+                                    b.battery,
+                                    b.device_type.clone(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        local_uuid = uuid;
+                        local_battery = battery;
+                        local_device_type = device_type.clone();
+                        local_name = if name_b64.is_empty() {
+                            String::new()
+                        } else {
+                            String::from_utf8(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(&name_b64)
+                                    .unwrap_or_default(),
                             )
-                        })
-                        .unwrap_or_default();
-                    let local_name = if local_name_b64.is_empty() {
-                        String::new()
-                    } else {
-                        String::from_utf8(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(&local_name_b64)
-                                .unwrap_or_default(),
-                        )
-                        .unwrap_or(local_name_b64)
-                    };
+                            .unwrap_or(name_b64)
+                        };
 
-                    let known_devices = guard.discovery.get_known_devices();
-                    let paired: Vec<String> = guard.crypto.device_keys.keys().cloned().collect();
+                        let known_devices = guard.discovery.get_known_devices();
+                        let paired: Vec<String> =
+                            guard.crypto.device_keys.keys().cloned().collect();
 
-                    // 已配对设备的 handle 注册表（uuid -> HeartbeatHandle，跨轮次持久）
-                    let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
+                        let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
 
-                    // 1. 移除已不在 known_devices 的 handle
-                    let stale: Vec<String> = handles.keys().cloned().collect();
-                    for s in stale {
-                        if !known_devices.contains_key(&s) {
-                            if let Some(h) = handles.remove(&s) {
+                        // 回收失效 handle：设备已不在 known_devices，或发送线程已不存活。
+                        // 用线程存活而非 running 标志——running 创建即 true，线程死亡不会复位。
+                        let stale: Vec<String> = handles
+                            .iter()
+                            .filter(|(u, h)| !known_devices.contains_key(*u) || !h.is_alive())
+                            .map(|(u, _)| u.clone())
+                            .collect();
+                        for s in &stale {
+                            if let Some(h) = handles.remove(s) {
                                 h.stop();
+                                log::info!("心跳调度器: 回收失效 handle uuid={}", s);
                             }
                         }
+
+                        // 收集待启动设备（只收集，不创建线程）
+                        for (uuid, ip) in &known_devices {
+                            if handles.contains_key(uuid) || !paired.contains(uuid) {
+                                continue;
+                            }
+                            if !local_uuid.is_empty() && *uuid == local_uuid {
+                                continue;
+                            }
+                            if local_uuid.is_empty() {
+                                break;
+                            }
+                            to_start.push((uuid.clone(), ip.clone()));
+                        }
+
+                        // 更新既有 handle 的本机参数
+                        for (uuid, ip) in &known_devices {
+                            if let Some(h) = handles.get(uuid) {
+                                h.update(
+                                    &local_uuid,
+                                    &local_name,
+                                    local_battery,
+                                    &local_device_type,
+                                    ip,
+                                );
+                            }
+                        }
+
+                        guard.heartbeat_scheduler_handles = handles;
                     }
 
-                    // 2. 为已配对且无 handle 的已知设备启动心跳（TCP 定向）
-                    for (uuid, ip) in &known_devices {
-                        if handles.contains_key(uuid) {
-                            continue;
-                        }
-                        if !paired.contains(uuid) {
-                            continue;
-                        }
-                        // 跳过本机自身（known_devices 中不应存在本机，防御历史残留）
-                        if !local_uuid.is_empty() && *uuid == local_uuid {
-                            continue;
-                        }
-                        if local_uuid.is_empty() {
-                            break;
-                        }
-                        match HeartbeatHandle::start(
-                            ctx_ptr,
-                            &local_uuid,
-                            &local_name,
-                            local_battery,
-                            &local_device_type,
-                            ip,
-                            interval_ms,
-                            HEARTBEAT_MODE_TCP,
-                            guard.network.transport.clone(),
-                        ) {
-                            Ok(h) => {
-                                log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);
-                                handles.insert(uuid.clone(), h);
-                            }
-                            Err(e) => {
-                                log::warn!("心跳调度器: 启动心跳失败 uuid={} err={}", uuid, e);
-                            }
-                        }
-                    }
-
-                    // 3. 本机参数变化 → 更新全部 handle（复用现有 update；目标 IP 同步 known_devices 最新值）
-                    for (uuid, ip) in &known_devices {
-                        if let Some(h) = handles.get(uuid) {
-                            h.update(
+                    // 第二段（**锁外**）：创建心跳线程。
+                    // 新线程体第一步就 ctx.lock()，若在持锁时创建会与其永久互锁，
+                    // 表现为「线程已创建但从不发送心跳」。
+                    if !to_start.is_empty() {
+                        let mut started: Vec<(String, HeartbeatHandle)> = Vec::new();
+                        for (uuid, ip) in to_start {
+                            match HeartbeatHandle::start(
+                                ctx_ptr,
                                 &local_uuid,
                                 &local_name,
                                 local_battery,
                                 &local_device_type,
-                                ip,
-                            );
+                                &ip,
+                                interval_ms,
+                                HEARTBEAT_MODE_TCP,
+                                network_state.clone(),
+                            ) {
+                                Ok(h) => {
+                                    log::info!("心跳调度器: 启动心跳 uuid={} ip={}", uuid, ip);
+                                    started.push((uuid, h));
+                                }
+                                Err(e) => {
+                                    log::warn!("心跳调度器: 启动心跳失败 uuid={} err={}", uuid, e);
+                                }
+                            }
+                        }
+                        if !started.is_empty() {
+                            if let Ok(mut g) = ctx.lock() {
+                                for (uuid, h) in started {
+                                    g.heartbeat_scheduler_handles.insert(uuid, h);
+                                }
+                            }
                         }
                     }
 
-                    // 4. 将 handle 表存回调度器共享状态
-                    guard.heartbeat_scheduler_handles = handles;
+                    thread::sleep(Duration::from_millis(interval_ms.min(2000)));
                 }
-
-                thread::sleep(Duration::from_millis(interval_ms.min(2000)));
             })
             .map_err(|e| format!("启动心跳调度线程失败: {}", e))?;
 
@@ -525,12 +571,18 @@ pub fn start_scheduler_for(
         guard.persistence_activated = true;
     }
     crate::network::set_local_uuid(guard.network.transport.clone(), &local_uuid);
+    let transport_state = guard.network.transport.clone();
+    // 先释放 ctx 锁：调度线程第一轮即取锁，持锁启动会与其互锁
+    drop(guard);
 
-    match HeartbeatScheduler::start(ctx_ptr, interval_ms) {
+    match HeartbeatScheduler::start(ctx_ptr, interval_ms, transport_state) {
         Ok(scheduler) => {
             let boxed = Box::new(scheduler);
             let handle = crate::handle::put(Box::into_raw(boxed) as *mut std::os::raw::c_void);
-            guard.heartbeat_scheduler = handle;
+            // 重新取锁写回句柄（前面已释放，避免与调度线程互锁）
+            if let Ok(mut g) = ctx.lock() {
+                g.heartbeat_scheduler = handle;
+            }
             handle
         }
         Err(e) => {

@@ -78,6 +78,39 @@ impl MdnsDiscovery {
     ) -> Result<Self, String> {
         let daemon = ServiceDaemon::new().map_err(|e| format!("创建 mDNS daemon 失败: {e}"))?;
 
+        // 关键：把 mDNS 限制在局域网网卡上。
+        //
+        // mdns-sd 默认在所有网卡上收发组播。实测某 Android 同时存在
+        // wlan0(192.168.x) 与 6 张 rmnet_data*(蜂窝)，SearchStarted 显示
+        // 搜索覆盖 8 张网卡 → 组播分散到蜂窝网卡，收不到局域网对端通告。
+        //
+        // 注意 enable_interface 是「追加启用」而非「独占」，无法缩小范围；
+        // 必须用 disable_interface 主动排除非局域网网卡。
+        let lan_addrs: Vec<std::net::IpAddr> = crate::utils::local_ipv4_addrs()
+            .into_iter()
+            .map(std::net::IpAddr::V4)
+            .collect();
+        let all_ifas = local_ip_address::list_afinet_netifas().unwrap_or_default();
+        let mut excluded = 0usize;
+        for (name, ip) in all_ifas {
+            let std::net::IpAddr::V4(v4) = ip else {
+                continue;
+            };
+            if v4.is_loopback() || lan_addrs.contains(&ip) {
+                continue;
+            }
+            if daemon
+                .disable_interface(mdns_sd::IfKind::Name(name.clone()))
+                .is_ok()
+            {
+                excluded += 1;
+                log::debug!("mDNS 已禁用非局域网网卡: {} ({})", name, v4);
+            }
+        }
+        if excluded > 0 {
+            log::info!("mDNS 已排除 {} 张非局域网网卡", excluded);
+        }
+
         let name_b64 = crate::utils::encode_name_b64(name);
         let mut props = HashMap::new();
         props.insert("uuid".to_string(), uuid.to_string());
@@ -119,7 +152,9 @@ impl MdnsDiscovery {
                         Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                             log::debug!("mDNS 服务移除: {}", fullname);
                         }
-                        Ok(_) => {}
+                        Ok(ev) => {
+                            log::debug!("mDNS 其它事件: {:?}", ev);
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -158,6 +193,64 @@ impl Drop for MdnsDiscovery {
     }
 }
 
+/// 判断两个 IPv4 是否属于同一 /24 网段（局域网可达性的实用近似）。
+fn same_subnet_24(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr) -> bool {
+    let (ao, bo) = (a.octets(), b.octets());
+    ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// 同 /24 网段判定：仅前三段相同才算同网段。
+    #[test]
+    fn same_subnet_only_matches_first_three_octets() {
+        assert!(same_subnet_24(
+            Ipv4Addr::new(192, 168, 31, 1),
+            Ipv4Addr::new(192, 168, 31, 200)
+        ));
+        assert!(!same_subnet_24(
+            Ipv4Addr::new(192, 168, 31, 1),
+            Ipv4Addr::new(192, 168, 32, 1)
+        ));
+        assert!(!same_subnet_24(
+            Ipv4Addr::new(10, 39, 123, 115),
+            Ipv4Addr::new(192, 168, 31, 135)
+        ));
+    }
+
+    /// 排序规则：同网段 IPv4 最优，其次其他 IPv4，IPv6 最后。
+    /// 这是「对端同时通告局域网地址与蜂窝地址」时的正确选路依据。
+    #[test]
+    fn address_ranking_prefers_lan_ipv4() {
+        let local = Ipv4Addr::new(192, 168, 31, 123);
+        let rank = |ip: &IpAddr| -> u8 {
+            match ip {
+                IpAddr::V4(v4) => {
+                    if same_subnet_24(local, *v4) {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                IpAddr::V6(_) => 2,
+            }
+        };
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 31, 135));
+        let cell = IpAddr::V4(Ipv4Addr::new(10, 39, 123, 115));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert!(rank(&lan) < rank(&cell), "同网段 IPv4 必须优先于蜂窝地址");
+        assert!(rank(&cell) < rank(&v6), "IPv4 必须优先于 IPv6");
+
+        // 混合候选集按 (rank, 字符串) 排序后，首位应是局域网地址
+        let mut cands = vec![v6, cell, lan];
+        cands.sort_by_key(|ip| (rank(ip), ip.to_string()));
+        assert_eq!(cands[0], lan);
+    }
+}
+
 /// 处理一条已解析的对端服务记录。
 fn handle_resolved(ctx_ptr: usize, resolved: &mdns_sd::ResolvedService) {
     let Some(uuid) = resolved.txt_properties.get_property_val_str("uuid") else {
@@ -181,34 +274,56 @@ fn handle_resolved(ctx_ptr: usize, resolved: &mdns_sd::ResolvedService) {
         .get_property_val_str("type")
         .unwrap_or("");
 
-    // 取首个可用 IPv4 地址：必须排除环回与链路本地址。
-    // mDNS 解析结果里可能同时出现 127.0.0.1（本机接口）与真实局域网地址，
-    // 选中 127.0.0.1 会让后续连接发往本机，对端永远连不上。
-    let Some(ip) = resolved
+    // 地址选择：同一设备锁定一个地址，避免 device_ips 反复被覆盖。
+    //
+    // 说明：mDNS 为同一设备解析出多个地址（IPv4 / IPv6 / 链路本地）是正常现象，
+    // 这里只需保证**本机记录的目标地址稳定**，不涉及对端可达性判定。
+    // 优先同网段 IPv4，其次其他 IPv4，最后 IPv6——局域网直连最可靠。
+    let candidates: Vec<std::net::IpAddr> = resolved
         .addresses
         .iter()
         .map(|a| a.to_ip_addr())
-        .find(|ip| match ip {
+        .filter(|ip| match ip {
             std::net::IpAddr::V4(v4) => {
                 !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
             }
-            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+            std::net::IpAddr::V6(v6) => {
+                !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local()
+            }
         })
-        .map(|ip| ip.to_string())
-    else {
-        log::debug!("mDNS 服务无可用（非环回）地址，忽略: {}", uuid);
+        .collect();
+    if candidates.is_empty() {
+        log::debug!("mDNS 服务无可用地址，忽略: {}", uuid);
         return;
+    }
+    // 排序：同网段 IPv4 > 其他 IPv4 > IPv6（真可达性由建连阶段逐个尝试确认）
+    let locals = crate::utils::local_ipv4_addrs();
+    let rank = |ip: &std::net::IpAddr| -> u8 {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if locals.iter().any(|l| same_subnet_24(*l, *v4)) {
+                    0
+                } else {
+                    1
+                }
+            }
+            std::net::IpAddr::V6(_) => 2,
+        }
     };
+    let mut ordered = candidates.clone();
+    ordered.sort_by_key(|ip| (rank(ip), ip.to_string()));
+    let addrs: Vec<String> = ordered.iter().map(|ip| ip.to_string()).collect();
+    let ip = addrs[0].clone();
 
-    log::debug!(
-        "mDNS 发现设备: uuid={}, ip={}, port={}, name_b64={}, type={}",
-        uuid,
-        ip,
-        resolved.port,
-        name_b64,
-        device_type
-    );
     let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    // 记录全部候选地址：建连阶段逐个尝试，避免「挑中坏地址就彻底连不上」
+    if let Ok(guard) = ctx.lock() {
+        if let Ok(mut m) = guard.device_addrs.lock() {
+            m.insert(uuid.to_string(), addrs.clone());
+        }
+    }
+
+    log::debug!("mDNS 发现设备: uuid={}, ip={}", uuid, ip);
     crate::send::consume_discovered_device(
         ctx,
         uuid,

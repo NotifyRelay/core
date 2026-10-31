@@ -63,13 +63,15 @@ pub(crate) fn do_send_control(ctx: &CoreContext, uuid: &str, header: &str, paylo
 /// 向指定地址发起一次性请求并处理响应（QUIC 双向流）。
 fn oneshot_send_and_process(
     ctx: &SafeContext,
+    uuid: &str,
     ip: &str,
     port: u16,
     header: &str,
     payload: &str,
 ) -> i32 {
     let ctx_ptr = ctx as *const SafeContext as usize;
-    let resp = crate::network::request_response_over_quic(ctx_ptr, header, payload, ip, port, 5000);
+    let resp =
+        crate::network::request_response_over_quic(ctx_ptr, uuid, ip, port, header, payload, 5000);
     match resp {
         Some((resp_header, resp_payload)) => {
             // 一次性直连：无会话 uuid 可比对
@@ -106,9 +108,10 @@ pub fn send_handshake(
         return 0;
     }
 
-    // 否则向 target_ip 发起一次性请求
+    // 否则在长连接上开流请求（首次会按 target_ip 建连）
     oneshot_send_and_process(
         ctx,
+        uuid,
         target_ip,
         port,
         crate::processing::CTRL_HANDSHAKE,
@@ -181,10 +184,11 @@ pub fn send_pairing_init(
     let ctx_ptr = ctx as *const SafeContext as usize;
     let resp = match crate::network::request_response_over_quic(
         ctx_ptr,
-        crate::processing::CTRL_PAIRING_INIT,
-        &init_payload,
+        target_uuid,
         &target_ip,
         port,
+        crate::processing::CTRL_PAIRING_INIT,
+        &init_payload,
         60_000,
     ) {
         Some(r) => r,
@@ -194,11 +198,11 @@ pub fn send_pairing_init(
             let reject = codec::reject_payload(local_uuid);
             let _ = crate::network::send_once_over_quic(
                 ctx_ptr,
-                crate::processing::CTRL_REJECT,
-                &reject,
+                target_uuid,
                 &target_ip,
                 port,
-                5000,
+                crate::processing::CTRL_REJECT,
+                &reject,
             );
             return -1;
         }
@@ -269,10 +273,11 @@ pub fn send_pairing_init(
         let accept = codec::accept_payload(local_uuid, &enc_lt);
         let acked = crate::network::request_response_over_quic(
             ctx_ptr,
-            crate::processing::CTRL_ACCEPT,
-            &accept,
+            target_uuid,
             &target_ip,
             port,
+            crate::processing::CTRL_ACCEPT,
+            &accept,
             10_000,
         );
         match acked {
@@ -287,11 +292,11 @@ pub fn send_pairing_init(
     let reject = codec::reject_payload(local_uuid);
     let _ = crate::network::send_once_over_quic(
         ctx_ptr,
-        crate::processing::CTRL_REJECT,
-        &reject,
+        target_uuid,
         &target_ip,
         port,
-        5000,
+        crate::processing::CTRL_REJECT,
+        &reject,
     );
     fire_pairing_result(ctx, target_uuid, 0, "session_missing");
     0
@@ -501,13 +506,22 @@ pub(crate) fn consume_discovered_device(
     let Ok(guard) = ctx_ref.lock() else {
         return;
     };
-    // 跳过本机自身：UDP 广播可能回环到本机监听端口，避免自我登记为远程设备
-    if guard
-        .broadcast_info
-        .as_ref()
-        .map(|b| b.uuid == uuid)
-        .unwrap_or(false)
-    {
+    // 跳过本机自身：mDNS 组播会回环到本机监听 socket，
+    // 若不拦截会把本机登记成「远程设备」，污染设备表并占掉发现配额。
+    //
+    // 身份必须优先用持久化的 local_uuid：broadcast_info 由心跳调度器稍后写入，
+    // 发现线程首次回调时可能仍为空，仅用它判断会漏过自我过滤。
+    let is_self = if !guard.local_uuid.is_empty() {
+        guard.local_uuid == uuid
+    } else {
+        guard
+            .broadcast_info
+            .as_ref()
+            .map(|b| b.uuid == uuid)
+            .unwrap_or(false)
+    };
+    if is_self {
+        log::debug!("忽略自身 mDNS 通告 uuid={}", uuid);
         return;
     }
     // 名称 base64 解码（与心跳路径一致），失败回退原串
@@ -521,9 +535,13 @@ pub(crate) fn consume_discovered_device(
     guard
         .registry
         .upsert(uuid, &name, ip, port, battery, device_type);
-    // 记录发现来源 IP 到内部映射：配对发起（send_pairing_init）等出站操作依赖该表解析目标 IP
+    // 记录发现来源 IP：已锁定的地址优先保留，避免多地址反复覆盖。
+    // mDNS 侧已实现「锁定地址仍在候选集中就沿用」，故这里只在无记录时写入；
+    // 锁定地址失效时 mDNS 会传入新地址，需要覆盖时由该路径显式刷新。
     if let Ok(mut ips) = guard.device_ips.lock() {
-        ips.insert(uuid.to_string(), ip.to_string());
+        if !ips.contains_key(uuid) || ips.get(uuid).is_some_and(|v| v == ip) {
+            ips.insert(uuid.to_string(), ip.to_string());
+        }
     }
     // 关键：登记到 known_devices，否则心跳调度器不会为它启动心跳，
     // 该设备永远停留在「已发现但离线」状态（多设备场景下表现为随机一台掉线）。
@@ -738,10 +756,11 @@ pub fn connect_device(
     for attempt in 0..MAX_RETRIES {
         let resp = crate::network::request_response_over_quic(
             ptr,
-            crate::processing::CTRL_HANDSHAKE,
-            &payload,
+            target_uuid,
             target_ip,
             PORT,
+            crate::processing::CTRL_HANDSHAKE,
+            &payload,
             TIMEOUT_MS,
         );
         match resp {
