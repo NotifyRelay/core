@@ -848,6 +848,57 @@ fn lost_non_null_fields(
         .collect()
 }
 
+/// QUIC 控制帧的 wire header（与 `MessageType` 常量一一对应）。
+pub(crate) const CTRL_HANDSHAKE: &str = "CTRL_HANDSHAKE";
+pub(crate) const CTRL_PAIRING_INIT: &str = "CTRL_PAIRING_INIT";
+pub(crate) const CTRL_PAIRING_RESP: &str = "CTRL_PAIRING_RESP";
+pub(crate) const CTRL_ACCEPT: &str = "CTRL_ACCEPT";
+pub(crate) const CTRL_REJECT: &str = "CTRL_REJECT";
+pub(crate) const CTRL_HEARTBEAT: &str = "CTRL_HEARTBEAT";
+pub(crate) const CTRL_ACK: &str = "CTRL_ACK";
+pub(crate) const CTRL_RESYNC: &str = "CTRL_RESYNC";
+
+/// 控制帧 header → 消息类型；非控制帧返回 None。
+pub(crate) fn control_header_to_type(header: &str) -> Option<u8> {
+    Some(match header {
+        CTRL_HANDSHAKE => MessageType::HANDSHAKE,
+        CTRL_PAIRING_INIT => MessageType::PAIRING_INIT,
+        CTRL_PAIRING_RESP => MessageType::PAIRING_RESP,
+        CTRL_ACCEPT => MessageType::ACCEPT,
+        CTRL_REJECT => MessageType::REJECT,
+        CTRL_HEARTBEAT => MessageType::HEARTBEAT,
+        CTRL_ACK => MessageType::ACK,
+        CTRL_RESYNC => MessageType::RESYNC_REQUEST,
+        _ => return None,
+    })
+}
+
+/// 以「wire header + 明文 payload」形式处理入站帧（QUIC 传输层入口）。
+///
+/// 与 [process_frame] 的差异：QUIC 传输不携带二进制帧头，
+/// 直接给出 header 与明文载荷，故此处按 header 反查消息类型后复用同一处理路径。
+pub(crate) fn process_header_frame(
+    ctx: &SafeContext,
+    session_uuid: Option<&str>,
+    header: &str,
+    payload: &[u8],
+) -> i32 {
+    // 控制帧（握手/配对/心跳等）：按类型直接走既有控制帧处理路径
+    if let Some(ctrl_type) = control_header_to_type(header) {
+        return process_frame(ctx, session_uuid, ctrl_type, payload);
+    }
+    let msg_type = crate::protocol::binary_codec::data_header_to_type(header);
+    if msg_type == 0xFF {
+        log::warn!("处理消息: 未知 header={}", header);
+        return -1;
+    }
+    // QUIC 已由 TLS 1.3 提供机密性与完整性，业务载荷无需再做 AES-GCM 解密，
+    // 直接进入明文分发，与旧 TCP 路径解密后的处理完全一致。
+    let uuid = session_uuid.unwrap_or("");
+    let plaintext = String::from_utf8_lossy(payload);
+    dispatch_plaintext(ctx, msg_type, header, uuid, &plaintext)
+}
+
 fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // DATA 消息 payload 格式: DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data
     let text = match std::str::from_utf8(payload) {
@@ -921,14 +972,23 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     } else {
         wire_header
     };
-
     log::debug!(
         "处理消息: 解密 DATA header={}, uuid={}, 密文长度={}",
         data_header,
         local_uuid,
         encrypted_payload.len()
     );
+    dispatch_plaintext(ctx, msg_type, data_header, local_uuid, &plaintext)
+}
 
+/// 明文分发：把已解密的业务载荷交给对应处理器（旧 TCP 路径与 QUIC 路径共用）。
+fn dispatch_plaintext(
+    ctx: &SafeContext,
+    msg_type: u8,
+    data_header: &str,
+    local_uuid: &str,
+    plaintext: &str,
+) -> i32 {
     // 重同步请求：接收端缺失基线时主动请求发送方重发 FULL
     if msg_type == MessageType::RESYNC_REQUEST {
         match serde_json::from_str::<serde_json::Value>(&plaintext) {
@@ -978,13 +1038,13 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
             serde_json::from_str::<crate::models::Notification>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::MEDIA_SESSION | MessageType::FEATURE_STATUS => {
             serde_json::from_str::<crate::models::MediaPayload>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         // DATA_ICON_REQUEST / DATA_ICON_RESPONSE 共用 PACKAGE_INFO，必须按 wire header
         // 选择模型：响应侧用 IconRequest 归一化会把 iconData/icons/missing 静默丢弃
@@ -999,41 +1059,41 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
             serde_json::from_str::<crate::models::AppListRequest>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::SYNC_SEARCH_APP_RESPONSE => {
             serde_json::from_str::<crate::models::AppListResponse>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::MEDIA_SESSION_CONTROL => {
             serde_json::from_str::<crate::models::MediaControl>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::FTP => serde_json::from_str::<crate::models::FtpMessage>(&plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or(plaintext.clone()),
+            .unwrap_or(plaintext.to_string()),
         MessageType::CLIPBOARD => serde_json::from_str::<crate::models::ClipboardData>(&plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or(plaintext.clone()),
+            .unwrap_or(plaintext.to_string()),
         MessageType::DEVICE_STATUS => {
             serde_json::from_str::<crate::models::StatusMessage>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::RELAY_APPLICATION => {
             serde_json::from_str::<crate::models::AppLaunch>(&plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
-        _ => plaintext.clone(),
+        _ => plaintext.to_string(),
     };
 
     fire_data_cb(ctx, local_uuid, cb_type, &processed_text);

@@ -519,35 +519,31 @@ impl SenderQueue {
         }
     }
 
+    /// 发送单项：走 QUIC 会话（header + 明文，加密由 TLS 1.3 承担）。
+    ///
+    /// 返回 `Ok(true)` 表示已交付传输层；`Ok(false)` 表示明确失败（可重试/弃置）；
+    /// `Err(())` 表示上下文取锁失败（不可判定，交由调用方按失败处理）。
     fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        let (key_arr, local_uuid, tcp, ip) = {
-            // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+        let (local_uuid, transport, ip) = {
             let Ok(guard) = ctx.lock() else {
                 return Err(());
             };
-            let key = guard.crypto.get_aes_key(&item.device_uuid);
             let uuid = guard
                 .broadcast_info
                 .as_ref()
                 .map(|i| i.uuid.clone())
                 .unwrap_or_default();
-            let tcp = guard.network.tcp.clone();
+            // QuicTransport 不实现 Clone：取其内部可共享句柄需借用，
+            // 故这里只做存在性判断，真正发送在锁外通过 send_via_quic 完成
+            let ready = guard.quic.is_some();
             let ip = guard
                 .device_ips
                 .lock()
                 .ok()
                 .and_then(|ips| ips.get(&item.device_uuid).cloned())
                 .unwrap_or_default();
-            (key, uuid, tcp, ip)
-        };
-
-        let key_arr = match key_arr {
-            Some(k) => k,
-            None => {
-                log::warn!("发送队列: 未找到密钥 uuid={}", item.device_uuid);
-                return Ok(false);
-            }
+            (uuid, ready, ip)
         };
 
         if !local_uuid.is_empty() && item.device_uuid == local_uuid {
@@ -555,45 +551,41 @@ impl SenderQueue {
             return Ok(false);
         }
 
-        // DATA 通道统一使用绑定 core 版本的 AAD：跨 major.minor 时对端 AAD 不同，
-        // GCM 认证必然失败，即便公钥与密钥完全一致也无法通信。
-        let encrypted = match aes::encrypt_with_aad(
-            &key_arr,
-            item.plaintext.as_bytes(),
-            &crate::protocol::version::data_aad(),
-        ) {
-            Ok(e) => e,
-            Err(_) => return Ok(false),
-        };
-        let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
-
-        // 会话优先：与心跳复用同一条 TCP 会话；无会话或会话写失败时回落 oneshot。
-        // 独立作用域：只在会话发送期间持有 TCP 状态锁，避免阻塞下面的 oneshot 建连。
-        let session_result = {
-            let Ok(mut tcp) = tcp.lock() else {
-                return Err(());
-            };
-            tcp.send_through_session(&item.device_uuid, &msg)
-        };
-        if let Ok(true) = session_result {
-            return Ok(true);
+        if transport {
+            // 已有 QUIC 会话：直接发送
+            if crate::send::send_via_quic(ctx, &item.device_uuid, &item.header, &item.plaintext) {
+                return Ok(true);
+            }
         }
 
+        // 无会话：尝试按已知 IP 主动建立 QUIC 连接后再发
         if ip.is_empty() || ip == "0.0.0.0" {
-            log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
+            log::warn!("发送队列: 无有效IP且无会话 uuid={}", item.device_uuid);
             return Ok(false);
         }
-        // 媒体类消息用短超时快速失败，避免长时间占用并发槽位
-        let timeout_ms = if Self::is_media_header(&item.header) {
-            Self::MEDIA_TIMEOUT_MS
-        } else {
-            Self::DEFAULT_TIMEOUT_MS
+        let port = codec::DEFAULT_TCP_PORT;
+        let connected = {
+            let Ok(guard) = ctx.lock() else {
+                return Err(());
+            };
+            match guard.quic.as_ref() {
+                Some(t) => t.connect(&item.device_uuid, &ip, port, None).is_ok(),
+                None => false,
+            }
         };
-        Ok(crate::network::oneshot_send_only(
-            &msg,
-            &ip,
-            codec::DEFAULT_TCP_PORT,
-            timeout_ms,
+        if !connected {
+            log::debug!(
+                "发送队列: QUIC 建连失败 uuid={}, ip={}",
+                item.device_uuid,
+                ip
+            );
+            return Ok(false);
+        }
+        Ok(crate::send::send_via_quic(
+            ctx,
+            &item.device_uuid,
+            &item.header,
+            &item.plaintext,
         ))
     }
 
@@ -1138,48 +1130,14 @@ mod ctx_tests {
         assert_eq!(queue.pending_count(), 4);
     }
 
-    /// 会话优先：已存在会话时经该会话写帧；未登记 device_ips 时 oneshot 回落不可用。
+    /// 传输层未启动时 try_send 必须明确失败（不再回落旧 TCP）。
     #[test]
-    fn try_send_prefers_existing_session() {
-        use crate::network::TcpSession;
-        use crate::protocol::binary_codec;
-        use crate::protocol::header::MessageType;
-        use base64::Engine as _;
-        use std::net::{TcpListener, TcpStream};
-
+    fn try_send_fails_without_transport() {
         let ctx = create_ctx();
         let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
-        let peer_uuid = "session-peer";
-
-        {
-            let mut guard = ctx.lock().unwrap();
-            guard.crypto.set_device_key(
-                peer_uuid.to_string(),
-                String::new(),
-                base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
-            );
-        }
-
-        // 回环连接：服务端一侧登记为对端会话，客户端一侧读取实际写出的帧
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
-        {
-            let mut guard = ctx.lock().unwrap();
-            guard.network.tcp.lock().unwrap().sessions.insert(
-                peer_uuid.to_string(),
-                TcpSession {
-                    stream: server_stream,
-                    uuid: peer_uuid.to_string(),
-                    ip: "127.0.0.1".to_string(),
-                    conn_id: 1,
-                },
-            );
-        }
 
         let item = SendItem {
-            device_uuid: peer_uuid.to_string(),
+            device_uuid: "peer".to_string(),
             header: "DATA_NOTIFICATION".to_string(),
             plaintext: r#"{"title":"t"}"#.to_string(),
             dedup_key: None,
@@ -1187,20 +1145,72 @@ mod ctx_tests {
             coalesce_key: None,
         };
         assert!(
+            !SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+            "QUIC 传输层未启动时必须返回失败"
+        );
+    }
+
+    /// 已建立 QUIC 会话时，try_send 必须经该会话成功投递。
+    #[test]
+    fn try_send_delivers_over_quic_session() {
+        use crate::crypto::{cert, ecdh};
+        use crate::quic::QuicTransport;
+        use std::sync::mpsc;
+
+        let (secret_a, _) = ecdh::generate_keypair();
+        let (secret_b, _) = ecdh::generate_keypair();
+        let cert_b = cert::derive_cert(&secret_b, "peer-b").expect("B 证书");
+        let fp_b = cert_b.fingerprint.clone();
+
+        // 对端：接收帧
+        let server = QuicTransport::new().expect("创建服务端");
+        let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+        let port = server
+            .start_server(
+                0,
+                cert_b,
+                |_, _| {},
+                move |_u, h, p| {
+                    let _ = tx.send((h, p));
+                },
+            )
+            .expect("启动服务端");
+
+        // 本机：作为客户端连上对端，并把传输层放进上下文
+        let client = QuicTransport::new().expect("创建客户端");
+        client
+            .connect("peer", "127.0.0.1", port, Some(&fp_b))
+            .expect("连接");
+
+        let ctx = create_ctx();
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.quic = Some(std::sync::Arc::new(client));
+            guard
+                .device_ips
+                .lock()
+                .unwrap()
+                .insert("peer".to_string(), "127.0.0.1".to_string());
+        }
+
+        let item = SendItem {
+            device_uuid: "peer".to_string(),
+            header: "DATA_NOTIFICATION".to_string(),
+            plaintext: r#"{"title":"quic"}"#.to_string(),
+            dedup_key: None,
+            retries_left: 0,
+            coalesce_key: None,
+        };
+        assert!(
             SenderQueue::try_send(ctx_ptr, &item).unwrap(),
-            "已存在会话时必须经会话发送"
+            "已建立 QUIC 会话时必须投递成功"
         );
 
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut reader = client;
-        let (msg_type, payload) = binary_codec::read_frame(&mut reader).unwrap();
-        assert_eq!(msg_type, MessageType::NOTIFICATION);
-        let text = String::from_utf8(payload).unwrap();
-        // 首段为 wire header，后续依次为本机 uuid / 版本 / 公钥 / 密文
-        let parts: Vec<&str> = text.splitn(5, ':').collect();
-        assert_eq!(parts[0], "DATA_NOTIFICATION", "会话发送的应是 DATA 帧");
-        assert_eq!(parts.len(), 5, "DATA 帧应为 5 段: {}", text);
+        let (header, payload) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("对端应收到帧");
+        assert_eq!(header, "DATA_NOTIFICATION");
+        assert_eq!(payload, br#"{"title":"quic"}"#.to_vec());
     }
 }

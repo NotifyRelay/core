@@ -5,7 +5,7 @@ mod app_sync;
 pub mod audio_codec;
 pub mod audio_stream;
 mod clipboard;
-mod crypto;
+pub mod crypto;
 mod dedup;
 pub mod device_registry;
 pub mod diff;
@@ -19,7 +19,8 @@ mod models;
 mod network;
 mod persistence;
 mod processing;
-mod protocol;
+pub mod protocol;
+pub mod quic;
 pub mod reconnect;
 mod router;
 pub mod send;
@@ -49,6 +50,8 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub audio: Arc<Mutex<audio_stream::AudioStreamState>>,
     pub network: network::NetworkState,
+    /// QUIC 传输层（方案 B）：Arc 共享，便于「锁内取句柄、锁外发送」避免持锁做 I/O
+    pub quic: Option<std::sync::Arc<quic::QuicTransport>>,
     pub dedup: dedup::DedupState,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
@@ -176,6 +179,7 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             audio: Arc::new(Mutex::new(audio_stream::AudioStreamState::new())),
             network: network::NetworkState::new(),
+            quic: None,
             dedup: dedup::DedupState::new(),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),

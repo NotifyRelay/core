@@ -2,7 +2,7 @@
 name = "notify-relay-core"
 # 版本号参与全链路协议兼容校验（仅比较 major.minor）与 DATA 通道 AES-GCM AAD 绑定：
 # 跨 major.minor 的 core 之间即便公钥正确也无法解密，从而阻断跨版本通信。
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 
 [lib]
@@ -37,6 +37,14 @@ zeroize = "1"
 # UniFFI：Kotlin 绑定由 gobley-uniffi-bindgen 0.3.7 生成，其内置 uniffi_bindgen 为 0.29.4。
 # 元数据格式按精确版本校验，此处必须锁定同一版本，否则 bindgen 静默只产出公共骨架。
 uniffi = "=0.29.4"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+quinn = "0.11.12"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.1"
+rcgen = "0.14.10"
+mdns-sd = "0.21.6"
+futures-util = "0.3.34"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 env_logger = "0.11"

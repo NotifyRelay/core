@@ -117,15 +117,29 @@ impl TcpServerState {
     }
 }
 
-/// 网络状态（包含 TCP 服务器）
+/// 网络状态（QUIC 传输 + 遗留 TCP 状态容器）
 pub struct NetworkState {
+    /// 遗留 TCP 状态容器：QUIC 启用后仅作为兼容占位，
+    /// 供尚未迁移的 `set_local_uuid` / `set_broadcast_info` 等接口写入
     pub tcp: Arc<Mutex<TcpServerState>>,
+    /// 本机证书公钥指纹（配对期交换给对端，连接期校验）
+    pub local_fingerprint: Option<String>,
+    /// 传输服务端监听端口（0 表示未启动）
+    pub port: u16,
+    /// 传输服务端是否运行中
+    pub running: bool,
+    /// 本机 uuid 副本
+    pub local_uuid: String,
 }
 
 impl NetworkState {
     pub fn new() -> Self {
         Self {
             tcp: Arc::new(Mutex::new(TcpServerState::new())),
+            local_fingerprint: None,
+            port: 0,
+            running: false,
+            local_uuid: String::new(),
         }
     }
 }
@@ -703,19 +717,30 @@ pub fn bind_udp_discovery_listener() -> Result<UdpSocket, String> {
 
 use crate::SafeContext;
 
-/// 启动 TCP 服务器（供统一启动入口调用）。返回 0 表示成功。
+/// 启动传输服务端（QUIC）。返回 0 表示成功。
+///
+/// 函数名沿用历史命名以保持调用方不变；实现已切换为 QUIC：
+/// - 证书由本机长期 P-256 私钥派生（`crypto::cert`），历史配对无需重来；
+/// - 入站帧解码后交给 `processing::process_frame`，与旧 TCP 路径语义一致；
+/// - 无可用证书（尚未生成密钥对）时直接失败，由平台端先 `nrc_ecdh_generate_keypair`。
 pub fn start_tcp_server_for(ctx_ptr: usize, port: u16) -> i32 {
     if ctx_ptr == 0 {
-        log::error!("启动 TCP 服务器: 空上下文");
+        log::error!("启动传输服务端: 空上下文");
         return -1;
     }
     let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-    let (network_state, local_uuid, on_connected, on_disconnected, on_tcp_error) = {
+
+    // 取出本机长期私钥与 uuid（缺失则无法派生证书，启动失败）
+    let (secret, local_uuid, on_connected, on_disconnected, on_tcp_error) = {
         let Ok(guard) = ctx.lock() else {
             return -1;
         };
+        let Some(secret) = guard.crypto.local_key.clone() else {
+            log::error!("启动传输服务端: 本机长期密钥未生成，无法派生证书");
+            return -1;
+        };
         (
-            guard.network.tcp.clone(),
+            secret,
             guard
                 .broadcast_info
                 .as_ref()
@@ -727,8 +752,26 @@ pub fn start_tcp_server_for(ctx_ptr: usize, port: u16) -> i32 {
         )
     };
 
-    let on_connected_cb = Some(Arc::new(move |uuid: String, ip: String| {
-        // 始终记录 TCP 连接来源 IP 到内部映射（供 oneshot 发送回退）
+    // 派生证书
+    let cert = match crate::crypto::cert::derive_cert(&secret, &local_uuid) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("启动传输服务端: 派生证书失败: {}", e);
+            return -1;
+        }
+    };
+    let fingerprint = cert.fingerprint.clone();
+
+    // 传输层惰性创建并保存到上下文
+    let transport = match crate::quic::QuicTransport::new() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("启动传输服务端: 创建传输层失败: {}", e);
+            return -1;
+        }
+    };
+
+    let on_connected_cb = Arc::new(move |uuid: String, ip: String| {
         if let Ok(guard) = unsafe { &*(ctx_ptr as *const SafeContext) }.lock() {
             if let Ok(mut ips) = guard.device_ips.lock() {
                 ips.insert(uuid.clone(), ip.clone());
@@ -738,10 +781,9 @@ pub fn start_tcp_server_for(ctx_ptr: usize, port: u16) -> i32 {
         if let Some(cb) = on_connected.as_ref() {
             cb(&uuid, &ip);
         }
-    }) as Arc<dyn Fn(String, String) + Send + Sync>);
+    });
 
-    let on_disconnected_cb = Some(Arc::new(move |uuid: String| {
-        // TCP 断开：登记断开状态，并清理该连接遗留的未完成配对会话。
+    let on_disconnected_cb = Arc::new(move |uuid: String| {
         if let Ok(mut guard) = unsafe { &*(ctx_ptr as *const SafeContext) }.lock() {
             guard.registry.mark_disconnected(&uuid);
             guard.pairing_sessions.remove(&uuid);
@@ -749,55 +791,47 @@ pub fn start_tcp_server_for(ctx_ptr: usize, port: u16) -> i32 {
         if let Some(cb) = on_disconnected.as_ref() {
             cb(&uuid);
         }
-    }) as Arc<dyn Fn(String) + Send + Sync>);
-
-    let on_message_cb = Some(
-        Arc::new(move |uuid: String, msg_type: u8, payload: Vec<u8>| {
-            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-            // 传入会话 uuid：帧内声明的发送方必须与之相同，否则丢弃
-            crate::processing::process_frame(ctx, Some(&uuid), msg_type, &payload);
-        }) as Arc<dyn Fn(String, u8, Vec<u8>) + Send + Sync>,
-    );
-
-    let on_error_cb = on_tcp_error.map(|cb| {
-        Arc::new(move |error: String| {
-            cb(&error);
-        }) as Arc<dyn Fn(String) + Send + Sync>
     });
 
-    // TCP 绑定失败时自动重试（覆盖旧进程退出导致端口延迟释放等场景），间隔递增
-    let mut attempts = 0;
-    let tcp_result = loop {
-        match start_tcp_server(
-            network_state.clone(),
-            port,
-            local_uuid.clone(),
-            on_connected_cb.clone(),
-            on_disconnected_cb.clone(),
-            on_message_cb.clone(),
-            on_error_cb.clone(),
-        ) {
-            Ok(_) => break Ok(()),
-            Err(e) => {
-                attempts += 1;
-                if attempts >= 5 {
-                    break Err(e);
-                }
-                log::warn!("启动 TCP 服务器失败（第 {}/5 次）: {}", attempts, e);
-                std::thread::sleep(Duration::from_secs(attempts as u64));
+    // 入站帧：直接交给既有的帧处理入口，保持与旧 TCP 路径一致
+    let on_frame_cb = Arc::new(move |uuid: String, header: String, payload: Vec<u8>| {
+        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+        crate::processing::process_header_frame(ctx, Some(&uuid), &header, &payload);
+    });
+
+    let bind_port = port;
+    let started = {
+        let on_connected_cb = on_connected_cb.clone();
+        let on_frame_cb = on_frame_cb.clone();
+        transport.start_server(
+            bind_port,
+            cert,
+            move |uuid, ip| on_connected_cb(uuid, ip),
+            move |uuid, header, payload| on_frame_cb(uuid, header, payload),
+        )
+    };
+
+    let bound = match started {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("启动传输服务端失败: {}", e);
+            if let Some(cb) = on_tcp_error.as_ref() {
+                cb(&format!("启动传输服务端失败: {e}"));
             }
+            return -1;
         }
     };
-    match tcp_result {
-        Ok(_) => {
-            log::info!("TCP 服务器已启动，端口: {}", port);
-            0
-        }
-        Err(e) => {
-            log::error!("启动 TCP 服务器失败（已重试 5 次）: {}", e);
-            -1
-        }
+
+    // 保存传输层与证书指纹
+    if let Ok(mut guard) = ctx.lock() {
+        guard.quic = Some(Arc::new(transport));
+        guard.network.local_fingerprint = Some(fingerprint);
+        guard.network.port = bound;
+        guard.network.running = true;
+        guard.network.local_uuid = local_uuid.clone();
     }
+    log::info!("QUIC 传输服务端已启动，端口: {}", bound);
+    0
 }
 
 /// 移除设备 TCP 会话。

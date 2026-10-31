@@ -1,4 +1,5 @@
 pub mod aes;
+pub mod cert;
 pub mod ecdh;
 pub mod hkdf;
 pub mod ops;

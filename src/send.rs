@@ -19,7 +19,39 @@ use crate::{
     BroadcastHandle, BroadcastInfo, CoreContext, SafeContext,
 };
 
-/// 通过已建立的 TCP 会话发送消息
+/// 通过已建立的会话发送一条「header + 明文」消息（QUIC 承载，加密由 TLS 1.3 负责）。
+///
+/// 这是全仓唯一的出站入口：旧 TCP 帧（含 AES-GCM 密文）已随传输层切换废弃。
+pub(crate) fn send_via_quic(ctx: &SafeContext, uuid: &str, header: &str, plaintext: &str) -> bool {
+    // 在锁内调用：QUIC 发送内部只做流写入，不回调平台，故不会重入 core
+    let Ok(guard) = ctx.lock() else {
+        return false;
+    };
+    let Some(transport) = guard.quic.as_ref() else {
+        log::warn!(
+            "发送失败: QUIC 传输层未启动 uuid={}, header={}",
+            uuid,
+            header
+        );
+        return false;
+    };
+    match transport.send(uuid, header, plaintext.as_bytes()) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("发送失败 uuid={}, header={}, error={}", uuid, header, e);
+            false
+        }
+    }
+}
+
+/// 发送控制帧（握手/配对/ACCEPT/REJECT 等）到指定设备。
+///
+/// QUIC 承载：header 表示控制帧类型，明文为载荷文本。
+pub(crate) fn send_control(ctx: &SafeContext, uuid: &str, header: &str, payload: &str) -> bool {
+    send_via_quic(ctx, uuid, header, payload)
+}
+
+/// 通过已建立的会话发送消息（旧 TCP 帧接口，保留供尚未迁移的调用点）。
 pub(crate) fn do_send(ctx: &CoreContext, uuid: &str, data: &[u8]) -> bool {
     do_send_via_network(&ctx.network.tcp, uuid, data)
 }
