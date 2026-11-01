@@ -58,7 +58,7 @@ fn send_reaches_receiver_with_header_and_payload() {
     let first = rx.recv_timeout(Duration::from_secs(5)).expect("收到第一条");
     let second = rx.recv_timeout(Duration::from_secs(5)).expect("收到第二条");
 
-    let mut got = vec![first, second];
+    let mut got = [first, second];
     got.sort_by(|a, b| a.header.cmp(&b.header));
 
     assert_eq!(got[0].header, "DATA_MEDIAPLAY");

@@ -554,6 +554,23 @@ pub(crate) fn consume_discovered_device(
     }
 }
 
+/// 供集成测试驱动的发现消费入口。
+///
+/// 发现机制已迁移到 mDNS，consume_discovered_device 是唯一的消费链入口；
+/// 集成测试无法构造 mdns_sd::ResolvedService，故由此转调，验证语义保持一致。
+#[doc(hidden)]
+pub fn consume_discovered_device_for_test(
+    ctx: &SafeContext,
+    uuid: &str,
+    name_b64: &str,
+    port: u16,
+    battery: i32,
+    device_type: &str,
+    ip: &str,
+) {
+    consume_discovered_device(ctx, uuid, name_b64, port, battery, device_type, ip);
+}
+
 /// 周期广播控制：0=停止，1=启动，2=仅更新参数。
 pub fn periodic_broadcast(
     ctx_ptr: usize,

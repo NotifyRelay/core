@@ -175,58 +175,6 @@ fn same_subnet_24(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr) -> bool {
     ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    /// 同 /24 网段判定：仅前三段相同才算同网段。
-    #[test]
-    fn same_subnet_only_matches_first_three_octets() {
-        assert!(same_subnet_24(
-            Ipv4Addr::new(192, 168, 31, 1),
-            Ipv4Addr::new(192, 168, 31, 200)
-        ));
-        assert!(!same_subnet_24(
-            Ipv4Addr::new(192, 168, 31, 1),
-            Ipv4Addr::new(192, 168, 32, 1)
-        ));
-        assert!(!same_subnet_24(
-            Ipv4Addr::new(10, 39, 123, 115),
-            Ipv4Addr::new(192, 168, 31, 135)
-        ));
-    }
-
-    /// 排序规则：同网段 IPv4 最优，其次其他 IPv4，IPv6 最后。
-    /// 这是「对端同时通告局域网地址与蜂窝地址」时的正确选路依据。
-    #[test]
-    fn address_ranking_prefers_lan_ipv4() {
-        let local = Ipv4Addr::new(192, 168, 31, 123);
-        let rank = |ip: &IpAddr| -> u8 {
-            match ip {
-                IpAddr::V4(v4) => {
-                    if same_subnet_24(local, *v4) {
-                        0
-                    } else {
-                        1
-                    }
-                }
-                IpAddr::V6(_) => 2,
-            }
-        };
-        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 31, 135));
-        let cell = IpAddr::V4(Ipv4Addr::new(10, 39, 123, 115));
-        let v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-        assert!(rank(&lan) < rank(&cell), "同网段 IPv4 必须优先于蜂窝地址");
-        assert!(rank(&cell) < rank(&v6), "IPv4 必须优先于 IPv6");
-
-        // 混合候选集按 (rank, 字符串) 排序后，首位应是局域网地址
-        let mut cands = vec![v6, cell, lan];
-        cands.sort_by_key(|ip| (rank(ip), ip.to_string()));
-        assert_eq!(cands[0], lan);
-    }
-}
-
 /// 处理一条已解析的对端服务记录。
 fn handle_resolved(ctx_ptr: usize, resolved: &mdns_sd::ResolvedService) {
     let Some(uuid) = resolved.txt_properties.get_property_val_str("uuid") else {
@@ -309,4 +257,56 @@ fn handle_resolved(ctx_ptr: usize, resolved: &mdns_sd::ResolvedService) {
         device_type,
         &ip,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// 同 /24 网段判定：仅前三段相同才算同网段。
+    #[test]
+    fn same_subnet_only_matches_first_three_octets() {
+        assert!(same_subnet_24(
+            Ipv4Addr::new(192, 168, 31, 1),
+            Ipv4Addr::new(192, 168, 31, 200)
+        ));
+        assert!(!same_subnet_24(
+            Ipv4Addr::new(192, 168, 31, 1),
+            Ipv4Addr::new(192, 168, 32, 1)
+        ));
+        assert!(!same_subnet_24(
+            Ipv4Addr::new(10, 39, 123, 115),
+            Ipv4Addr::new(192, 168, 31, 135)
+        ));
+    }
+
+    /// 排序规则：同网段 IPv4 最优，其次其他 IPv4，IPv6 最后。
+    /// 这是「对端同时通告局域网地址与蜂窝地址」时的正确选路依据。
+    #[test]
+    fn address_ranking_prefers_lan_ipv4() {
+        let local = Ipv4Addr::new(192, 168, 31, 123);
+        let rank = |ip: &IpAddr| -> u8 {
+            match ip {
+                IpAddr::V4(v4) => {
+                    if same_subnet_24(local, *v4) {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                IpAddr::V6(_) => 2,
+            }
+        };
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 31, 135));
+        let cell = IpAddr::V4(Ipv4Addr::new(10, 39, 123, 115));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert!(rank(&lan) < rank(&cell), "同网段 IPv4 必须优先于蜂窝地址");
+        assert!(rank(&cell) < rank(&v6), "IPv4 必须优先于 IPv6");
+
+        // 混合候选集按 (rank, 字符串) 排序后，首位应是局域网地址
+        let mut cands = [v6, cell, lan];
+        cands.sort_by_key(|ip| (rank(ip), ip.to_string()));
+        assert_eq!(cands[0], lan);
+    }
 }

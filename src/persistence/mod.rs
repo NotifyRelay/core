@@ -36,6 +36,8 @@ pub struct PersistedDevice {
 }
 
 impl PersistedDevice {
+    // 参数与数据库列一一对应，拆结构体只是把同名列换个位置。
+    #[allow(clippy::too_many_arguments)]
     pub fn from_row(
         uuid: String,
         public_key: String,

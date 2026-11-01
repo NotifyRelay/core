@@ -98,3 +98,9 @@ impl CryptoState {
         );
     }
 }
+
+impl Default for CryptoState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

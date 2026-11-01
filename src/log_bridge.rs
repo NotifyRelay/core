@@ -38,10 +38,10 @@ fn should_skip(record: &log::Record) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    let is_arrow = (trimmed.starts_with("->") || trimmed.starts_with("<-"))
+
+    (trimmed.starts_with("->") || trimmed.starts_with("<-"))
         && trimmed.ends_with(';')
-        && trimmed.len() <= 64;
-    is_arrow
+        && trimmed.len() <= 64
 }
 
 impl log::Log for PlatformLogBridge {

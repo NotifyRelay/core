@@ -105,14 +105,14 @@ fn frame_sender_uuid(msg_type: u8, payload: &[u8]) -> Option<String> {
     match msg_type {
         MessageType::HANDSHAKE => binary_codec::decode_handshake_frame(payload).map(|h| h.uuid),
         MessageType::HEARTBEAT => binary_codec::decode_heartbeat_frame(payload).map(|h| h.uuid),
-        t if t >= 10 && t <= 200 => std::str::from_utf8(payload)
+        t if (10..=200).contains(&t) => std::str::from_utf8(payload)
             .ok()
-            .and_then(|s| s.splitn(4, ':').nth(1).map(|v| v.to_string())),
+            .and_then(|s| s.split(':').nth(1).map(|v| v.to_string())),
         // 配对帧与 ACCEPT：首段即发送方 uuid
         MessageType::PAIRING_INIT | MessageType::PAIRING_RESP | MessageType::ACCEPT => {
             std::str::from_utf8(payload)
                 .ok()
-                .and_then(|s| s.splitn(2, ':').next().map(|v| v.trim().to_string()))
+                .and_then(|s| s.split(':').next().map(|v| v.trim().to_string()))
                 .filter(|u| !u.is_empty())
         }
         _ => None,
@@ -153,7 +153,7 @@ pub(crate) fn process_frame(
             0
         }
         MessageType::RESYNC_REQUEST => process_data(ctx, msg_type, payload),
-        t if t >= 10 && t <= 200 => process_data(ctx, t, payload),
+        t if (10..=200).contains(&t) => process_data(ctx, t, payload),
         _ => {
             log::warn!("处理消息: 未知消息类型 type={}", msg_type);
             -1
@@ -995,7 +995,7 @@ fn dispatch_plaintext(
 ) -> i32 {
     // 重同步请求：接收端缺失基线时主动请求发送方重发 FULL
     if msg_type == MessageType::RESYNC_REQUEST {
-        match serde_json::from_str::<serde_json::Value>(&plaintext) {
+        match serde_json::from_str::<serde_json::Value>(plaintext) {
             Ok(v) => {
                 if let Some(fid) = v.get("feature").and_then(|x| x.as_str()) {
                     // local_uuid 为请求方（原接收端）；本机作为发送方标记对应会话重发 FULL
@@ -1012,7 +1012,7 @@ fn dispatch_plaintext(
     // 超级岛 / 媒体：交给状态合并引擎
     if msg_type == MessageType::MEDIA_SESSION || msg_type == MessageType::FEATURE_STATUS {
         let is_media = msg_type == MessageType::MEDIA_SESSION;
-        crate::state_merge::handle_state_message(ctx, local_uuid, is_media, &plaintext);
+        crate::state_merge::handle_state_message(ctx, local_uuid, is_media, plaintext);
         return 0;
     }
 
@@ -1038,14 +1038,12 @@ fn dispatch_plaintext(
     };
 
     let processed_text = match msg_type {
-        MessageType::NOTIFICATION => {
-            serde_json::from_str::<crate::models::Notification>(&plaintext)
-                .ok()
-                .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.to_string())
-        }
+        MessageType::NOTIFICATION => serde_json::from_str::<crate::models::Notification>(plaintext)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or(plaintext.to_string()),
         MessageType::MEDIA_SESSION | MessageType::FEATURE_STATUS => {
-            serde_json::from_str::<crate::models::MediaPayload>(&plaintext)
+            serde_json::from_str::<crate::models::MediaPayload>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())
@@ -1054,45 +1052,45 @@ fn dispatch_plaintext(
         // 选择模型：响应侧用 IconRequest 归一化会把 iconData/icons/missing 静默丢弃
         MessageType::PACKAGE_INFO => {
             if data_header == "DATA_ICON_RESPONSE" {
-                normalize_or_keep::<crate::models::IconResponse>(&plaintext)
+                normalize_or_keep::<crate::models::IconResponse>(plaintext)
             } else {
-                normalize_or_keep::<crate::models::IconRequest>(&plaintext)
+                normalize_or_keep::<crate::models::IconRequest>(plaintext)
             }
         }
         MessageType::SYNC_SEARCH_APP => {
-            serde_json::from_str::<crate::models::AppListRequest>(&plaintext)
+            serde_json::from_str::<crate::models::AppListRequest>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())
         }
         MessageType::SYNC_SEARCH_APP_RESPONSE => {
-            serde_json::from_str::<crate::models::AppListResponse>(&plaintext)
+            serde_json::from_str::<crate::models::AppListResponse>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())
         }
         MessageType::MEDIA_SESSION_CONTROL => {
-            serde_json::from_str::<crate::models::MediaControl>(&plaintext)
+            serde_json::from_str::<crate::models::MediaControl>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())
         }
-        MessageType::FTP => serde_json::from_str::<crate::models::FtpMessage>(&plaintext)
+        MessageType::FTP => serde_json::from_str::<crate::models::FtpMessage>(plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
             .unwrap_or(plaintext.to_string()),
-        MessageType::CLIPBOARD => serde_json::from_str::<crate::models::ClipboardData>(&plaintext)
+        MessageType::CLIPBOARD => serde_json::from_str::<crate::models::ClipboardData>(plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
             .unwrap_or(plaintext.to_string()),
         MessageType::DEVICE_STATUS => {
-            serde_json::from_str::<crate::models::StatusMessage>(&plaintext)
+            serde_json::from_str::<crate::models::StatusMessage>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())
         }
         MessageType::RELAY_APPLICATION => {
-            serde_json::from_str::<crate::models::AppLaunch>(&plaintext)
+            serde_json::from_str::<crate::models::AppLaunch>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
                 .unwrap_or(plaintext.to_string())

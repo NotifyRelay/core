@@ -11,12 +11,6 @@ use std::time::Duration;
 use notify_relay_core::crypto::{cert, ecdh};
 use notify_relay_core::quic::{decode_frame, QuicTransport};
 
-/// 取一个本机空闲端口。
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
-    l.local_addr().expect("取地址").port()
-}
-
 #[test]
 fn two_identities_connect_over_quic() {
     // 两个独立身份（模拟两台设备）

@@ -43,7 +43,8 @@ pub enum DeviceType {
 }
 
 impl DeviceType {
-    pub fn from_str(s: &str) -> Self {
+    /// 按设备类型名称解析。名称不区分大小写，支持中英文别名。
+    pub fn parse_from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "phone" | "手机" => Self::Phone,
             "pad" | "tablet" | "平板" => Self::Pad,

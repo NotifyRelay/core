@@ -386,9 +386,9 @@ pub fn start_transport_server(ctx_ptr: usize, port: u16) -> i32 {
     if let Ok(mut guard) = ctx.lock() {
         let shared = Arc::new(transport);
         guard.quic = Some(shared.clone());
-        guard.network.transport.lock().ok().map(|mut t| {
+        if let Ok(mut t) = guard.network.transport.lock() {
             t.transport = Some(shared);
-        });
+        }
         guard.network.local_fingerprint = Some(fingerprint);
         guard.network.port = bound;
         guard.network.running = true;

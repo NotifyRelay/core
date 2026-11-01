@@ -81,10 +81,16 @@ pub struct QuicTransport {
     ///
     /// 出站连接同样需要它：主动拨号建立的连接也必须启动流读取循环，
     /// 否则拨号方永远收不到对端回发的消息。
-    on_conn_cb: Mutex<Option<Arc<dyn Fn(String, String) + Send + Sync>>>,
+    on_conn_cb: Mutex<Option<Arc<OnConnFn>>>,
     /// 收到完整应用层帧的回调（由 start_server 写入，出站连接复用）。
-    on_frame_cb: Mutex<Option<Arc<dyn Fn(String, String, Vec<u8>) + Send + Sync>>>,
+    on_frame_cb: Mutex<Option<Arc<OnFrameFn>>>,
 }
+
+/// 新连接回调：入参与 start_server 的 on_conn 一致。
+type OnConnFn = dyn Fn(String, String) + Send + Sync;
+
+/// 应用层帧回调：入参与 start_server 的 on_frame 一致。
+type OnFrameFn = dyn Fn(String, String, Vec<u8>) + Send + Sync;
 
 impl QuicTransport {
     /// 取（必要时创建）入站帧分发池。
@@ -616,9 +622,7 @@ fn peer_cert_uuid(conn: &Connection) -> Option<String> {
 /// 文本载荷取首个冒号前的段。
 fn uuid_from_payload(header: &str, payload: &[u8]) -> Option<String> {
     // 仅控制帧参与身份推断，业务帧必须已有身份
-    if crate::processing::control_header_to_type(header).is_none() {
-        return None;
-    }
+    crate::processing::control_header_to_type(header)?;
     let text = std::str::from_utf8(payload).ok()?;
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(uuid) = v.get("uuid").and_then(|x| x.as_str()) {

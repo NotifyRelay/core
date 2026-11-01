@@ -342,6 +342,8 @@ fn start_read_thread(state: &mut AudioStreamState) {
     state.playback_handle = Some(playback_handle);
 }
 
+// 播放线程需要完整的一组运行期句柄；拆成结构体只是搬运字段，不增加可读性。
+#[allow(clippy::too_many_arguments)]
 fn read_loop(
     socket: UdpSocket,
     active: Arc<AtomicBool>,
@@ -544,7 +546,9 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     }
 
     let pcm: Vec<i16> = pcm_data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
