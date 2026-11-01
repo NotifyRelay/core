@@ -268,6 +268,20 @@ fn test_state_export_import_loop_stable() {
     unsafe { free_cstr(uuid) };
 }
 
+/// 提取设备列表中的 uuid 并排序，用于与遍历顺序无关的比较。
+fn sorted_uuids(list: &serde_json::Value) -> Vec<String> {
+    let mut uuids: Vec<String> = list
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d["uuid"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    uuids.sort();
+    uuids
+}
+
 #[test]
 fn test_device_known_loop_stable() {
     let ctx = create_ctx();
@@ -277,10 +291,16 @@ fn test_device_known_loop_stable() {
     // 去重后共 5 个设备
     let list = device_list(&ctx, 30000, 30000);
     assert_eq!(list.as_array().unwrap().len(), 5);
-    // 连续查询结果幂等
+    // 连续查询结果幂等。
+    // 比较 uuid 集合而非整个数组：设备列表来自 HashMap 遍历，元素顺序不保证稳定，
+    // 直接比较数组会把「顺序变化」误判为状态不一致。
+    let mut expect: Vec<String> = sorted_uuids(&list);
     for _ in 0..20 {
-        assert_eq!(device_list(&ctx, 30000, 30000), list);
+        let mut got: Vec<String> = sorted_uuids(&device_list(&ctx, 30000, 30000));
+        assert_eq!(got, expect);
+        got.clear();
     }
+    expect.clear();
     // 全部移除后为空
     for i in 0..5 {
         remove_known(&ctx, &format!("dev-{}", i));

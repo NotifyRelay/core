@@ -209,3 +209,71 @@ fn mdns_discovery_ignores_self_announcement() {
         );
     }
 }
+/// 服务下线后必须清理发现态，否则设备永久挂在列表里并被反复重拨。
+#[test]
+fn mdns_service_removed_clears_discovery_state() {
+    DISCOVERED.lock().unwrap().clear();
+
+    let ctx = create_ctx();
+    {
+        let mut guard = ctx.lock().expect("取上下文锁");
+        guard.local_uuid = LOCAL_UUID.to_string();
+    }
+
+    // 先登记一台对端
+    notify_relay_core::send::consume_discovered_device_for_test(
+        &ctx, PEER_UUID, "", PEER_PORT, 66, "phone", PEER_IP,
+    );
+    {
+        let guard = ctx.lock().expect("取上下文锁");
+        assert!(guard.discovery.get_known_devices().contains_key(PEER_UUID));
+    }
+
+    // 模拟其 mDNS 服务下线（Goodbye）
+    let fullname = format!("nr-{}._notifyrelay._udp.local.", PEER_UUID);
+    notify_relay_core::discovery::mdns::handle_service_removed_for_test(
+        ctx_ptr(&ctx) as usize,
+        &fullname,
+    );
+
+    // 发现态必须被清空：known_devices 与 device_ips 都不再保留该设备
+    let guard = ctx.lock().expect("取上下文锁");
+    assert!(
+        !guard.discovery.get_known_devices().contains_key(PEER_UUID),
+        "服务下线后 known_devices 必须移除该设备，否则会持续重拨已下线地址"
+    );
+    let ip = guard
+        .device_ips
+        .lock()
+        .ok()
+        .and_then(|m| m.get(PEER_UUID).cloned())
+        .unwrap_or_default();
+    assert!(ip.is_empty(), "服务下线后 device_ips 必须一并清理");
+}
+
+/// 本机自身服务下线通知不得触发清理（避免误删自身状态）。
+#[test]
+fn mdns_service_removed_ignores_self() {
+    // 各测试使用独立的 local uuid，避免并行执行时共享 DISCOVERED 互相污染
+    const SELF_UUID: &str = "self-removed-test";
+
+    let ctx = create_ctx();
+    {
+        let mut guard = ctx.lock().expect("取上下文锁");
+        guard.local_uuid = SELF_UUID.to_string();
+        guard.discovery.add_known_device(SELF_UUID, "127.0.0.1");
+    }
+
+    let fullname = format!("nr-{}._notifyrelay._udp.local.", SELF_UUID);
+    notify_relay_core::discovery::mdns::handle_service_removed_for_test(
+        ctx_ptr(&ctx) as usize,
+        &fullname,
+    );
+
+    // 自身 uuid 的下线通知被跳过，本机登记不应被清除
+    let guard = ctx.lock().expect("取上下文锁");
+    assert!(
+        guard.discovery.get_known_devices().contains_key(SELF_UUID),
+        "本机自身的下线通知不得清理发现态"
+    );
+}

@@ -13,11 +13,32 @@ use crate::SafeContext;
 /// 在线判定窗口（秒）：last_seen 在此窗口内视为已连接，跳过自动握手
 const RECENT_SEEN_SECS: i64 = 15;
 
+/// 已知设备条目：地址 + 最近一次被发现的时刻。
+///
+/// 时刻用于过期清理：对端进程被强杀时 mDNS 不会发出 Goodbye，
+/// 仅靠 ServiceRemoved 无法感知下线，必须依赖超时兜底。
+#[derive(Clone)]
+struct KnownDevice {
+    ip: String,
+    last_seen: i64,
+}
+
+/// 已知设备过期窗口（秒）：超过该时长未再次被发现即移除。
+///
+/// 取 10 分钟：mDNS 通告间隔通常为分钟级，短于此值会误删活跃设备。
+const KNOWN_DEVICE_TTL_SECS: i64 = 600;
+
 pub struct DiscoveryState {
     /// 发现扫描线程
     scanner_running: Arc<AtomicBool>,
     /// 已知设备列表（用于自动连接已配对设备）
-    known_devices: Arc<Mutex<HashMap<String, String>>>, // uuid -> ip
+    known_devices: Arc<Mutex<HashMap<String, KnownDevice>>>,
+}
+
+impl Default for DiscoveryState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DiscoveryState {
@@ -28,11 +49,48 @@ impl DiscoveryState {
         }
     }
 
-    /// 添加已知设备（已配对的，用于自动重连发现）
+    /// 添加已知设备（已配对的，用于自动重连发现），同时刷新发现时刻。
     pub fn add_known_device(&self, uuid: &str, ip: &str) {
         if let Ok(mut guard) = self.known_devices.lock() {
-            guard.insert(uuid.to_string(), ip.to_string());
+            let now = crate::device_registry::now_sec();
+            match guard.get_mut(uuid) {
+                Some(entry) => {
+                    // 地址为空时不覆盖已有有效地址（握手路径会传空串）
+                    if !ip.is_empty() {
+                        entry.ip = ip.to_string();
+                    }
+                    entry.last_seen = now;
+                }
+                None => {
+                    guard.insert(
+                        uuid.to_string(),
+                        KnownDevice {
+                            ip: ip.to_string(),
+                            last_seen: now,
+                        },
+                    );
+                }
+            }
         }
+    }
+
+    /// 清理长期未被再次发现的条目，返回被移除的 uuid。
+    ///
+    /// 对端进程被强杀时 mDNS 不会发出 Goodbye，只能靠超时兜底，
+    /// 否则该设备会永久留在已知列表并被反复重拨。
+    pub fn prune_expired(&self) -> Vec<String> {
+        let now = crate::device_registry::now_sec();
+        let mut removed = Vec::new();
+        if let Ok(mut guard) = self.known_devices.lock() {
+            guard.retain(|uuid, entry| {
+                let keep = now.saturating_sub(entry.last_seen) <= KNOWN_DEVICE_TTL_SECS;
+                if !keep {
+                    removed.push(uuid.clone());
+                }
+                keep
+            });
+        }
+        removed
     }
 
     /// 移除已知设备
@@ -45,7 +103,12 @@ impl DiscoveryState {
     pub fn get_known_devices(&self) -> HashMap<String, String> {
         self.known_devices
             .lock()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(uuid, entry)| (uuid.clone(), entry.ip.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -68,9 +131,27 @@ impl DiscoveryState {
                         break;
                     }
 
+                    // 每轮扫描前清理长期未被发现的条目：
+                    // 对端进程被强杀时收不到 mDNS Goodbye，只能超时兜底。
+                    {
+                        let now = crate::device_registry::now_sec();
+                        if let Ok(mut guard) = known.lock() {
+                            let before = guard.len();
+                            guard.retain(|uuid, entry| {
+                                let keep =
+                                    now.saturating_sub(entry.last_seen) <= KNOWN_DEVICE_TTL_SECS;
+                                if !keep {
+                                    log::info!("发现扫描: 已知设备过期移除 uuid={}", uuid);
+                                }
+                                keep
+                            });
+                            let _ = before;
+                        }
+                    }
+
                     let known_list: Vec<(String, String)> = known
                         .lock()
-                        .map(|g| g.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .map(|g| g.iter().map(|(k, v)| (k.clone(), v.ip.clone())).collect())
                         .unwrap_or_default();
 
                     // 是否存在未连接（需扫描握手）的设备：有则保持短周期，无则降频

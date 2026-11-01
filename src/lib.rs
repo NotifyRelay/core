@@ -9,7 +9,7 @@ pub mod crypto;
 mod dedup;
 pub mod device_registry;
 pub mod diff;
-mod discovery;
+pub mod discovery;
 pub mod ffi;
 mod filter;
 pub mod handle;

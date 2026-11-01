@@ -127,6 +127,7 @@ impl MdnsDiscovery {
                         }
                         Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                             log::debug!("mDNS 服务移除: {}", fullname);
+                            handle_service_removed(ctx_ptr, &fullname);
                         }
                         Ok(ev) => {
                             log::debug!("mDNS 其它事件: {:?}", ev);
@@ -169,10 +170,48 @@ impl Drop for MdnsDiscovery {
     }
 }
 
+/// 供集成测试驱动的服务下线入口。
+///
+/// handle_service_removed 需要 mdns_sd 事件对象，集成测试无法构造，
+/// 故按 fullname 直接转调，验证发现态清理语义。
+#[doc(hidden)]
+pub fn handle_service_removed_for_test(ctx_ptr: usize, fullname: &str) {
+    handle_service_removed(ctx_ptr, fullname);
+}
 /// 判断两个 IPv4 是否属于同一 /24 网段（局域网可达性的实用近似）。
 fn same_subnet_24(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr) -> bool {
     let (ao, bo) = (a.octets(), b.octets());
     ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2]
+}
+
+/// 处理对端服务下线（Goodbye 或缓存过期）。
+///
+/// 必须同步清理发现态：只记日志会让该设备永久留在 known_devices，
+/// 心跳调度器持续对已下线地址重拨，设备列表里长期挂着一台离线设备。
+fn handle_service_removed(ctx_ptr: usize, fullname: &str) {
+    // 实例名格式为 nr-<uuid>._notifyrelay._udp.local.
+    let Some(instance) = fullname.split('.').next() else {
+        return;
+    };
+    let Some(uuid) = instance.strip_prefix("nr-") else {
+        return;
+    };
+    if uuid.is_empty() {
+        return;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let Ok(guard) = ctx.lock() else {
+        return;
+    };
+    // 本机自身下线通知不参与清理
+    if !guard.local_uuid.is_empty() && guard.local_uuid == uuid {
+        return;
+    }
+    guard.discovery.remove_known_device(uuid);
+    if let Ok(mut ips) = guard.device_ips.lock() {
+        ips.remove(uuid);
+    }
+    log::info!("mDNS 服务已下线，清理发现态: uuid={}", uuid);
 }
 
 /// 处理一条已解析的对端服务记录。
