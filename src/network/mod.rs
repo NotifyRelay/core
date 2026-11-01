@@ -176,7 +176,10 @@ pub fn send_once_over_quic(
 /// 3. 失败过的地址排最后（仍参与尝试，网络环境可能已变）。
 ///
 /// 这是全仓唯一的建连入口，避免「每条消息一次拨号」的短连接行为。
-fn ensure_link(
+///
+/// 对 `crate` 内公开：心跳发送同样必须走多地址回退，
+/// 否则单一地址不可达时该设备会持续被判离线。
+pub(crate) fn ensure_link(
     ctx: &crate::SafeContext,
     uuid: &str,
     ip: &str,

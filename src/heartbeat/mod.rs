@@ -10,7 +10,12 @@ use crate::protocol::codec;
 use crate::SafeContext;
 
 /// 心跳指数退避上限（毫秒）：离线设备退避到该间隔后不再增加（约 1 分钟）
-const MAX_HEARTBEAT_INTERVAL_MS: u64 = 60_000;
+/// 心跳失败时的最大退避间隔。
+///
+/// 必须小于平台侧在线判定窗口（12s）：退避一旦超过该窗口，
+/// 对端在本机恢复发送之前就已把本机判为离线，
+/// 表现为设备「掉了之后长时间回不来」。
+const MAX_HEARTBEAT_INTERVAL_MS: u64 = 8_000;
 
 pub struct HeartbeatState {
     pub last_seen: HashMap<String, i64>,
@@ -113,6 +118,7 @@ impl HeartbeatHandle {
         let spawned = thread::Builder::new()
             .name("heartbeat-sender".to_string())
             .spawn(move || {
+                log::error!("[HB] 发送线程进入");
                 let mut next_interval_ms = interval_ms;
 
                 loop {
@@ -161,11 +167,12 @@ impl HeartbeatHandle {
                         }
                     };
 
+                    log::error!("[HB] uuid={} sent={} next={}", uuid, sent, next_interval_ms);
                     if sent {
                         next_interval_ms = interval_ms;
                     } else {
-                        // 离线设备指数退避：2s → 4s → 8s → 16s → 32s → 60s 封顶，
-                        // 对端恢复连接后下一次发送成功即恢复基础间隔
+                        // 指数退避：2s → 4s → 8s 封顶。
+                        // 上限收紧到在线判定窗口以内，保证恢复发送先于对端判离线。
                         next_interval_ms = (next_interval_ms * 2).min(MAX_HEARTBEAT_INTERVAL_MS);
                     }
 
@@ -219,25 +226,26 @@ impl HeartbeatHandle {
             log::debug!("心跳: QUIC 传输层未启动 uuid={}", uuid);
             return Ok(false);
         };
-        if connected
-            && transport
+        if connected {
+            if transport
                 .send(uuid, crate::processing::CTRL_HEARTBEAT, payload.as_bytes())
                 .is_ok()
-        {
-            return Ok(true);
+            {
+                return Ok(true);
+            }
+            // 会话登记仍存在但写入失败：连接已不可用。
+            // 必须先移除该登记，否则后续 ensure_link 会因 is_connected 仍为真
+            // 而反复返回同一条死连接，心跳永远发不出去。
+            log::debug!("心跳: 连接写入失败，丢弃旧连接 uuid={}", uuid);
+            transport.disconnect(uuid);
         }
 
-        // 2) 无会话：按已知 IP 建连后重试一次
-        // 地址可能是 "ip:port" 形式，建连前统一归一化为纯 IP
-        let ip = crate::utils::normalize_ip(ip);
-        if ip.is_empty() || ip == "0.0.0.0" {
-            log::debug!("心跳: 无会话且无已知 IP uuid={}", uuid);
+        // 2) 无可用会话：走统一建连入口（汇总全部已知地址逐个尝试）。
+        // 只用传入的单个 IP 会在该地址过期时永久发不出心跳，对端随即判本机离线。
+        let Some(transport) = crate::network::ensure_link(ctx, uuid, ip, port) else {
+            log::debug!("心跳: 建连失败 uuid={}, ip={}", uuid, ip);
             return Ok(false);
-        }
-        if transport.connect(uuid, &ip, port, None).is_err() {
-            log::debug!("心跳: QUIC 建连失败 uuid={}, ip={}", uuid, ip);
-            return Ok(false);
-        }
+        };
         Ok(transport
             .send(uuid, crate::processing::CTRL_HEARTBEAT, payload.as_bytes())
             .is_ok())
@@ -317,12 +325,11 @@ pub fn start_offline_detector(
                     };
                     guard.heartbeat.remove(uuid);
                     guard.registry.mark_disconnected(uuid);
-                    // 单语句内完成内部锁获取与调用：避免 MutexGuard 经由 deref 临时量的借用生命周期不足
-                    let _ = guard
-                        .network
-                        .transport
-                        .lock()
-                        .map(|mut tcp| tcp.remove_session(uuid));
+                    // 只标记状态，**不拆传输层连接**。
+                    //
+                    // 拆连接会造成自毁式循环：心跳稍慢 → 判超时 → 断长连接 →
+                    // 对端立刻掉线 → 双方互判离线，且每次都要重新握手。
+                    // 连接释放交由 QUIC 自身的空闲回收与对端关闭处理。
                 }
             }
 
@@ -397,14 +404,37 @@ impl HeartbeatScheduler {
                         let known_devices = guard.discovery.get_known_devices();
                         let paired: Vec<String> =
                             guard.crypto.device_keys.keys().cloned().collect();
+                        // 地址来源不限于发现层：对端主动连入时入站回调会写入 device_ips，
+                        // mDNS 抖动导致 known_devices 掉条目时该地址依然有效。
+                        let device_ips: HashMap<String, String> = guard
+                            .device_ips
+                            .lock()
+                            .map(|m| m.clone())
+                            .unwrap_or_default();
 
                         let mut handles = std::mem::take(&mut guard.heartbeat_scheduler_handles);
 
-                        // 回收失效 handle：设备已不在 known_devices，或发送线程已不存活。
+                        // 心跳目标集合 = 全部已配对设备。
+                        // 判定依据只能是「本机是否与该设备配对」，不能是「发现层当前是否看到它」：
+                        // mDNS 掉条目时若据此停发心跳，对端 last_seen 会超时并把本机判为离线。
+                        let targets: Vec<(String, String)> = paired
+                            .iter()
+                            .filter(|u| !local_uuid.is_empty() && u.as_str() != local_uuid)
+                            .map(|u| {
+                                let ip = known_devices
+                                    .get(u)
+                                    .or_else(|| device_ips.get(u))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                (u.clone(), ip)
+                            })
+                            .collect();
+
+                        // 回收条件仅为「已不再配对」或「发送线程已不存活」。
                         // 用线程存活而非 running 标志——running 创建即 true，线程死亡不会复位。
                         let stale: Vec<String> = handles
                             .iter()
-                            .filter(|(u, h)| !known_devices.contains_key(*u) || !h.is_alive())
+                            .filter(|(u, h)| !paired.contains(u) || !h.is_alive())
                             .map(|(u, _)| u.clone())
                             .collect();
                         for s in &stale {
@@ -415,21 +445,15 @@ impl HeartbeatScheduler {
                         }
 
                         // 收集待启动设备（只收集，不创建线程）
-                        for (uuid, ip) in &known_devices {
-                            if handles.contains_key(uuid) || !paired.contains(uuid) {
+                        for (uuid, ip) in &targets {
+                            if handles.contains_key(uuid) || local_uuid.is_empty() {
                                 continue;
-                            }
-                            if !local_uuid.is_empty() && *uuid == local_uuid {
-                                continue;
-                            }
-                            if local_uuid.is_empty() {
-                                break;
                             }
                             to_start.push((uuid.clone(), ip.clone()));
                         }
 
-                        // 更新既有 handle 的本机参数
-                        for (uuid, ip) in &known_devices {
+                        // 更新既有 handle 的本机参数与目标地址
+                        for (uuid, ip) in &targets {
                             if let Some(h) = handles.get(uuid) {
                                 h.update(
                                     &local_uuid,
@@ -441,6 +465,14 @@ impl HeartbeatScheduler {
                             }
                         }
 
+                        log::error!(
+                            "[SCH] paired={} targets={} handles={} to_start={} local_uuid={}",
+                            paired.len(),
+                            targets.len(),
+                            handles.len(),
+                            to_start.len(),
+                            local_uuid
+                        );
                         guard.heartbeat_scheduler_handles = handles;
                     }
 

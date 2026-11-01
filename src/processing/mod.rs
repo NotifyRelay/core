@@ -771,6 +771,10 @@ fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
             hb.battery,
             &hb.device_type,
         );
+        // 收到心跳即证明对端可达：必须恢复在线标记。
+        // 否则一旦出现过一次超时，connected 会永久停在 false，
+        // 表现为设备「掉线后再也回不来」。
+        guard.registry.mark_connected(&hb.uuid, &ip);
     }
 
     let data = serde_json::json!({

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -611,10 +612,31 @@ fn build_server_config(cert: &DerivedCert) -> Result<ServerConfig, QuicError> {
         .map_err(|e| QuicError::Connect(format!("服务端 TLS 配置失败: {e}")))?;
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
-    Ok(ServerConfig::with_crypto(Arc::new(
+    let mut cfg = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
             .map_err(|e| QuicError::Connect(format!("QUIC 服务端配置失败: {e}")))?,
-    )))
+    ));
+    cfg.transport_config(transport_with_keepalive());
+    Ok(cfg)
+}
+
+/// 空闲超时：明显大于心跳间隔，允许若干次心跳丢失仍不拆连接。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 保活间隔：QUIC 自身在无应用数据时发送 PING。
+///
+/// quinn 默认 `keep_alive_interval` 为 None、`max_idle_timeout` 为 30s：
+/// 心跳一旦超过 30s 未成功交付，连接就进入空闲并结束会话，
+/// 表现为设备在运行中逐渐掉线且需要重新握手。
+/// 这里显式开启保活，让长连接的维持不依赖应用层心跳是否恰好及时。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 构造带保活与空闲超时的传输层配置（服务端与客户端共用同一套参数）。
+fn transport_with_keepalive() -> Arc<quinn::TransportConfig> {
+    let mut cfg = quinn::TransportConfig::default();
+    cfg.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+    cfg.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("空闲超时恒定可表示")));
+    Arc::new(cfg)
 }
 
 /// 构造客户端 TLS 配置。
@@ -638,10 +660,12 @@ fn build_client_config(
         .map_err(|e| QuicError::Connect(format!("客户端证书配置失败: {e}")))?;
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
-    Ok(ClientConfig::new(Arc::new(
+    let mut cfg = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicError::Connect(format!("QUIC 客户端配置失败: {e}")))?,
-    )))
+    ));
+    cfg.transport_config(transport_with_keepalive());
+    Ok(cfg)
 }
 
 /// 服务端接受任意客户端证书。

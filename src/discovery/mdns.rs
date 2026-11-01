@@ -78,38 +78,14 @@ impl MdnsDiscovery {
     ) -> Result<Self, String> {
         let daemon = ServiceDaemon::new().map_err(|e| format!("创建 mDNS daemon 失败: {e}"))?;
 
-        // 关键：把 mDNS 限制在局域网网卡上。
+        // 网卡策略：在所有 UP 且非回环的 IPv4 网卡上收发组播。
         //
-        // mdns-sd 默认在所有网卡上收发组播。实测某 Android 同时存在
-        // wlan0(192.168.x) 与 6 张 rmnet_data*(蜂窝)，SearchStarted 显示
-        // 搜索覆盖 8 张网卡 → 组播分散到蜂窝网卡，收不到局域网对端通告。
-        //
-        // 注意 enable_interface 是「追加启用」而非「独占」，无法缩小范围；
-        // 必须用 disable_interface 主动排除非局域网网卡。
-        let lan_addrs: Vec<std::net::IpAddr> = crate::utils::local_ipv4_addrs()
-            .into_iter()
-            .map(std::net::IpAddr::V4)
-            .collect();
-        let all_ifas = local_ip_address::list_afinet_netifas().unwrap_or_default();
-        let mut excluded = 0usize;
-        for (name, ip) in all_ifas {
-            let std::net::IpAddr::V4(v4) = ip else {
-                continue;
-            };
-            if v4.is_loopback() || lan_addrs.contains(&ip) {
-                continue;
-            }
-            if daemon
-                .disable_interface(mdns_sd::IfKind::Name(name.clone()))
-                .is_ok()
-            {
-                excluded += 1;
-                log::debug!("mDNS 已禁用非局域网网卡: {} ({})", name, v4);
-            }
-        }
-        if excluded > 0 {
-            log::info!("mDNS 已排除 {} 张非局域网网卡", excluded);
-        }
+        // 与 miLink 一致（每网卡独立 socket + IP_MULTICAST_IF）：
+        // 组播必须逐网卡投递，任一网卡都可能承载对端通告。
+        // mdns-sd 默认即覆盖全部网卡，不做接口收敛
+        // （enable_interface 只做追加、disable_interface 无法缩小搜索范围）。
+        let lan_addrs = crate::utils::local_ipv4_addrs();
+        log::debug!("mDNS 组播网卡数: {}", lan_addrs.len());
 
         let name_b64 = crate::utils::encode_name_b64(name);
         let mut props = HashMap::new();
