@@ -189,7 +189,7 @@ impl QuicTransport {
 
                     // 身份来源优先级：对端证书 CN 中的 uuid > 首帧自报 uuid。
                     // 绝不使用 IP:端口 作为设备身份，避免污染设备表。
-                    let mut resolved_uuid = peer_cert_uuid(&conn);
+                    let resolved_uuid = peer_cert_uuid(&conn);
                     if resolved_uuid.is_none() {
                         log::warn!(
                             "QUIC 入站连接无有效身份证书 peer={}（对端可能未携带 uuid 证书）",
@@ -219,52 +219,66 @@ impl QuicTransport {
                             .ok();
                     }
 
-                    // 持续接受对端打开的流，逐流解码应用层帧
+                    // 持续接受对端打开的流，逐流解码应用层帧。
+                    //
+                    // 每条流必须独立并发处理：发送侧每条消息新开一条流，
+                    // 若在此串行 await 读取，一条流卡住会让后续消息全部堆积在
+                    // QUIC 接收队列里（实测 62 条心跳只收到 2 条）。
                     loop {
                         match conn.accept_bi().await {
                             Ok((_send, mut recv)) => {
-                                let mut buf = Vec::new();
-                                if let Ok(data) = recv.read_to_end(MAX_STREAM_LEN).await {
-                                    buf.extend_from_slice(&data);
-                                }
-                                let mut offset = 0usize;
-                                while let Ok(Some((header, payload, used))) =
-                                    decode_frame(&buf[offset..])
-                                {
-                                    offset += used;
-                                    // 首帧尚未解析出身份时，尝试从载荷中提取并对齐
-                                    if resolved_uuid.is_none() {
-                                        if let Some(uuid) = uuid_from_payload(&header, &payload) {
-                                            if let Ok(mut map) = conns.lock() {
-                                                map.insert(uuid.clone(), conn.clone());
+                                let mut resolved = resolved_uuid.clone();
+                                let conns = conns.clone();
+                                let on_conn = on_conn.clone();
+                                let on_frame = on_frame.clone();
+                                let dispatch_pool = dispatch_pool.clone();
+                                let peer = peer.clone();
+                                let conn = conn.clone();
+                                tokio::spawn(async move {
+                                    let mut buf = Vec::new();
+                                    if let Ok(data) = recv.read_to_end(MAX_STREAM_LEN).await {
+                                        buf.extend_from_slice(&data);
+                                    }
+                                    let mut offset = 0usize;
+                                    while let Ok(Some((header, payload, used))) =
+                                        decode_frame(&buf[offset..])
+                                    {
+                                        offset += used;
+                                        // 首帧尚未解析出身份时，尝试从载荷中提取并对齐
+                                        if resolved.is_none() {
+                                            if let Some(uuid) = uuid_from_payload(&header, &payload)
+                                            {
+                                                if let Ok(mut map) = conns.lock() {
+                                                    map.insert(uuid.clone(), conn.clone());
+                                                }
+                                                log::info!(
+                                                    "QUIC 入站身份已确认: uuid={}, peer={}",
+                                                    uuid,
+                                                    peer
+                                                );
+                                                on_conn(uuid.clone(), peer.clone());
+                                                resolved = Some(uuid);
                                             }
-                                            log::info!(
-                                                "QUIC 入站身份已确认: uuid={}, peer={}",
-                                                uuid,
-                                                peer
+                                        }
+                                        if let Some(uuid) = resolved.as_ref() {
+                                            // 关键：on_frame 的下游可能同步调用 send()，
+                                            // 而 send() 内部走 block_on。若在 tokio 工作线程上直接执行，
+                                            // 会触发 "Cannot start a runtime from within a runtime" 而 panic。
+                                            // 故投递到固定分发池（不能每帧新建线程，会耗尽线程资源）。
+                                            let on_frame = on_frame.clone();
+                                            let uuid = uuid.clone();
+                                            let pool = dispatch_pool.clone();
+                                            pool.execute(move || {
+                                                on_frame(uuid, header, payload);
+                                            });
+                                        } else {
+                                            log::warn!(
+                                                "QUIC 入站帧无法确定设备身份, 已丢弃: header={}",
+                                                header
                                             );
-                                            on_conn(uuid.clone(), peer.clone());
-                                            resolved_uuid = Some(uuid);
                                         }
                                     }
-                                    if let Some(uuid) = resolved_uuid.as_ref() {
-                                        // 关键：on_frame 的下游可能同步调用 send()，
-                                        // 而 send() 内部走 block_on。若在 tokio 工作线程上直接执行，
-                                        // 会触发 "Cannot start a runtime from within a runtime" 而 panic。
-                                        // 故投递到固定分发池（不能每帧新建线程，会耗尽线程资源）。
-                                        let on_frame = on_frame.clone();
-                                        let uuid = uuid.clone();
-                                        let pool = dispatch_pool.clone();
-                                        pool.execute(move || {
-                                            on_frame(uuid, header, payload);
-                                        });
-                                    } else {
-                                        log::warn!(
-                                            "QUIC 入站帧无法确定设备身份, 已丢弃: header={}",
-                                            header
-                                        );
-                                    }
-                                }
+                                });
                             }
                             Err(e) => {
                                 log::debug!("QUIC 入站流接受结束: {}", e);
@@ -620,8 +634,10 @@ fn build_server_config(cert: &DerivedCert) -> Result<ServerConfig, QuicError> {
     Ok(cfg)
 }
 
-/// 空闲超时：明显大于心跳间隔，允许若干次心跳丢失仍不拆连接。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 空闲超时：对端进程消失（重启、被系统回收）时本机收不到任何 FIN，
+/// 该值决定僵尸连接被判死的时限。必须落在平台在线判定窗口内，
+/// 否则本机会一直往死连接发送，对端始终显示本机离线且不会重新拨号。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 保活间隔：QUIC 自身在无应用数据时发送 PING。
 ///
@@ -629,7 +645,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 心跳一旦超过 30s 未成功交付，连接就进入空闲并结束会话，
 /// 表现为设备在运行中逐渐掉线且需要重新握手。
 /// 这里显式开启保活，让长连接的维持不依赖应用层心跳是否恰好及时。
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
 
 /// 构造带保活与空闲超时的传输层配置（服务端与客户端共用同一套参数）。
 fn transport_with_keepalive() -> Arc<quinn::TransportConfig> {

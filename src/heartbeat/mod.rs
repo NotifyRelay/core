@@ -65,7 +65,10 @@ fn now_sec() -> i64 {
 
 /// 心跳发送器参数（可通过 FFI 更新）
 pub struct HeartbeatSenderParams {
-    pub uuid: Mutex<String>,
+    /// 目标设备 uuid：仅用于寻址传输层连接。
+    pub target_uuid: Mutex<String>,
+    /// 本机 uuid：写入心跳载荷，供对端识别来源。
+    pub local_uuid: Mutex<String>,
     pub name_b64: Mutex<String>,
     pub battery: AtomicI32,
     pub device_type: Mutex<String>,
@@ -89,9 +92,11 @@ pub const HEARTBEAT_MODE_TCP: i32 = 1;
 
 impl HeartbeatHandle {
     /// 启动心跳发送线程
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         ctx_ptr: usize,
-        uuid: &str,
+        local_uuid: &str,
+        target_uuid: &str,
         name: &str,
         battery: i32,
         device_type: &str,
@@ -104,7 +109,8 @@ impl HeartbeatHandle {
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
 
         let params = Arc::new(HeartbeatSenderParams {
-            uuid: Mutex::new(uuid.to_string()),
+            target_uuid: Mutex::new(target_uuid.to_string()),
+            local_uuid: Mutex::new(local_uuid.to_string()),
             name_b64: Mutex::new(name_b64),
             battery: AtomicI32::new(battery),
             device_type: Mutex::new(device_type.to_string()),
@@ -118,7 +124,6 @@ impl HeartbeatHandle {
         let spawned = thread::Builder::new()
             .name("heartbeat-sender".to_string())
             .spawn(move || {
-                log::error!("[HB] 发送线程进入");
                 let mut next_interval_ms = interval_ms;
 
                 loop {
@@ -126,7 +131,18 @@ impl HeartbeatHandle {
                         break;
                     }
 
-                    let uuid = p.uuid.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    let target_uuid = p
+                        .target_uuid
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    let local_uuid = p
+                        .local_uuid
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let name_b64 = p
                         .name_b64
                         .lock()
@@ -142,14 +158,15 @@ impl HeartbeatHandle {
                         .unwrap_or_default();
                     let port = codec::DEFAULT_TCP_PORT;
 
-                    if uuid.is_empty() {
+                    if target_uuid.is_empty() || local_uuid.is_empty() {
                         thread::sleep(Duration::from_millis(next_interval_ms));
                         continue;
                     }
 
-                    // QUIC 心跳：header 表类型，载荷为 JSON（与旧心跳解码器完全兼容）
+                    // 载荷携带**本机** uuid：对端据此识别来源设备。
+                    // 传输层寻址使用**目标** uuid，二者不可混用。
                     let hb = crate::protocol::binary_codec::HeartbeatPayload {
-                        uuid: uuid.clone(),
+                        uuid: local_uuid.clone(),
                         name: name_b64.clone(),
                         port,
                         battery,
@@ -158,7 +175,11 @@ impl HeartbeatHandle {
                     let payload = serde_json::to_string(&hb).unwrap_or_default();
                     let ip_str = p.ip.lock().ok().map(|g| g.clone()).unwrap_or_default();
                     let sent = match HeartbeatHandle::send_heartbeat(
-                        ctx_ptr, &uuid, &ip_str, &payload, port,
+                        ctx_ptr,
+                        &target_uuid,
+                        &ip_str,
+                        &payload,
+                        port,
                     ) {
                         Ok(v) => v,
                         Err(_) => {
@@ -167,7 +188,6 @@ impl HeartbeatHandle {
                         }
                     };
 
-                    log::error!("[HB] uuid={} sent={} next={}", uuid, sent, next_interval_ms);
                     if sent {
                         next_interval_ms = interval_ms;
                     } else {
@@ -251,11 +271,13 @@ impl HeartbeatHandle {
             .is_ok())
     }
 
-    /// 更新心跳参数（电池、名称、目标 IP 等）
-    pub fn update(&self, uuid: &str, name: &str, battery: i32, device_type: &str, ip: &str) {
-        if !uuid.is_empty() {
-            if let Ok(mut u) = self.params.uuid.lock() {
-                *u = uuid.to_string();
+    /// 更新心跳参数（本机身份、电池、名称、目标 IP 等）
+    ///
+    /// local_uuid 只影响载荷中的来源标识；目标设备由创建时的 target_uuid 固定。
+    pub fn update(&self, local_uuid: &str, name: &str, battery: i32, device_type: &str, ip: &str) {
+        if !local_uuid.is_empty() {
+            if let Ok(mut u) = self.params.local_uuid.lock() {
+                *u = local_uuid.to_string();
             }
         }
         if !name.is_empty() {
@@ -465,14 +487,6 @@ impl HeartbeatScheduler {
                             }
                         }
 
-                        log::error!(
-                            "[SCH] paired={} targets={} handles={} to_start={} local_uuid={}",
-                            paired.len(),
-                            targets.len(),
-                            handles.len(),
-                            to_start.len(),
-                            local_uuid
-                        );
                         guard.heartbeat_scheduler_handles = handles;
                     }
 
@@ -485,6 +499,7 @@ impl HeartbeatScheduler {
                             match HeartbeatHandle::start(
                                 ctx_ptr,
                                 &local_uuid,
+                                &uuid,
                                 &local_name,
                                 local_battery,
                                 &local_device_type,
