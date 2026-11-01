@@ -220,6 +220,11 @@ pub(crate) fn ensure_link(
         }
     }
     push(ip.to_string(), &mut candidates);
+    // 活跃连接的对端地址：对端主动连入时本机没有它的发现结果，
+    // 但该连接已证明地址可达，必须纳入候选，否则出现「收得到、发不出」的单向在线。
+    if let Some(peer_ip) = transport.peer_ip(uuid) {
+        push(peer_ip, &mut candidates);
+    }
 
     if candidates.is_empty() {
         log::debug!("建连失败: 无候选地址 uuid={}", uuid);

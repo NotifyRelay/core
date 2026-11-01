@@ -77,6 +77,13 @@ pub struct QuicTransport {
     /// 实测会累积数十个 quic-dispatch 线程直至耗尽线程资源。
     /// 故用固定大小线程池（有界队列）串行/并行消费。
     dispatch_pool: Arc<Mutex<Option<threadpool::ThreadPool>>>,
+    /// 新连接回调（由 start_server 写入）。
+    ///
+    /// 出站连接同样需要它：主动拨号建立的连接也必须启动流读取循环，
+    /// 否则拨号方永远收不到对端回发的消息。
+    on_conn_cb: Mutex<Option<Arc<dyn Fn(String, String) + Send + Sync>>>,
+    /// 收到完整应用层帧的回调（由 start_server 写入，出站连接复用）。
+    on_frame_cb: Mutex<Option<Arc<dyn Fn(String, String, Vec<u8>) + Send + Sync>>>,
 }
 
 impl QuicTransport {
@@ -107,6 +114,8 @@ impl QuicTransport {
             cert: Mutex::new(None),
             port: Mutex::new(0),
             dispatch_pool: Arc::new(Mutex::new(None)),
+            on_conn_cb: Mutex::new(None),
+            on_frame_cb: Mutex::new(None),
         })
     }
 
@@ -174,6 +183,10 @@ impl QuicTransport {
         let on_conn = Arc::new(on_conn);
         let on_frame = Arc::new(on_frame);
         let dispatch_pool = self.dispatch_pool();
+        // 出站连接同样需要回调：主动拨号建立的连接也要启动流读取循环，
+        // 否则拨号方永远收不到对端回发的消息。
+        *self.on_conn_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(on_conn.clone());
+        *self.on_frame_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(on_frame.clone());
         self.rt.spawn(async move {
             while let Some(incoming) = endpoint_clone.accept().await {
                 let conns = conns.clone();
@@ -219,73 +232,9 @@ impl QuicTransport {
                             .ok();
                     }
 
-                    // 持续接受对端打开的流，逐流解码应用层帧。
-                    //
-                    // 每条流必须独立并发处理：发送侧每条消息新开一条流，
-                    // 若在此串行 await 读取，一条流卡住会让后续消息全部堆积在
-                    // QUIC 接收队列里（实测 62 条心跳只收到 2 条）。
-                    loop {
-                        match conn.accept_bi().await {
-                            Ok((_send, mut recv)) => {
-                                let mut resolved = resolved_uuid.clone();
-                                let conns = conns.clone();
-                                let on_conn = on_conn.clone();
-                                let on_frame = on_frame.clone();
-                                let dispatch_pool = dispatch_pool.clone();
-                                let peer = peer.clone();
-                                let conn = conn.clone();
-                                tokio::spawn(async move {
-                                    let mut buf = Vec::new();
-                                    if let Ok(data) = recv.read_to_end(MAX_STREAM_LEN).await {
-                                        buf.extend_from_slice(&data);
-                                    }
-                                    let mut offset = 0usize;
-                                    while let Ok(Some((header, payload, used))) =
-                                        decode_frame(&buf[offset..])
-                                    {
-                                        offset += used;
-                                        // 首帧尚未解析出身份时，尝试从载荷中提取并对齐
-                                        if resolved.is_none() {
-                                            if let Some(uuid) = uuid_from_payload(&header, &payload)
-                                            {
-                                                if let Ok(mut map) = conns.lock() {
-                                                    map.insert(uuid.clone(), conn.clone());
-                                                }
-                                                log::info!(
-                                                    "QUIC 入站身份已确认: uuid={}, peer={}",
-                                                    uuid,
-                                                    peer
-                                                );
-                                                on_conn(uuid.clone(), peer.clone());
-                                                resolved = Some(uuid);
-                                            }
-                                        }
-                                        if let Some(uuid) = resolved.as_ref() {
-                                            // 关键：on_frame 的下游可能同步调用 send()，
-                                            // 而 send() 内部走 block_on。若在 tokio 工作线程上直接执行，
-                                            // 会触发 "Cannot start a runtime from within a runtime" 而 panic。
-                                            // 故投递到固定分发池（不能每帧新建线程，会耗尽线程资源）。
-                                            let on_frame = on_frame.clone();
-                                            let uuid = uuid.clone();
-                                            let pool = dispatch_pool.clone();
-                                            pool.execute(move || {
-                                                on_frame(uuid, header, payload);
-                                            });
-                                        } else {
-                                            log::warn!(
-                                                "QUIC 入站帧无法确定设备身份, 已丢弃: header={}",
-                                                header
-                                            );
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                log::debug!("QUIC 入站流接受结束: {}", e);
-                                break;
-                            }
-                        }
-                    }
+                    // 启动流读取循环（入站与出站连接共用同一实现）
+                    conn_reader_loop(conn, resolved_uuid, conns, on_conn, on_frame, dispatch_pool)
+                        .await;
                 });
             }
         });
@@ -387,10 +336,54 @@ impl QuicTransport {
             if canonical != uuid {
                 map.insert(uuid.to_string(), conn.clone());
             }
-            map.insert(canonical.clone(), conn);
+            map.insert(canonical.clone(), conn.clone());
         }
         log::info!("QUIC 长连接已建立 {} ({}:{})", canonical, ip, port);
+
+        // 出站连接必须同样启动流读取循环：QUIC 连接是双向的，
+        // 对端在这条连接上回发的消息只有本侧主动 accept_bi 才能读到。
+        // 缺失此步会导致「本机连得上、却收不到对端心跳」的单向在线。
+        let reader_conn = conn.clone();
+        let reader_uuid = Some(canonical.clone());
+        let reader_conns = self.conns.clone();
+        let on_conn = self
+            .on_conn_cb
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let on_frame = self
+            .on_frame_cb
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let dispatch_pool = self.dispatch_pool();
+        if let (Some(on_conn), Some(on_frame)) = (on_conn, on_frame) {
+            self.rt.spawn(async move {
+                conn_reader_loop(
+                    reader_conn,
+                    reader_uuid,
+                    reader_conns,
+                    on_conn,
+                    on_frame,
+                    dispatch_pool,
+                )
+                .await;
+            });
+        }
         Ok(())
+    }
+
+    /// 取指定设备活跃连接的对端 IP。
+    ///
+    /// 对端主动连入时本机没有它的发现结果，但连接本身已证明该地址可达，
+    /// 回发消息应据此补齐地址，否则会出现「收得到、发不出」的单向在线。
+    pub fn peer_ip(&self, uuid: &str) -> Option<String> {
+        let map = self.conns.lock().ok()?;
+        let conn = map.get(uuid)?;
+        if conn.close_reason().is_some() {
+            return None;
+        }
+        Some(conn.remote_address().ip().to_string())
     }
 
     /// 是否已连接指定设备。
@@ -530,6 +523,80 @@ impl QuicTransport {
 impl Drop for QuicTransport {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// 连接级流读取循环：持续接受对端打开的流并解码应用层帧。
+///
+/// 入站连接与出站连接共用本实现。QUIC 连接是双向的，
+/// 任何一侧若不主动 accept_bi，对端在该连接上发来的数据都不会被读取；
+/// 只给入站连接挂读取循环，会导致「主动拨号方收不到回复」的单向在线。
+///
+/// 每条流独立并发处理：发送侧每条消息新开一条流，
+/// 若串行 await 读取，一条流卡住会让后续消息全部堆积在 QUIC 接收队列里。
+async fn conn_reader_loop<F, G>(
+    conn: Connection,
+    resolved_uuid: Option<String>,
+    conns: Arc<Mutex<HashMap<String, Connection>>>,
+    on_conn: Arc<F>,
+    on_frame: Arc<G>,
+    dispatch_pool: threadpool::ThreadPool,
+) where
+    F: Fn(String, String) + Send + Sync + 'static + ?Sized,
+    G: Fn(String, String, Vec<u8>) + Send + Sync + 'static + ?Sized,
+{
+    let peer = conn.remote_address().to_string();
+    loop {
+        match conn.accept_bi().await {
+            Ok((_send, mut recv)) => {
+                let mut resolved = resolved_uuid.clone();
+                let conns = conns.clone();
+                let on_conn = on_conn.clone();
+                let on_frame = on_frame.clone();
+                let dispatch_pool = dispatch_pool.clone();
+                let peer = peer.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    if let Ok(data) = recv.read_to_end(MAX_STREAM_LEN).await {
+                        buf.extend_from_slice(&data);
+                    }
+                    let mut offset = 0usize;
+                    while let Ok(Some((header, payload, used))) = decode_frame(&buf[offset..]) {
+                        offset += used;
+                        // 首帧尚未解析出身份时，尝试从载荷中提取并对齐
+                        if resolved.is_none() {
+                            if let Some(uuid) = uuid_from_payload(&header, &payload) {
+                                if let Ok(mut map) = conns.lock() {
+                                    map.insert(uuid.clone(), conn.clone());
+                                }
+                                log::info!("QUIC 入站身份已确认: uuid={}, peer={}", uuid, peer);
+                                on_conn(uuid.clone(), peer.clone());
+                                resolved = Some(uuid);
+                            }
+                        }
+                        if let Some(uuid) = resolved.as_ref() {
+                            // 关键：on_frame 的下游可能同步调用 send()，
+                            // 而 send() 内部走 block_on。若在 tokio 工作线程上直接执行，
+                            // 会触发 "Cannot start a runtime from within a runtime" 而 panic。
+                            // 故投递到固定分发池（不能每帧新建线程，会耗尽线程资源）。
+                            let on_frame = on_frame.clone();
+                            let uuid = uuid.clone();
+                            let pool = dispatch_pool.clone();
+                            pool.execute(move || {
+                                on_frame(uuid, header, payload);
+                            });
+                        } else {
+                            log::warn!("QUIC 入站帧无法确定设备身份, 已丢弃: header={}", header);
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                log::debug!("QUIC 连接流接受结束: {}", e);
+                break;
+            }
+        }
     }
 }
 
