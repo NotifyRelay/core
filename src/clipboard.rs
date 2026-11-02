@@ -199,11 +199,15 @@ pub fn on_changed_for(
     now_ms: i64,
     force: bool,
 ) -> String {
-    let targets: Vec<String> = serde_json::from_str::<Vec<String>>(targets_json)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|u| !u.is_empty())
-        .collect();
+    // 目标列表由平台拼装：解析失败与"没有目标"是两回事，静默当成空列表会让发送
+    // 永远不发生且不留线索（平台手拼 JSON 出错时就是这样）。
+    let targets: Vec<String> = match serde_json::from_str::<Vec<String>>(targets_json) {
+        Ok(list) => list.into_iter().filter(|u| !u.is_empty()).collect(),
+        Err(e) => {
+            log::warn!("剪贴板目标列表 JSON 无效: {e}");
+            return skipped("目标列表解析失败");
+        }
+    };
     if targets.is_empty() {
         return skipped("no targets");
     }
@@ -299,6 +303,26 @@ mod tests {
         // 平台回读图片时重编码，内容与线上 Base64 不同
         let result = on_changed(&mut state, &q, &targets, "image/png", "B1", 1000, false);
         assert!(result.contains("内容来自远程"));
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_on_changed_for_reports_malformed_targets() {
+        // 平台手拼 JSON 出错时必须留下可观察原因，而不是静默按"没有目标"处理
+        let ctx = crate::SafeContext::new(crate::CoreContext::new());
+        let ctx_ptr = &ctx as *const crate::SafeContext as usize;
+        let q = queue();
+        let queue_handle = crate::ffi::handle::put(&q as *const _ as *mut std::os::raw::c_void);
+        let result = on_changed_for(
+            ctx_ptr,
+            queue_handle,
+            "[ + it.uuid + ]",
+            "text/plain",
+            "hello",
+            1000,
+            false,
+        );
+        assert!(result.contains("目标列表解析失败"), "unexpected: {result}");
         assert_eq!(q.pending_count(), 0);
     }
 
