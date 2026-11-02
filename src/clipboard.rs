@@ -47,17 +47,21 @@ fn normalize_type(mime: &str) -> &str {
     }
 }
 
-/// 归一化内容：data URL（data:image/...;base64,xxx）提取纯 base64 部分
+/// 归一化内容：data URL（data:image/...;base64,xxx）提取纯 base64 部分，换行统一为 LF。
+///
+/// 换行归一必须与平台写入系统剪贴板的形态同口径：防循环以内容相等为前提，
+/// 平台回读的内容（已归一到 LF）才能与接收时登记的值比较。
 fn normalize_content(content: &str) -> String {
     let lower = content.to_lowercase();
-    if lower.starts_with("data:image/") && content.contains(',') {
+    let extracted = if lower.starts_with("data:image/") && content.contains(',') {
         content
             .split_once(',')
             .map(|(_, rest)| rest.to_string())
             .unwrap_or_else(|| content.to_string())
     } else {
         content.to_string()
-    }
+    };
+    extracted.replace("\r\n", "\n")
 }
 
 /// 估算 base64 解码后的字节长度
@@ -69,6 +73,7 @@ fn decoded_len(b64: &str) -> usize {
 /// 平台检测到剪贴板变化时调用。
 /// Rust 内部完成类型归一化、内容未变跳过、防循环、频率限制与 2MB 阈值判定，
 /// 通过后直接构造 DATA_CLIPBOARD 报文按 targets 逐个入队发送。
+/// 平台不持有任何同步状态：本机复制与远端回灌的区分全部在此完成。
 /// 返回 JSON：{"action": "sent"|"skipped"|"file_transfer", "reason": "..."}
 pub fn on_changed(
     state: &mut ClipboardState,
@@ -86,12 +91,16 @@ pub fn on_changed(
         return skipped("内容为空");
     }
 
-    // 防循环：内容与最近一次从远程接收的一致且在窗口内
-    if !state.last_received_content.is_empty()
-        && state.last_received_type == ctype
-        && state.last_received_content == ccontent
-        && now - state.last_received_time < ANTI_LOOP_DELAY_MS
-    {
+    // 防循环：最近一次从远程接收的内容在窗口内被平台写回剪贴板又回读出来。
+    // 内容按归一化后的口径比较，不要求类型一致：安卓把接收到的图片以 data URL 文本写回剪贴板
+    // （归一化去掉前缀），回读类型是 text 而登记类型是 image，限定类型会漏判。
+    // 图片还有平台重编码的情形（剪贴板形态与线上 Base64 不同），内容不可比，退回类型与窗口判定。
+    // 未接收过任何内容时 last_received_content 为空，内容分支不命中。
+    let within_window = now - state.last_received_time < ANTI_LOOP_DELAY_MS;
+    let same_content =
+        !state.last_received_content.is_empty() && state.last_received_content == ccontent;
+    let reencoded_image = state.last_received_type == "image" && ctype == "image";
+    if within_window && (same_content || reencoded_image) {
         return skipped("内容来自远程，跳过发送");
     }
 
@@ -243,6 +252,105 @@ mod tests {
     fn test_normalize_content_data_url() {
         assert_eq!(normalize_content("data:image/png;base64,ABC="), "ABC=");
         assert_eq!(normalize_content("hello"), "hello");
+    }
+
+    #[test]
+    fn test_normalize_content_newlines() {
+        assert_eq!(normalize_content("a\r\nb"), "a\nb");
+        assert_eq!(normalize_content("a\rb"), "a\rb");
+        assert_eq!(normalize_content("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn test_on_received_canonicalizes_newlines() {
+        let mut state = ClipboardState::new();
+        let result = on_received(
+            &mut state,
+            r#"{"clipboardType":"text/plain","content":"a\r\nb","time":1000}"#,
+            2000,
+        );
+        assert!(result.contains(r#""content":"a\nb""#));
+        assert_eq!(state.last_received_content, "a\nb");
+    }
+
+    #[test]
+    fn test_on_changed_skips_loop_for_crlf_receive() {
+        let mut state = ClipboardState::new();
+        let _ = on_received(
+            &mut state,
+            r#"{"clipboardType":"text/plain","content":"a\r\nb","time":1000}"#,
+            1000,
+        );
+        let q = queue();
+        let targets = vec!["dev1".to_string()];
+        let result = on_changed(&mut state, &q, &targets, "text/plain", "a\nb", 1200, false);
+        assert!(result.contains("skipped"));
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_on_changed_skips_image_loop_within_window() {
+        let mut state = ClipboardState::new();
+        state.last_received_content = "B0".to_string();
+        state.last_received_type = "image".to_string();
+        state.last_received_time = 900;
+        let q = queue();
+        let targets = vec!["dev1".to_string()];
+        // 平台回读图片时重编码，内容与线上 Base64 不同
+        let result = on_changed(&mut state, &q, &targets, "image/png", "B1", 1000, false);
+        assert!(result.contains("内容来自远程"));
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_on_changed_skips_data_url_writeback_as_text() {
+        // 安卓收到图片后把 data URL 文本写回剪贴板，Fcitx5 广播回来时类型已是 text
+        let mut state = ClipboardState::new();
+        let _ = on_received(
+            &mut state,
+            r#"{"clipboardType":"image/png","content":"AAA=","time":1000}"#,
+            1000,
+        );
+        let q = queue();
+        let targets = vec!["dev1".to_string()];
+        let result = on_changed(
+            &mut state,
+            &q,
+            &targets,
+            "text/plain",
+            "data:image/png;base64,AAA=",
+            1200,
+            false,
+        );
+        assert!(result.contains("内容来自远程"));
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_on_changed_skips_loop_for_same_content_across_types() {
+        // 内容相等即判定为回灌，不再要求类型相等
+        let mut state = ClipboardState::new();
+        state.last_received_content = "hello".to_string();
+        state.last_received_type = "text".to_string();
+        state.last_received_time = 900;
+        let q = queue();
+        let targets = vec!["dev1".to_string()];
+        let result = on_changed(&mut state, &q, &targets, "text/html", "hello", 1000, false);
+        assert!(result.contains("内容来自远程"));
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_on_changed_sends_image_after_window() {
+        let mut state = ClipboardState::new();
+        state.last_received_content = "B0".to_string();
+        state.last_received_type = "image".to_string();
+        state.last_received_time = 1000;
+        let q = queue();
+        let targets = vec!["dev1".to_string()];
+        let result = on_changed(&mut state, &q, &targets, "image/png", "B1", 2001, false);
+        assert_eq!(result, r#"{"action":"sent"}"#);
+        assert_eq!(q.pending_count(), 1);
     }
 
     #[test]
