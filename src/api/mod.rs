@@ -58,6 +58,22 @@ impl Core {
     pub fn crate_version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
     }
+
+    /// 请求关停本核心实例。
+    ///
+    /// 只置位全局关停信号，不获取上下文锁、不等待任何线程：
+    /// 调用在上下文锁被阻塞占用时依然立即返回，用于从中枢卡死中恢复。
+    /// 恢复正常工作需由平台侧重新创建核心实例。
+    pub fn request_shutdown(&self) {
+        if crate::lifecycle::request_shutdown() {
+            log::warn!("核心: 已请求关停");
+        }
+    }
+
+    /// 是否已请求关停。
+    pub fn is_shutdown_requested(&self) -> bool {
+        crate::lifecycle::is_shutdown_requested()
+    }
 }
 
 /// ABI 探针：返回核心库 crate 版本。

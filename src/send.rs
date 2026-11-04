@@ -13,18 +13,23 @@ use crate::utils::encode_name_b64;
 use crate::{
     crypto::{aes, hkdf, spake2},
     protocol::{codec, header::MessageType},
-    BroadcastHandle, BroadcastInfo, CoreContext, SafeContext,
+    quic, BroadcastHandle, BroadcastInfo, CoreContext, SafeContext,
 };
+
+/// 取传输层句柄。
+///
+/// 传输层句柄以 `Arc` 共享，锁内只做一次克隆；调用方必须在**释放上下文锁之后**
+/// 才发起收发。发送与拨号都会阻塞在 tokio 运行时上，持锁进行会让同一把锁上的
+/// 其他线程（含 tokio 工作线程触发的入站回调）永久等待，形成全局死锁。
+pub(crate) fn transport_handle(ctx: &SafeContext) -> Option<Arc<quic::QuicTransport>> {
+    ctx.lock().ok().and_then(|guard| guard.quic.clone())
+}
 
 /// 通过已建立的会话发送一条「header + 明文」消息（QUIC 承载，加密由 TLS 1.3 负责）。
 ///
 /// 这是全仓唯一的出站入口：旧 TCP 帧（含 AES-GCM 密文）已随传输层切换废弃。
 pub(crate) fn send_via_quic(ctx: &SafeContext, uuid: &str, header: &str, plaintext: &str) -> bool {
-    // 在锁内调用：QUIC 发送内部只做流写入，不回调平台，故不会重入 core
-    let Ok(guard) = ctx.lock() else {
-        return false;
-    };
-    let Some(transport) = guard.quic.as_ref() else {
+    let Some(transport) = transport_handle(ctx) else {
         log::warn!(
             "发送失败: QUIC 传输层未启动 uuid={}, header={}",
             uuid,
@@ -42,15 +47,14 @@ pub(crate) fn send_via_quic(ctx: &SafeContext, uuid: &str, header: &str, plainte
 }
 
 /// 通过已建立的会话发送一条控制帧（header + 明文）。
-pub(crate) fn do_send_control(ctx: &CoreContext, uuid: &str, header: &str, payload: &str) -> bool {
-    let Some(transport) = ctx.quic.as_ref() else {
-        log::warn!(
-            "发送失败: QUIC 传输层未就绪 uuid={}, header={}",
-            uuid,
-            header
-        );
-        return false;
-    };
+///
+/// 调用方须持有传输层句柄而非上下文锁。
+pub(crate) fn send_control_via(
+    transport: &Arc<quic::QuicTransport>,
+    uuid: &str,
+    header: &str,
+    payload: &str,
+) -> bool {
     match transport.send(uuid, header, payload.as_bytes()) {
         Ok(()) => true,
         Err(e) => {
@@ -99,10 +103,15 @@ pub fn send_handshake(
     let port = crate::protocol::codec::DEFAULT_TCP_PORT;
     let payload = codec::handshake_payload(uuid, local_ip, battery, device_type);
 
-    // 优先走已建立会话
-    let sent = match ctx.lock() {
-        Ok(guard) => do_send_control(&guard, uuid, crate::processing::CTRL_HANDSHAKE, &payload),
-        Err(_) => false,
+    // 优先走已建立会话（句柄在锁内取，发送在锁外进行）
+    let sent = match transport_handle(ctx) {
+        Some(transport) => send_control_via(
+            &transport,
+            uuid,
+            crate::processing::CTRL_HANDSHAKE,
+            &payload,
+        ),
+        None => false,
     };
     if sent {
         return 0;
@@ -418,14 +427,14 @@ pub fn send_pairing_resp(
         return -1;
     }
 
-    let sent = match ctx.lock() {
-        Ok(guard) => do_send_control(
-            &guard,
+    let sent = match transport_handle(ctx) {
+        Some(transport) => send_control_via(
+            &transport,
             &target_uuid,
             crate::processing::CTRL_PAIRING_RESP,
             &msg,
         ),
-        Err(_) => false,
+        None => false,
     };
     if !sent {
         log::warn!("发送 PAIRING_RESP 失败 target={}", target_uuid);
@@ -442,21 +451,30 @@ pub fn send_accept(
     _battery: i32,
     _device_type: &str,
 ) {
-    let Ok(guard) = ctx.lock() else {
-        return;
+    let (local_uuid, transport) = {
+        let Ok(guard) = ctx.lock() else {
+            return;
+        };
+        (
+            guard
+                .broadcast_info
+                .as_ref()
+                .map(|info| info.uuid.clone())
+                .unwrap_or_default(),
+            guard.quic.clone(),
+        )
     };
-    let local_uuid = guard
-        .broadcast_info
-        .as_ref()
-        .map(|info| info.uuid.clone())
-        .unwrap_or_default();
     if local_uuid.is_empty() {
         log::warn!("send_accept: 本机 uuid 未设置（broadcast_info 为空），跳过发送 ACCEPT");
         return;
     }
+    let Some(transport) = transport else {
+        log::warn!("send_accept: QUIC 传输层未就绪，跳过发送 ACCEPT");
+        return;
+    };
     let payload = codec::accept_payload(&local_uuid, lt_pub_key);
-    let sent = do_send_control(
-        &guard,
+    let sent = send_control_via(
+        &transport,
         target_uuid,
         crate::processing::CTRL_ACCEPT,
         &payload,
@@ -469,12 +487,18 @@ pub fn send_accept(
 /// 发送 REJECT 并清理该对端的配对会话。
 pub fn send_reject(ctx: &SafeContext, uuid: &str) {
     let payload = codec::reject_payload(uuid);
-    let sent = match ctx.lock() {
+    let transport = match ctx.lock() {
         Ok(mut guard) => {
             guard.pairing_sessions.remove(uuid);
-            do_send_control(&guard, uuid, crate::processing::CTRL_REJECT, &payload)
+            guard.quic.clone()
         }
-        Err(_) => false,
+        Err(_) => None,
+    };
+    let sent = match transport {
+        Some(transport) => {
+            send_control_via(&transport, uuid, crate::processing::CTRL_REJECT, &payload)
+        }
+        None => false,
     };
     if !sent {
         log::warn!("send_reject: 发送 REJECT 失败 uuid={}", uuid);
@@ -680,26 +704,33 @@ pub fn periodic_broadcast(
             }
         }
         2 => {
-            let Ok(mut guard) = ctx.lock() else {
-                return -1;
+            let mdns_target = {
+                let Ok(mut guard) = ctx.lock() else {
+                    return -1;
+                };
+                if let Some(ref mut info) = guard.broadcast_info {
+                    if let Some(uuid) = uuid {
+                        info.uuid = uuid.to_string();
+                    }
+                    if let Some(name) = name {
+                        info.name_b64 = encode_name_b64(name);
+                    }
+                    // 负数表示放电，是有效状态；仅超出 [-100,100] 才视为未知
+                    if battery.abs() <= 100 {
+                        info.battery = battery;
+                    }
+                    if let Some(device_type) = device_type {
+                        info.device_type = device_type.to_string();
+                    }
+                }
+                guard.mdns_battery_target()
             };
-            if let Some(ref mut info) = guard.broadcast_info {
-                if let Some(uuid) = uuid {
-                    info.uuid = uuid.to_string();
-                }
-                if let Some(name) = name {
-                    info.name_b64 = encode_name_b64(name);
-                }
-                // 负数表示放电，是有效状态；仅超出 [-100,100] 才视为未知
-                if battery.abs() <= 100 {
-                    info.battery = battery;
-                }
-                if let Some(device_type) = device_type {
-                    info.device_type = device_type.to_string();
+            // 电量/名称/类型变化同步到 mDNS TXT 记录（锁外，避免阻塞 daemon 拖住上下文锁）
+            if let Some((mdns, battery)) = mdns_target {
+                if let Ok(mut guard) = mdns.lock() {
+                    guard.update_battery(battery);
                 }
             }
-            // 电量/名称/类型变化同步到 mDNS TXT 记录
-            guard.refresh_mdns_battery();
             0
         }
         _ => -1,

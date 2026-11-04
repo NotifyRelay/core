@@ -1008,6 +1008,10 @@ pub fn handle_state_message(
 pub fn start_heartbeat_thread(ctx_ptr: usize) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
+        if crate::lifecycle::is_shutdown_requested() {
+            log::warn!("状态合并: 收到关停请求，心跳线程退出");
+            return;
+        }
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
         let now = Instant::now();
         let (cb, queries) = {

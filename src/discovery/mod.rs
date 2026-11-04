@@ -127,7 +127,8 @@ impl DiscoveryState {
             .name("discovery-scanner".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested()
+                    {
                         break;
                     }
 
@@ -157,23 +158,32 @@ impl DiscoveryState {
                     // 是否存在未连接（需扫描握手）的设备：有则保持短周期，无则降频
                     let mut has_offline = false;
 
+                    // 本机身份每轮只取一次：逐设备重复取锁既无必要，也把锁持有次数放大到设备数倍。
+                    let (local_uuid, local_battery, local_dt) = {
+                        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                        match ctx.lock() {
+                            Ok(guard) => {
+                                let bi = guard.broadcast_info.as_ref();
+                                (
+                                    bi.map(|i| i.uuid.clone()).unwrap_or_default(),
+                                    bi.map(|i| i.battery).unwrap_or(0),
+                                    bi.map(|i| i.device_type.clone()).unwrap_or_default(),
+                                )
+                            }
+                            Err(_) => (String::new(), 0, String::new()),
+                        }
+                    };
+                    let local_ip = crate::utils::get_local_ip();
+
                     for (uuid, ip) in known_list {
                         // 跳过本机自身（已知设备中不应包含本机）
-                        let is_self = {
-                            // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
-                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                            ctx.lock()
-                                .ok()
-                                .and_then(|g| g.broadcast_info.as_ref().map(|b| b.uuid == uuid))
-                                .unwrap_or(false)
-                        };
+                        let is_self = !local_uuid.is_empty() && local_uuid == uuid;
                         if is_self {
                             continue;
                         }
 
                         // 在线判定：最近收到过对方心跳（last_seen 在窗口内）即视为已连接。
-                        // 不依赖 TCP 会话：协议连接均为短连接（session 随连接关闭立即移除），
-                        // 用 tcp.is_connected 判定会永远失败，导致每轮扫描无限重复握手。
+                        // 不依赖 TCP 会话：session 随连接关闭立即移除，用它判定会永远失败。
                         let connected = {
                             let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
                             match ctx.lock() {
@@ -191,29 +201,12 @@ impl DiscoveryState {
                         has_offline = true;
 
                         // 尝试握手建立连接（携带本机真实电量，避免 -1 被对端当作真实电量覆盖显示）
-                        let (local_uuid, local_battery, local_ip) = {
-                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                            let Ok(guard) = ctx.lock() else {
-                                continue;
-                            };
-                            let bi = guard.broadcast_info.as_ref();
-                            (
-                                bi.map(|i| i.uuid.clone()).unwrap_or_default(),
-                                bi.map(|i| i.battery).unwrap_or(0),
-                                crate::utils::get_local_ip(),
-                            )
-                        };
-                        let dt = {
-                            let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                            ctx.lock()
-                                .ok()
-                                .and_then(|g| {
-                                    g.broadcast_info.as_ref().map(|i| i.device_type.clone())
-                                })
-                                .unwrap_or_default()
-                        };
-                        let handshake =
-                            codec::handshake_payload(&local_uuid, &local_ip, local_battery, &dt);
+                        let handshake = codec::handshake_payload(
+                            &local_uuid,
+                            &local_ip,
+                            local_battery,
+                            &local_dt,
+                        );
 
                         let resp = network::request_response_over_quic(
                             ctx_ptr,

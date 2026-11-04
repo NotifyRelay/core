@@ -97,11 +97,44 @@ impl ReconnectState {
             .name("reconnect".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested()
+                    {
                         break;
                     }
 
                     let mut to_reconnect: Vec<(String, String)> = Vec::new();
+
+                    // 先取上下文侧的本机身份与在线集合，再进入重连状态锁。
+                    //
+                    // 锁序必须恒为 ctx → inner：remove_target / add_target 由 FFI 线程以
+                    // ctx 锁为先进入本状态，反向取锁会与它们构成 ABBA 死锁。
+                    let (self_uuid, online) = {
+                        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                        match ctx.lock() {
+                            Ok(guard) => {
+                                let self_uuid = guard
+                                    .broadcast_info
+                                    .as_ref()
+                                    .map(|b| b.uuid.clone())
+                                    .unwrap_or_default();
+                                let online: Vec<String> = guard
+                                    .heartbeat
+                                    .last_seen
+                                    .iter()
+                                    .filter(|(uuid, ts)| {
+                                        crate::device_registry::now_sec()
+                                            .saturating_sub(**ts)
+                                            <= RECENT_SEEN_SECS
+                                        // uuid 仅用于下方筛选，保留完整集合以免每轮重复取锁
+                                        && !uuid.is_empty()
+                                    })
+                                    .map(|(uuid, _)| uuid.clone())
+                                    .collect();
+                                (self_uuid, online)
+                            }
+                            Err(_) => (String::new(), Vec::new()),
+                        }
+                    };
 
                     let mut to_remove: Vec<String> = Vec::new();
                     if let Ok(mut guard) = inner.lock() {
@@ -110,36 +143,16 @@ impl ReconnectState {
 
                         for uuid in &uuids {
                             // 跳过本机自身（重连目标中不应包含本机）
-                            let is_self = {
-                                // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
-                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                                ctx.lock()
-                                    .ok()
-                                    .and_then(|g| {
-                                        g.broadcast_info.as_ref().map(|b| b.uuid == *uuid)
-                                    })
-                                    .unwrap_or(false)
-                            };
+                            let is_self = !self_uuid.is_empty() && self_uuid == *uuid;
                             if is_self {
                                 guard.attempt_counts.remove(uuid);
                                 to_remove.push(uuid.clone());
                                 continue;
                             }
 
-                            // 在线判定：最近收到过对方心跳（last_seen 在窗口内）即视为已连接。
-                            // 不依赖 TCP 会话：协议连接均为短连接（session 随连接关闭立即移除），
-                            // 用 tcp.is_connected 判定会永远失败，导致无限重复握手。
-                            let connected = {
-                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                                match ctx.lock() {
-                                    Ok(guard) => {
-                                        guard.heartbeat.is_recently_seen(uuid, RECENT_SEEN_SECS)
-                                    }
-                                    Err(_) => false,
-                                }
-                            };
-
-                            if connected {
+                            // 在线判定：最近收到过对方心跳即视为已连接。
+                            // 不依赖 TCP 会话：session 随连接关闭立即移除，用它判定会永远失败。
+                            if online.iter().any(|u| u == uuid) {
                                 guard.attempt_counts.remove(uuid);
                                 to_remove.push(uuid.clone());
                                 continue;

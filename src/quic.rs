@@ -30,6 +30,15 @@ const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// 单条 QUIC 流最大读取字节数（一条流承载一个或多个完整帧）。
 const MAX_STREAM_LEN: usize = 32 * 1024 * 1024;
 
+/// 单次发送的等待上限。
+///
+/// 对端进程被强杀时不会发 FIN，流控额度耗尽的连接同样不会自行推进；
+/// 缺少上限会让 `block_on` 永久挂起，进而拖住调用方持有的上层锁。
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单次拨号握手的等待上限（含 TLS 双向认证）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 连接级错误。
 #[derive(Debug)]
 pub enum QuicError {
@@ -320,9 +329,13 @@ impl QuicTransport {
             let connecting = endpoint
                 .connect(addr, "notifyrelay")
                 .map_err(|e| QuicError::Connect(format!("发起连接失败: {e}")))?;
-            connecting
-                .await
-                .map_err(|e| QuicError::Connect(format!("QUIC 握手失败: {e}")))
+            match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+                Ok(r) => r.map_err(|e| QuicError::Connect(format!("QUIC 握手失败: {e}"))),
+                Err(_) => Err(QuicError::Connect(format!(
+                    "QUIC 握手超时 {}:{port}",
+                    addr.ip()
+                ))),
+            }
         })?;
 
         // 以对端证书 uuid 作为规范键（与入站侧一致），调用方 uuid 作别名
@@ -458,16 +471,22 @@ impl QuicTransport {
 
         let frame = encode_frame(header, payload)?;
         self.rt.block_on(async {
-            let (mut send, _recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| QuicError::Io(format!("打开流失败: {e}")))?;
-            send.write_all(&frame)
-                .await
-                .map_err(|e| QuicError::Io(format!("写入流失败: {e}")))?;
-            send.finish()
-                .map_err(|e| QuicError::Io(format!("关闭发送侧失败: {e}")))?;
-            Ok(())
+            let write_all = async {
+                let (mut send, _recv) = conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| QuicError::Io(format!("打开流失败: {e}")))?;
+                send.write_all(&frame)
+                    .await
+                    .map_err(|e| QuicError::Io(format!("写入流失败: {e}")))?;
+                send.finish()
+                    .map_err(|e| QuicError::Io(format!("关闭发送侧失败: {e}")))?;
+                Ok(())
+            };
+            match tokio::time::timeout(SEND_TIMEOUT, write_all).await {
+                Ok(r) => r,
+                Err(_) => Err(QuicError::Io("发送超时".to_string())),
+            }
         })
     }
 

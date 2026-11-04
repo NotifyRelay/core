@@ -7,6 +7,19 @@ use std::time::{Duration, Instant};
 use crate::protocol::codec;
 use crate::SafeContext;
 
+/// 单次发送结果。
+///
+/// 区分「设备离线」与「已连接但发送失败」：前者是正常状态，
+/// 只记信息级日志并按退避重试；后者才是需要告警的故障。
+enum SendOutcome {
+    /// 已交付传输层
+    Sent,
+    /// 设备离线或地址不可用，本次未发送
+    Offline,
+    /// 设备可用但发送失败
+    Failed,
+}
+
 /// 消息发送项（IP 由 Rust 内部分配，不依赖平台端传入）
 pub struct SendItem {
     pub device_uuid: String,
@@ -299,7 +312,8 @@ impl SenderQueue {
             .name("sender-queue".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested()
+                    {
                         break;
                     }
 
@@ -415,7 +429,7 @@ impl SenderQueue {
         inner: &Arc<Mutex<SenderQueueInner>>,
         orphan: &Arc<Mutex<Vec<String>>>,
     ) {
-        let send_ok = match Self::try_send(ctx_ptr, item) {
+        let outcome = match Self::try_send(ctx_ptr, item) {
             Ok(v) => v,
             Err(_) => {
                 // 取锁失败使该项未发送即被丢弃：登记其去重键待补清理
@@ -428,7 +442,7 @@ impl SenderQueue {
 
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
 
-        if send_ok {
+        if let SendOutcome::Sent = outcome {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
                     // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
@@ -450,7 +464,8 @@ impl SenderQueue {
             return;
         }
 
-        // 发送失败：设置递增冷却，避免对不可达设备反复握手占用并发槽位
+        // 未送达：设置递增冷却，避免对不可达设备反复握手占用并发槽位。
+        // 设备离线属于正常状态，失败计数只用于退避节奏，不产生告警。
         if let Ok(mut guard) = inner.lock() {
             let streak = {
                 let entry = guard
@@ -504,6 +519,12 @@ impl SenderQueue {
                     item.device_uuid,
                     item.header
                 );
+            } else if let SendOutcome::Offline = outcome {
+                log::info!(
+                    "发送队列: 设备离线，放弃本次送达 uuid={}, header={}",
+                    item.device_uuid,
+                    item.header
+                );
             } else {
                 log::warn!(
                     "发送队列: 发送失败已达最大重试 uuid={}, header={}",
@@ -516,11 +537,12 @@ impl SenderQueue {
 
     /// 发送单项：走 QUIC 会话（header + 明文，加密由 TLS 1.3 承担）。
     ///
-    /// 返回 `Ok(true)` 表示已交付传输层；`Ok(false)` 表示明确失败（可重试/弃置）；
-    /// `Err(())` 表示上下文取锁失败（不可判定，交由调用方按失败处理）。
-    fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
+    /// 上下文锁只用于取句柄与在线判定；发送与拨号在锁外执行。
+    /// 发送与拨号都会阻塞在 tokio 运行时上，持锁进行会让同一把锁上的
+    /// 其他线程（含入站回调）永久等待。
+    fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<SendOutcome, ()> {
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        let (local_uuid, transport, ip) = {
+        let (local_uuid, transport, ip, online) = {
             let Ok(guard) = ctx.lock() else {
                 return Err(());
             };
@@ -529,60 +551,69 @@ impl SenderQueue {
                 .as_ref()
                 .map(|i| i.uuid.clone())
                 .unwrap_or_default();
-            // QuicTransport 不实现 Clone：取其内部可共享句柄需借用，
-            // 故这里只做存在性判断，真正发送在锁外通过 send_via_quic 完成
-            let ready = guard.quic.is_some();
+            let online = guard
+                .heartbeat
+                .is_recently_seen(&item.device_uuid, crate::heartbeat::ONLINE_WINDOW_SECS);
             let ip = guard
                 .device_ips
                 .lock()
                 .ok()
                 .and_then(|ips| ips.get(&item.device_uuid).cloned())
                 .unwrap_or_default();
-            (uuid, ready, ip)
+            (uuid, guard.quic.clone(), ip, online)
         };
 
         if !local_uuid.is_empty() && item.device_uuid == local_uuid {
             log::warn!("发送队列: 跳过向自身发送 uuid={}", item.device_uuid);
-            return Ok(false);
+            return Ok(SendOutcome::Failed);
         }
 
-        if transport {
-            // 已有 QUIC 会话：直接发送
-            if crate::send::send_via_quic(ctx, &item.device_uuid, &item.header, &item.plaintext) {
-                return Ok(true);
-            }
+        let Some(transport) = transport else {
+            log::info!(
+                "发送队列: 传输层未就绪，暂不发送 uuid={}, header={}",
+                item.device_uuid,
+                item.header
+            );
+            return Ok(SendOutcome::Offline);
+        };
+
+        // 在线：直接发送；失败说明会话已不可用，转入重连判定
+        if online
+            && transport
+                .send(&item.device_uuid, &item.header, item.plaintext.as_bytes())
+                .is_ok()
+        {
+            return Ok(SendOutcome::Sent);
         }
 
-        // 无会话：尝试按已知 IP 主动建立 QUIC 连接后再发
+        // 离线或会话失效：按已知 IP 重连一次再发。
+        // 设备离线是常态，不作为故障上报。
         let ip = crate::utils::normalize_ip(&ip);
         if ip.is_empty() || ip == "0.0.0.0" {
-            log::warn!("发送队列: 无有效IP且无会话 uuid={}", item.device_uuid);
-            return Ok(false);
+            log::info!(
+                "发送队列: 无有效地址，暂不发送 uuid={}, header={}",
+                item.device_uuid,
+                item.header
+            );
+            return Ok(SendOutcome::Offline);
         }
         let port = codec::DEFAULT_TCP_PORT;
-        let connected = {
-            let Ok(guard) = ctx.lock() else {
-                return Err(());
-            };
-            match guard.quic.as_ref() {
-                Some(t) => t.connect(&item.device_uuid, &ip, port, None).is_ok(),
-                None => false,
-            }
-        };
-        if !connected {
-            log::debug!(
-                "发送队列: QUIC 建连失败 uuid={}, ip={}",
+        if let Err(e) = transport.connect(&item.device_uuid, &ip, port, None) {
+            log::info!(
+                "发送队列: 重连未建立 uuid={}, ip={}, error={}",
                 item.device_uuid,
-                ip
+                ip,
+                e
             );
-            return Ok(false);
+            return Ok(SendOutcome::Offline);
         }
-        Ok(crate::send::send_via_quic(
-            ctx,
-            &item.device_uuid,
-            &item.header,
-            &item.plaintext,
-        ))
+        if transport
+            .send(&item.device_uuid, &item.header, item.plaintext.as_bytes())
+            .is_ok()
+        {
+            return Ok(SendOutcome::Sent);
+        }
+        Ok(SendOutcome::Failed)
     }
 
     pub fn stop(&self) {
@@ -1126,9 +1157,9 @@ mod ctx_tests {
         assert_eq!(queue.pending_count(), 4);
     }
 
-    /// 传输层未启动时 try_send 必须明确失败（不再回落旧 TCP）。
+    /// 传输层未启动时 try_send 必须报告离线（不再回落旧 TCP）。
     #[test]
-    fn try_send_fails_without_transport() {
+    fn try_send_reports_offline_without_transport() {
         let ctx = create_ctx();
         let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
 
@@ -1141,8 +1172,11 @@ mod ctx_tests {
             coalesce_key: None,
         };
         assert!(
-            !SenderQueue::try_send(ctx_ptr, &item).unwrap(),
-            "QUIC 传输层未启动时必须返回失败"
+            matches!(
+                SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+                SendOutcome::Offline
+            ),
+            "QUIC 传输层未启动时必须报告离线"
         );
     }
 
@@ -1201,7 +1235,10 @@ mod ctx_tests {
             coalesce_key: None,
         };
         assert!(
-            SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+            matches!(
+                SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+                SendOutcome::Sent
+            ),
             "已建立 QUIC 会话时必须投递成功"
         );
 

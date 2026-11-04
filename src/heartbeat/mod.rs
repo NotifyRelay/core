@@ -17,6 +17,12 @@ use crate::SafeContext;
 /// 表现为设备「掉了之后长时间回不来」。
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 8_000;
 
+/// 在线判定窗口（秒）：最近收到过对端心跳即视为在线。
+///
+/// 发送队列据此区分「设备离线」与「已连接但发送失败」：
+/// 离线是常态，不做故障上报；只有已在线却发送失败才需要告警。
+pub const ONLINE_WINDOW_SECS: i64 = 15;
+
 pub struct HeartbeatState {
     pub last_seen: HashMap<String, i64>,
 }
@@ -127,7 +133,7 @@ impl HeartbeatHandle {
                 let mut next_interval_ms = interval_ms;
 
                 loop {
-                    if !r.load(Ordering::Relaxed) {
+                    if !r.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested() {
                         break;
                     }
 
@@ -320,7 +326,7 @@ pub fn start_offline_detector(
     thread::Builder::new()
         .name("offline-detector".to_string())
         .spawn(move || loop {
-            if !r.load(Ordering::Relaxed) {
+            if !r.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested() {
                 break;
             }
 
@@ -646,26 +652,34 @@ pub fn update_scheduler_params(
     battery: i32,
     device_type: &str,
 ) {
-    let Ok(mut guard) = ctx.lock() else {
-        return;
+    let mdns_target = {
+        let Ok(mut guard) = ctx.lock() else {
+            return;
+        };
+        if let Some(ref mut b) = guard.broadcast_info {
+            if !name.is_empty() {
+                b.name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+            }
+            if battery.abs() <= 100 {
+                b.battery = battery;
+            }
+            if !device_type.is_empty() {
+                b.device_type = device_type.to_string();
+            }
+        }
+        crate::network::set_broadcast_info(
+            guard.network.transport.clone(),
+            guard.broadcast_info.clone(),
+        );
+        guard.mdns_battery_target()
     };
-    if let Some(ref mut b) = guard.broadcast_info {
-        if !name.is_empty() {
-            b.name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
-        }
-        if battery.abs() <= 100 {
-            b.battery = battery;
-        }
-        if !device_type.is_empty() {
-            b.device_type = device_type.to_string();
+    // 电量变化必须同步到 mDNS TXT 记录，否则对端发现时读到的仍是启动时电量。
+    // 重注册在锁外进行：daemon 调用可能阻塞，持锁会锁死整条核心链路。
+    if let Some((mdns, battery)) = mdns_target {
+        if let Ok(mut guard) = mdns.lock() {
+            guard.update_battery(battery);
         }
     }
-    crate::network::set_broadcast_info(
-        guard.network.transport.clone(),
-        guard.broadcast_info.clone(),
-    );
-    // 电量变化必须同步到 mDNS TXT 记录，否则对端发现时读到的仍是启动时电量
-    guard.refresh_mdns_battery();
 }
 
 #[cfg(test)]

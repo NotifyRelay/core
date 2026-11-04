@@ -789,8 +789,12 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
 
 use crate::SafeContext;
 
+/// 发送音频控制帧。
+///
+/// 入参为传输层句柄而非上下文引用：调用方不得持上下文锁执行网络发送，
+/// 否则发送阻塞时会锁死整条核心链路。
 fn send_control(
-    ctx: &crate::CoreContext,
+    transport: &crate::quic::QuicTransport,
     remote_uuid: &str,
     action: &str,
     sample_rate: i32,
@@ -811,14 +815,9 @@ fn send_control(
     };
 
     // QUIC 已由 TLS 1.3 提供加密，直接发送明文业务载荷
-    match ctx.quic.as_ref() {
-        Some(transport) => {
-            match transport.send(remote_uuid, "DATA_MEDIA_CONTROL", payload.as_bytes()) {
-                Ok(()) => log::info!("音频流: 已发送控制消息 action={}", action),
-                Err(e) => log::warn!("音频流: 发送控制消息失败 action={}, error={}", action, e),
-            }
-        }
-        None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
+    match transport.send(remote_uuid, "DATA_MEDIA_CONTROL", payload.as_bytes()) {
+        Ok(()) => log::info!("音频流: 已发送控制消息 action={}", action),
+        Err(e) => log::warn!("音频流: 发送控制消息失败 action={}, error={}", action, e),
     }
 }
 
@@ -881,8 +880,12 @@ pub fn start(
     if start_ok {
         log::info!("音频流: 启动成功");
         if direction == "send" {
-            if let Ok(guard) = ctx.lock() {
-                send_control(&guard, remote_uuid, "audioStart", sample_rate, channels);
+            let transport = ctx.lock().ok().and_then(|guard| guard.quic.clone());
+            match transport {
+                Some(transport) => {
+                    send_control(&transport, remote_uuid, "audioStart", sample_rate, channels)
+                }
+                None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
             }
         }
         0
@@ -912,18 +915,20 @@ pub fn write_pcm_frame(ctx: &SafeContext, pcm_data: &[u8]) -> i32 {
 pub fn stop_stream(ctx: &SafeContext) -> i32 {
     log::info!("音频流: 停止开始");
 
-    let uuid = {
+    let (uuid, transport) = {
         let Ok(guard) = ctx.lock() else {
             return -1;
         };
         let uuid = guard.audio.lock().unwrap().remote_uuid.clone();
-        if !uuid.is_empty() {
-            log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
-            send_control(&guard, &uuid, "audioStop", 0, 0);
-        }
-        uuid
+        (uuid, guard.quic.clone())
     };
-    let _ = uuid;
+    if !uuid.is_empty() {
+        log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
+        match transport {
+            Some(transport) => send_control(&transport, &uuid, "audioStop", 0, 0),
+            None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
+        }
+    }
 
     let thread_handles = {
         let Ok(guard) = ctx.lock() else {

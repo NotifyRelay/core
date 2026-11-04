@@ -20,6 +20,9 @@ pub fn create_context() -> *mut c_void {
     );
     let ctx = Box::new(Mutex::new(CoreContext::new()));
     let ptr = Box::into_raw(ctx) as *mut c_void;
+    // 新实例接管前重置关停信号：关停是进程级状态，不随上下文重建自动清除
+    crate::lifecycle::clear_shutdown();
+    crate::lifecycle::start_coordinator(ptr as usize);
     crate::state_merge::start_heartbeat_thread(ptr as usize);
     ptr
 }

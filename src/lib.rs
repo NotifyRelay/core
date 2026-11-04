@@ -14,6 +14,7 @@ pub mod ffi;
 mod filter;
 pub mod handle;
 mod heartbeat;
+pub mod lifecycle;
 mod log_bridge;
 mod models;
 mod network;
@@ -320,21 +321,20 @@ impl CoreContext {
         }
     }
 
-    /// 把当前 broadcast_info 的电量同步到 mDNS 服务记录。
+    /// 取「mDNS 句柄 + 当前电量」快照，供锁外刷新 TXT 记录。
     ///
     /// mDNS 的 TXT 记录在注册时固化，电量变化必须重注册才会被对端看到。
-    /// 电源事件与参数更新路径都经此刷新，避免对端读到过期电量。
-    pub fn refresh_mdns_battery(&mut self) {
-        let Some(battery) = self.broadcast_info.as_ref().map(|b| b.battery) else {
-            return;
-        };
-        if let Some(handle) = self.broadcast_handle.as_ref() {
-            if let Some(mdns) = handle.mdns.as_ref() {
-                if let Ok(mut guard) = mdns.lock() {
-                    guard.update_battery(battery);
-                }
-            }
-        }
+    /// 重注册是跨线程的传输层操作，必须在释放上下文锁之后执行：
+    /// 持锁做 I/O 会让锁在 daemon 阻塞期间不可用，波及全部核心调用。
+    pub fn mdns_battery_target(
+        &self,
+    ) -> Option<(
+        Arc<std::sync::Mutex<crate::discovery::mdns::MdnsDiscovery>>,
+        i32,
+    )> {
+        let battery = self.broadcast_info.as_ref().map(|b| b.battery)?;
+        let mdns = self.broadcast_handle.as_ref()?.mdns.as_ref()?.clone();
+        Some((mdns, battery))
     }
 
     pub fn mark_persistence_dirty(&mut self) {
