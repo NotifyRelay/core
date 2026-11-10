@@ -603,6 +603,10 @@ pub fn parse_notification_inbound(full_json: &str) -> Value {
 /// - `mediaType`/`packageName`/`appName`/`title`/`text`/`coverImage`：字符串，空时为 `null`
 /// - `isPlaying`：bool，缺省 `true`
 /// - `time`：i64，缺省 `0`（由平台自行替换为当前时间）
+/// - `timerType`/`timerWhen`/`timerTotal`/`timerSystemCurrent`：i64，缺省 `0`；
+///   口径与超级岛计时器组件一致（`timerType`：1 正计时进行中、2 正计时暂停，
+///   `timerWhen` 为位置归零时刻、`timerTotal` 为总时长、`timerSystemCurrent` 为采样时刻），
+///   接收端据此在本地推进显示进度，发送端无需按进度高频推送
 /// - `isEnd`：`mediaType` 忽略大小写等于 `"END"` 或 `terminateValue == TERMINATE_VALUE`
 ///
 /// 非 JSON 对象时返回 `Value::Null`。
@@ -633,6 +637,39 @@ pub fn parse_media_inbound(full_json: &str) -> Value {
 
     let is_end = media_type.eq_ignore_ascii_case("END") || terminate_value == TERMINATE_VALUE;
 
+    // 播放进度：优先取计时器口径字段，缺省时由「采样位置 + 采样时刻」推导出等价的归零时刻。
+    let opt_i64 = |key: &str| -> Option<i64> { obj.get(key).and_then(|x| x.as_i64()) };
+    let position_ms = opt_i64("positionMs");
+    let duration_ms = opt_i64("durationMs");
+    let position_at = opt_i64("positionAt").filter(|v| *v > 0);
+    let timer_total = opt_i64("timerTotal").or(duration_ms).unwrap_or(0);
+    let timer_system_current = opt_i64("timerSystemCurrent")
+        .filter(|v| *v > 0)
+        .or(position_at)
+        .unwrap_or(0);
+    let timer_when = opt_i64("timerWhen")
+        .filter(|v| *v > 0)
+        .or_else(|| {
+            let sampled_at = timer_system_current;
+            let position = position_ms?;
+            if sampled_at > 0 {
+                Some(sampled_at - position)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    // 有总时长才视为可推进；正计时 1 前进、2 暂停，与超级岛计时器组件同口径。
+    let timer_type = if timer_total > 0 {
+        if is_playing {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+
     json!({
         "mediaType": opt_str("mediaType"),
         "packageName": opt_str("packageName"),
@@ -643,6 +680,10 @@ pub fn parse_media_inbound(full_json: &str) -> Value {
         "isPlaying": is_playing,
         "isEnd": is_end,
         "time": time,
+        "timerType": timer_type,
+        "timerWhen": timer_when,
+        "timerTotal": timer_total,
+        "timerSystemCurrent": timer_system_current,
     })
 }
 

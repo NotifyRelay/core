@@ -460,6 +460,58 @@ fn test_parse_media_is_playing_false() {
 }
 
 #[test]
+fn test_parse_media_progress_from_position() {
+    // 采样位置 + 采样时刻 + 播放态 → 等价的计时器口径
+    let v = parse_media(
+        r#"{"title":"t","positionMs":30000,"durationMs":180000,"positionAt":1700000000000,"isPlaying":true}"#,
+    );
+    assert_eq!(v["timerType"], 1, "播放中应为正计时进行");
+    assert_eq!(v["timerTotal"], 180000);
+    assert_eq!(v["timerSystemCurrent"], 1700000000000i64);
+    assert_eq!(v["timerWhen"], 1700000000000i64 - 30000);
+}
+
+#[test]
+fn test_parse_media_progress_paused() {
+    let v = parse_media(
+        r#"{"positionMs":1000,"durationMs":60000,"positionAt":1700000000000,"isPlaying":false}"#,
+    );
+    assert_eq!(v["timerType"], 2, "暂停应取正计时暂停");
+    assert_eq!(v["timerWhen"], 1700000000000i64 - 1000);
+}
+
+#[test]
+fn test_parse_media_progress_without_duration_is_not_advancing() {
+    let v = parse_media(r#"{"positionMs":1000,"positionAt":1700000000000,"isPlaying":true}"#);
+    assert_eq!(v["timerType"], 0, "无总时长时不可推进");
+    assert_eq!(v["timerTotal"], 0);
+}
+
+#[test]
+fn test_parse_media_progress_absent_defaults_zero() {
+    let v = parse_media(r#"{"title":"t"}"#);
+    assert_eq!(v["timerType"], 0);
+    assert_eq!(v["timerWhen"], 0);
+    assert_eq!(v["timerTotal"], 0);
+    assert_eq!(v["timerSystemCurrent"], 0);
+}
+
+#[test]
+fn test_parse_media_progress_timer_fields_win() {
+    // 发送端已按计时器口径给出时直接透传，不再由位置推导
+    let v = parse_media(
+        r#"{"timerType":2,"timerWhen":100,"timerTotal":900,"timerSystemCurrent":500,"positionMs":400}"#,
+    );
+    assert_eq!(
+        v["timerType"], 1,
+        "timerType 由总时长与播放态派生，暂停由 isPlaying 表达"
+    );
+    assert_eq!(v["timerWhen"], 100);
+    assert_eq!(v["timerTotal"], 900);
+    assert_eq!(v["timerSystemCurrent"], 500);
+}
+
+#[test]
 fn test_parse_media_cover_image_pure_passthrough() {
     let v = parse_media(r#"{"coverUrl":"http://example.com/cover.jpg"}"#);
     assert_eq!(v["coverImage"], "http://example.com/cover.jpg");
