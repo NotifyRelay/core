@@ -60,13 +60,7 @@ pub fn create_ctx() -> SafeContext {
 
 /// 建立一套临时库上下文，临时目录按给定前缀命名。
 pub fn create_ctx_with_prefix(prefix: &str) -> SafeContext {
-    let n = CTX_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), n));
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        dirs.push(dir.clone());
-    }
-    register_cleanup_once();
-    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
+    create_ctx_configured(prefix, |_| {})
 }
 
 /// 把上下文按 FFI 的裸指针口径交出。
@@ -126,8 +120,13 @@ pub unsafe fn free_str(p: *mut c_char) {
     }
 }
 
-/// 推送一次超级岛全量状态；返回核心库的返回值。
-pub fn push_superisland(
+/// 状态推送入口的 FFI 签名。
+type PushStateFn =
+    unsafe extern "C" fn(*mut c_void, u64, *const c_char, *const c_char, i32, i32) -> i32;
+
+/// 以给定 FFI 入口推送一次全量状态；返回核心库的返回值。
+fn push_state(
+    push: PushStateFn,
     ctx: &SafeContext,
     queue_handle: u64,
     uuid: &str,
@@ -137,19 +136,32 @@ pub fn push_superisland(
 ) -> i32 {
     let u = cstr(uuid);
     let f = cstr(full_json);
-    let r = ffi::state_merge::nrc_push_superisland_state(
-        ctx_ptr(ctx),
-        queue_handle,
-        u,
-        f,
-        is_end,
-        is_query,
-    );
+    let r = unsafe { push(ctx_ptr(ctx), queue_handle, u, f, is_end, is_query) };
     unsafe {
         free_cstr(u);
         free_cstr(f);
     }
     r
+}
+
+/// 推送一次超级岛全量状态；返回核心库的返回值。
+pub fn push_superisland(
+    ctx: &SafeContext,
+    queue_handle: u64,
+    uuid: &str,
+    full_json: &str,
+    is_end: i32,
+    is_query: i32,
+) -> i32 {
+    push_state(
+        ffi::state_merge::nrc_push_superisland_state,
+        ctx,
+        queue_handle,
+        uuid,
+        full_json,
+        is_end,
+        is_query,
+    )
 }
 
 /// 登记一台已知设备。
@@ -194,4 +206,41 @@ pub fn register_exit_cleanup_once(cleanup: extern "C" fn()) {
         // SAFETY: 回调只做文件删除，不访问其他全局状态
         unsafe { libc::atexit(cleanup) };
     }
+}
+/// 建立一套临时库上下文，交给调用方在包装前配置核心实例。
+///
+/// 临时目录仍以 `nrctx_` 开头，退出时由本模块统一回收。
+pub fn create_ctx_configured(
+    prefix: &str,
+    configure: impl FnOnce(&mut CoreContext),
+) -> SafeContext {
+    let n = CTX_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), n));
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        dirs.push(dir.clone());
+    }
+    register_cleanup_once();
+    let mut ctx = CoreContext::with_db_override(dir.join("rust_core.db"));
+    configure(&mut ctx);
+    Mutex::new(ctx)
+}
+
+/// 推送一次媒体全量状态；返回核心库的返回值。
+pub fn push_media(
+    ctx: &SafeContext,
+    queue_handle: u64,
+    uuid: &str,
+    full_json: &str,
+    is_end: i32,
+    is_query: i32,
+) -> i32 {
+    push_state(
+        ffi::state_merge::nrc_push_media_state,
+        ctx,
+        queue_handle,
+        uuid,
+        full_json,
+        is_end,
+        is_query,
+    )
 }

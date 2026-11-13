@@ -4,7 +4,7 @@ use std::os::raw::{c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use notify_relay_core::{ffi, BroadcastInfo, CoreContext, SafeContext};
+use notify_relay_core::{ffi, BroadcastInfo, SafeContext};
 
 mod common;
 
@@ -49,48 +49,16 @@ extern "C" fn recv_callback(
     }
 }
 
-/// 进程内已创建的临时库目录；进程退出时统一清理。
-static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-
-/// 清理本进程及历史遗留的测试临时库目录。
-extern "C" fn prune_temp_dirs() {
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        for dir in dirs.drain(..) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("nrc_audio_") {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-fn register_cleanup_once() {
-    common::register_exit_cleanup_once(prune_temp_dirs);
-}
-
+/// 每个上下文使用独立临时库，避免写入平台默认路径（%LOCALAPPDATA% / 应用私有目录）。
 fn create_context(uuid: &str) -> SafeContext {
-    // 每个上下文使用独立临时库，避免写入平台默认路径（%LOCALAPPDATA% / 应用私有目录）
-    let seq = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nrc_audio_{}_{}", std::process::id(), seq));
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        dirs.push(dir.clone());
-    }
-    register_cleanup_once();
-    let mut ctx = CoreContext::with_db_override(dir.join("rust_core.db"));
-    ctx.broadcast_info = Some(BroadcastInfo {
-        uuid: uuid.to_string(),
-        name_b64: notify_relay_core::utils::encode_name_b64("test-device"),
-        battery: 100,
-        device_type: "test".to_string(),
-    });
-    Mutex::new(ctx)
+    common::create_ctx_configured("nrctx_audio", |ctx| {
+        ctx.broadcast_info = Some(BroadcastInfo {
+            uuid: uuid.to_string(),
+            name_b64: notify_relay_core::utils::encode_name_b64("test-device"),
+            battery: 100,
+            device_type: "test".to_string(),
+        })
+    })
 }
 
 fn reset_frames() {

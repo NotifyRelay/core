@@ -3,29 +3,10 @@
 
 use std::ffi::CString;
 
-use notify_relay_core::{ffi, SafeContext};
+use notify_relay_core::ffi;
 
 mod common;
 use common::*;
-
-fn push_media(
-    ctx: &SafeContext,
-    queue_handle: u64,
-    uuid: &str,
-    full_json: &str,
-    is_end: i32,
-    is_query: i32,
-) -> i32 {
-    let u = cstr(uuid);
-    let f = cstr(full_json);
-    let r =
-        ffi::state_merge::nrc_push_media_state(ctx_ptr(ctx), queue_handle, u, f, is_end, is_query);
-    unsafe {
-        free_cstr(u);
-        free_cstr(f);
-    }
-    r
-}
 
 const FULL_STATE: &str = r#"{"featureId":"f1","title":"t","text":"c"}"#;
 
