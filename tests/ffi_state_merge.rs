@@ -2,99 +2,11 @@
 //! 目的：保证 PC 与 Android 两个平台端共享的状态合并接口契约不变
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_void};
-use std::sync::Mutex;
 
-use notify_relay_core::{ffi, CoreContext, SafeContext};
+use notify_relay_core::{ffi, SafeContext};
 
-static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 进程内已创建的临时库目录；进程退出时统一清理，避免在 TEMP 下堆积。
-static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-
-/// 清理本进程及历史遗留的全部测试临时库目录。
-fn prune_temp_dirs() {
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        for dir in dirs.drain(..) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("nrctx_") {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-/// 注册进程退出清理（只注册一次）。
-fn register_cleanup_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        extern "C" fn on_exit() {
-            prune_temp_dirs();
-        }
-        // SAFETY: 回调只做文件删除，不访问其他全局状态
-        unsafe { libc::atexit(on_exit) };
-    });
-}
-
-fn create_ctx() -> SafeContext {
-    let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nrctx_{}_{}", std::process::id(), n));
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        dirs.push(dir.clone());
-    }
-    register_cleanup_once();
-    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
-}
-
-fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
-    ctx as *const SafeContext as *mut c_void
-}
-
-fn cstr(s: &str) -> *const c_char {
-    CString::new(s).unwrap().into_raw()
-}
-
-unsafe fn free_cstr(p: *const c_char) {
-    if !p.is_null() {
-        drop(CString::from_raw(p as *mut c_char));
-    }
-}
-
-fn make_queue_handle() -> u64 {
-    let queue = Box::new(notify_relay_core::sender_queue::SenderQueue::new());
-    ffi::handle::put(Box::into_raw(queue) as *mut c_void)
-}
-
-fn push_superisland(
-    ctx: &SafeContext,
-    queue_handle: u64,
-    uuid: &str,
-    full_json: &str,
-    is_end: i32,
-    is_query: i32,
-) -> i32 {
-    let u = cstr(uuid);
-    let f = cstr(full_json);
-    let r = ffi::state_merge::nrc_push_superisland_state(
-        ctx_ptr(ctx),
-        queue_handle,
-        u,
-        f,
-        is_end,
-        is_query,
-    );
-    unsafe {
-        free_cstr(u);
-        free_cstr(f);
-    }
-    r
-}
+mod common;
+use common::*;
 
 fn push_media(
     ctx: &SafeContext,

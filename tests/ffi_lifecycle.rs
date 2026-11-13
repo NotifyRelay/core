@@ -1,17 +1,12 @@
 //! FFI 生命周期接口语义测试（nrc_init / nrc_get_git_hash / nrc_free_string / nrc_get_local_ip）
 //! 目的：保证 PC 与 Android 两个平台端共享的生命周期接口契约不变
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::ffi::CString;
 
 use notify_relay_core::ffi;
 
-unsafe fn read_cstr(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    CStr::from_ptr(p).to_str().unwrap_or("").to_string()
-}
+mod common;
+use common::*;
 
 #[test]
 fn test_init_returns_non_null_context() {

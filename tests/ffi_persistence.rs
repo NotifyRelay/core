@@ -3,11 +3,14 @@
 //!
 //! 注意：单个 test 函数内端到端编排（环境变量为进程级，避免并发测试竞争）
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::Mutex;
 
 use notify_relay_core::{ffi, CoreContext, SafeContext};
+
+mod common;
+use common::*;
 
 fn create_ctx() -> SafeContext {
     Mutex::new(CoreContext::new())
@@ -25,19 +28,6 @@ fn cstr(s: &str) -> *const c_char {
     CString::new(s).unwrap().into_raw()
 }
 
-unsafe fn read_cstr(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    CStr::from_ptr(p).to_str().unwrap_or("").to_string()
-}
-
-unsafe fn free_str(p: *mut c_char) {
-    if !p.is_null() {
-        drop(CString::from_raw(p));
-    }
-}
-
 /// 每个测试使用彼此独立的库目录：
 /// 同文件内的测试并行执行，共用目录会互相 remove_dir_all 删除对方的 SQLite 文件
 fn db_path_env(case: &str) -> std::path::PathBuf {
@@ -51,7 +41,7 @@ fn cleanup(path: &std::path::Path) {
 }
 
 /// 清理本进程遗留的全部持久化测试目录（断言失败等提前返回时兜底）。
-fn prune_persist_dirs() {
+extern "C" fn prune_persist_dirs() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
@@ -65,16 +55,8 @@ fn prune_persist_dirs() {
     }
 }
 
-/// 注册进程退出清理（只注册一次）。
 fn register_cleanup_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        extern "C" fn on_exit() {
-            prune_persist_dirs();
-        }
-        // SAFETY: 回调只做文件删除，不访问其他全局状态
-        unsafe { libc::atexit(on_exit) };
-    });
+    common::register_exit_cleanup_once(prune_persist_dirs);
 }
 
 #[test]

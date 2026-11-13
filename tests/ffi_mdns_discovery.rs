@@ -10,85 +10,24 @@
 //! 自我过滤同属该链路：mDNS 组播会回环到本机，本机 uuid 的通告必须被忽略，
 //! 否则会把自身登记为远程设备并占掉发现配额。
 
-use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::Mutex;
 
-use notify_relay_core::{ffi, CoreContext, SafeContext};
+use notify_relay_core::ffi;
+
+mod common;
+use common::*;
 
 const LOCAL_UUID: &str = "local-mdns-self";
 const PEER_UUID: &str = "peer-mdns-1";
 const PEER_IP: &str = "192.168.31.200";
 const PEER_PORT: u16 = 23333;
 
-static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// on_device_discovered 回调事件：(uuid, name, port, battery, device_type, ip)
 type DiscoveredEvent = (String, String, u16, i32, String, String);
 
 /// 记录 on_device_discovered 回调事件（回调为 extern "C"，无法捕获上下文）
 static DISCOVERED: Mutex<Vec<DiscoveredEvent>> = Mutex::new(Vec::new());
-
-/// 进程内已创建的临时库目录；进程退出时统一清理。
-static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-
-/// 清理本进程及历史遗留的测试临时库目录。
-fn prune_temp_dirs() {
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        for dir in dirs.drain(..) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("nrctx_mdns_") {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-/// 注册进程退出清理（只注册一次）。
-fn register_cleanup_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        extern "C" fn on_exit() {
-            prune_temp_dirs();
-        }
-        // SAFETY: 回调只做文件删除，不访问其他全局状态
-        unsafe { libc::atexit(on_exit) };
-    });
-}
-
-fn create_ctx() -> SafeContext {
-    let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nrctx_mdns_{}_{}", std::process::id(), n));
-    if let Ok(mut dirs) = CTX_DIRS.lock() {
-        dirs.push(dir.clone());
-    }
-    register_cleanup_once();
-    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
-}
-
-fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
-    ctx as *const SafeContext as *mut c_void
-}
-
-unsafe fn read_cstr(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    CStr::from_ptr(p).to_str().unwrap_or("").to_string()
-}
-
-unsafe fn free_str(p: *mut c_char) {
-    if !p.is_null() {
-        drop(CString::from_raw(p));
-    }
-}
 
 extern "C" fn on_device_discovered(
     uuid: *const c_char,
@@ -107,13 +46,6 @@ extern "C" fn on_device_discovered(
         unsafe { read_cstr(device_type) },
         unsafe { read_cstr(ip) },
     ));
-}
-
-fn device_list(ctx: &SafeContext, authed_ms: i64, unauthed_ms: i64) -> serde_json::Value {
-    let r = unsafe { ffi::device_state::nrc_get_device_list(ctx_ptr(ctx), authed_ms, unauthed_ms) };
-    let s = unsafe { read_cstr(r) };
-    unsafe { free_str(r) };
-    serde_json::from_str(&s).unwrap_or_else(|_| panic!("设备列表应为合法 JSON: {}", s))
 }
 
 /// 通过发现消费链登记一台对端，并断言 registry、device_ips、known_devices 与回调。

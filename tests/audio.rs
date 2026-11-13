@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use notify_relay_core::{ffi, BroadcastInfo, CoreContext, SafeContext};
 
+mod common;
+
 fn init_logger() {
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -51,7 +53,7 @@ extern "C" fn recv_callback(
 static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 /// 清理本进程及历史遗留的测试临时库目录。
-fn prune_temp_dirs() {
+extern "C" fn prune_temp_dirs() {
     if let Ok(mut dirs) = CTX_DIRS.lock() {
         for dir in dirs.drain(..) {
             let _ = std::fs::remove_dir_all(dir);
@@ -69,16 +71,8 @@ fn prune_temp_dirs() {
     }
 }
 
-/// 注册进程退出清理（只注册一次）。
 fn register_cleanup_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        extern "C" fn on_exit() {
-            prune_temp_dirs();
-        }
-        // SAFETY: 回调只做文件删除，不访问其他全局状态
-        unsafe { libc::atexit(on_exit) };
-    });
+    common::register_exit_cleanup_once(prune_temp_dirs);
 }
 
 fn create_context(uuid: &str) -> SafeContext {
