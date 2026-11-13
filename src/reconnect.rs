@@ -97,11 +97,44 @@ impl ReconnectState {
             .name("reconnect".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested()
+                    {
                         break;
                     }
 
                     let mut to_reconnect: Vec<(String, String)> = Vec::new();
+
+                    // 先取上下文侧的本机身份与在线集合，再进入重连状态锁。
+                    //
+                    // 锁序必须恒为 ctx → inner：remove_target / add_target 由 FFI 线程以
+                    // ctx 锁为先进入本状态，反向取锁会与它们构成 ABBA 死锁。
+                    let (self_uuid, online) = {
+                        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+                        match ctx.lock() {
+                            Ok(guard) => {
+                                let self_uuid = guard
+                                    .broadcast_info
+                                    .as_ref()
+                                    .map(|b| b.uuid.clone())
+                                    .unwrap_or_default();
+                                let online: Vec<String> = guard
+                                    .heartbeat
+                                    .last_seen
+                                    .iter()
+                                    .filter(|(uuid, ts)| {
+                                        crate::device_registry::now_sec()
+                                            .saturating_sub(**ts)
+                                            <= RECENT_SEEN_SECS
+                                        // uuid 仅用于下方筛选，保留完整集合以免每轮重复取锁
+                                        && !uuid.is_empty()
+                                    })
+                                    .map(|(uuid, _)| uuid.clone())
+                                    .collect();
+                                (self_uuid, online)
+                            }
+                            Err(_) => (String::new(), Vec::new()),
+                        }
+                    };
 
                     let mut to_remove: Vec<String> = Vec::new();
                     if let Ok(mut guard) = inner.lock() {
@@ -110,36 +143,16 @@ impl ReconnectState {
 
                         for uuid in &uuids {
                             // 跳过本机自身（重连目标中不应包含本机）
-                            let is_self = {
-                                // 后台线程：通过 lock() 取锁，与 FFI/扫描回调共用同一把锁
-                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                                ctx.lock()
-                                    .ok()
-                                    .and_then(|g| {
-                                        g.broadcast_info.as_ref().map(|b| b.uuid == *uuid)
-                                    })
-                                    .unwrap_or(false)
-                            };
+                            let is_self = !self_uuid.is_empty() && self_uuid == *uuid;
                             if is_self {
                                 guard.attempt_counts.remove(uuid);
                                 to_remove.push(uuid.clone());
                                 continue;
                             }
 
-                            // 在线判定：最近收到过对方心跳（last_seen 在窗口内）即视为已连接。
-                            // 不依赖 TCP 会话：协议连接均为短连接（session 随连接关闭立即移除），
-                            // 用 tcp.is_connected 判定会永远失败，导致无限重复握手。
-                            let connected = {
-                                let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-                                match ctx.lock() {
-                                    Ok(guard) => {
-                                        guard.heartbeat.is_recently_seen(uuid, RECENT_SEEN_SECS)
-                                    }
-                                    Err(_) => false,
-                                }
-                            };
-
-                            if connected {
+                            // 在线判定：最近收到过对方心跳即视为已连接。
+                            // 不依赖 TCP 会话：session 随连接关闭立即移除，用它判定会永远失败。
+                            if online.iter().any(|u| u == uuid) {
                                 guard.attempt_counts.remove(uuid);
                                 to_remove.push(uuid.clone());
                                 continue;
@@ -204,21 +217,23 @@ impl ReconnectState {
                                 .as_ref()
                                 .map(|i| i.device_type.clone())
                                 .unwrap_or_default();
-                            let local_ip =
-                                crate::ffi::utils::get_local_ip_impl().unwrap_or_default();
-                            codec::encode_handshake(&local_uuid, &local_ip, local_battery, &dt)
+                            let local_ip = crate::utils::get_local_ip();
+                            codec::handshake_payload(&local_uuid, &local_ip, local_battery, &dt)
                         };
 
-                        let resp = crate::network::oneshot_send_receive_bin(
-                            &handshake_msg,
+                        let resp = crate::network::request_response_over_quic(
+                            ctx_ptr,
+                            &uuid,
                             &ip,
                             codec::DEFAULT_TCP_PORT,
+                            crate::processing::CTRL_HANDSHAKE,
+                            &handshake_msg,
                             5000,
                         );
-                        if let Some((msg_type, payload)) = resp {
+                        if let Some((resp_header, payload)) = resp {
                             // REJECT 表示对端明确拒绝（如 core 版本不兼容）：不得记为在线，
                             // 否则不兼容设备会被反复判定为已连接，掩盖真实失败原因。
-                            if msg_type == crate::protocol::header::MessageType::REJECT {
+                            if resp_header == crate::processing::CTRL_REJECT {
                                 let reason = codec::decode_reject_payload(&payload)
                                     .map(|(_, r)| r)
                                     .unwrap_or_else(|| "unknown".to_string());
@@ -251,4 +266,59 @@ impl ReconnectState {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+// ===== 上下文级重连入口 =====
+
+/// 创建重连状态机并登记句柄（供统一启动入口调用）。返回句柄，0 表示失败。
+pub fn create_state_for(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let state = Box::new(ReconnectState::new());
+    let handle = crate::handle::put(Box::into_raw(state) as *mut std::os::raw::c_void);
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    if let Ok(mut guard) = ctx.lock() {
+        guard.reconnect_state = handle;
+    }
+    handle
+}
+
+/// 添加重连目标（状态机由统一启动入口创建，内部从上下文获取）。
+pub fn add_target(ctx: &mut crate::CoreContext, uuid: &str, ip: &str) {
+    // 忽略本机自身，避免自我重连
+    let is_self = ctx
+        .broadcast_info
+        .as_ref()
+        .map(|b| b.uuid == uuid)
+        .unwrap_or(false);
+    if is_self {
+        return;
+    }
+    let state_handle = ctx.reconnect_state;
+    if state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.add_target(uuid, ip);
+}
+
+/// 移除重连目标。
+pub fn remove_target(ctx: &mut crate::CoreContext, uuid: &str) {
+    let state_handle = ctx.reconnect_state;
+    if state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.remove_target(uuid);
+}
+
+/// 启动重连检测（供统一启动入口调用）。
+pub fn start_for(ctx_ptr: usize, state_handle: u64, interval_secs: u64, max_retries: u32) {
+    if ctx_ptr == 0 || state_handle == 0 {
+        return;
+    }
+    let state = unsafe { &*(crate::handle::get(state_handle) as *const ReconnectState) };
+    state.configure(interval_secs, max_retries);
+    state.start(ctx_ptr);
 }

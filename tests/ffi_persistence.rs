@@ -50,8 +50,36 @@ fn cleanup(path: &std::path::Path) {
     }
 }
 
+/// 清理本进程遗留的全部持久化测试目录（断言失败等提前返回时兜底）。
+fn prune_persist_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("nrc_persist_test_") && name.contains(&me) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 注册进程退出清理（只注册一次）。
+fn register_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn on_exit() {
+            prune_persist_dirs();
+        }
+        // SAFETY: 回调只做文件删除，不访问其他全局状态
+        unsafe { libc::atexit(on_exit) };
+    });
+}
+
 #[test]
 fn test_persistence_full_flow() {
+    register_cleanup_once();
     let dir = db_path_env("full_flow");
     let db = dir.join("rust_core.db");
     // 清理历史残留（损坏库也一并处理）
@@ -318,6 +346,7 @@ fn test_persistence_full_flow() {
 /// 持久化故障注入测试：ensure_local_uuid 在 flush_persistence 事务中原子性保存
 #[test]
 fn test_uuid_atomicity_in_flush() {
+    register_cleanup_once();
     let dir = db_path_env("uuid_atomicity");
     let db = dir.join("rust_core_atomicity.db");
     cleanup(&db);

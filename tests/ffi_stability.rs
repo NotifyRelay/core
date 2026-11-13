@@ -10,12 +10,48 @@ use base64::Engine;
 use notify_relay_core::{ffi, CoreContext, SafeContext};
 
 static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 进程内已创建的临时库目录；进程退出时统一清理，避免在 TEMP 下堆积。
+static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// 清理本进程及历史遗留的全部测试临时库目录。
+fn prune_temp_dirs() {
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        for dir in dirs.drain(..) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("nrctx_") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 注册进程退出清理（只注册一次）。
+fn register_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn on_exit() {
+            prune_temp_dirs();
+        }
+        // SAFETY: 回调只做文件删除，不访问其他全局状态
+        unsafe { libc::atexit(on_exit) };
+    });
+}
+
 fn create_ctx() -> SafeContext {
     let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = std::env::temp_dir()
-        .join(format!("nrctx_{}_{}", std::process::id(), n))
-        .join("rust_core.db");
-    Mutex::new(CoreContext::with_db_override(p))
+    let dir = std::env::temp_dir().join(format!("nrctx_{}_{}", std::process::id(), n));
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        dirs.push(dir.clone());
+    }
+    register_cleanup_once();
+    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
 }
 
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
@@ -232,6 +268,20 @@ fn test_state_export_import_loop_stable() {
     unsafe { free_cstr(uuid) };
 }
 
+/// 提取设备列表中的 uuid 并排序，用于与遍历顺序无关的比较。
+fn sorted_uuids(list: &serde_json::Value) -> Vec<String> {
+    let mut uuids: Vec<String> = list
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d["uuid"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    uuids.sort();
+    uuids
+}
+
 #[test]
 fn test_device_known_loop_stable() {
     let ctx = create_ctx();
@@ -241,10 +291,16 @@ fn test_device_known_loop_stable() {
     // 去重后共 5 个设备
     let list = device_list(&ctx, 30000, 30000);
     assert_eq!(list.as_array().unwrap().len(), 5);
-    // 连续查询结果幂等
+    // 连续查询结果幂等。
+    // 比较 uuid 集合而非整个数组：设备列表来自 HashMap 遍历，元素顺序不保证稳定，
+    // 直接比较数组会把「顺序变化」误判为状态不一致。
+    let mut expect: Vec<String> = sorted_uuids(&list);
     for _ in 0..20 {
-        assert_eq!(device_list(&ctx, 30000, 30000), list);
+        let mut got: Vec<String> = sorted_uuids(&device_list(&ctx, 30000, 30000));
+        assert_eq!(got, expect);
+        got.clear();
     }
+    expect.clear();
     // 全部移除后为空
     for i in 0..5 {
         remove_known(&ctx, &format!("dev-{}", i));

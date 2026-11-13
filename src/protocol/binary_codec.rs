@@ -4,13 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use super::header::MessageType;
 
-/// 二进制帧格式: type(1B) + length(4B LE) + payload(NB)
+/// 从 TCP 流读取一个完整帧。
 ///
-/// - type: 消息类型 (0-255)
-/// - length: payload 长度，小端序
-/// - payload: 明文控制消息体 或 加密的 DATA 消息体
-
-/// 从 TCP 流读取一个完整帧
+/// 帧格式为 type(1B) + length(4B 小端) + payload(NB)：
+/// type 是消息类型，length 是 payload 长度，
+/// payload 为明文控制消息体或加密的 DATA 消息体。
 pub fn read_frame(reader: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 5];
     reader.read_exact(&mut header)?;

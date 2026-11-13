@@ -4,9 +4,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::crypto::aes;
 use crate::protocol::codec;
 use crate::SafeContext;
+
+/// 单次发送结果。
+///
+/// 区分「设备离线」与「已连接但发送失败」：前者是正常状态，
+/// 只记信息级日志并按退避重试；后者才是需要告警的故障。
+enum SendOutcome {
+    /// 已交付传输层
+    Sent,
+    /// 设备离线或地址不可用，本次未发送
+    Offline,
+    /// 设备可用但发送失败
+    Failed,
+}
 
 /// 消息发送项（IP 由 Rust 内部分配，不依赖平台端传入）
 pub struct SendItem {
@@ -68,10 +80,6 @@ impl Drop for TaskGuard {
 impl SenderQueue {
     const MAX_CONCURRENT: usize = 5;
     const MAX_RETRIES: u32 = 3;
-    /// 媒体类消息连接超时（毫秒）：过期状态无重发价值，快速失败
-    const MEDIA_TIMEOUT_MS: u32 = 800;
-    /// 普通消息连接超时（毫秒）
-    const DEFAULT_TIMEOUT_MS: u32 = 3000;
     /// 失败退避冷却上限（秒）
     const MAX_COOLDOWN_SECS: u64 = 5;
     /// orphan_keys 上限（超出丢弃最旧记录，正常路径每轮 worker 即清空）
@@ -304,7 +312,8 @@ impl SenderQueue {
             .name("sender-queue".to_string())
             .spawn(move || {
                 loop {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || crate::lifecycle::is_shutdown_requested()
+                    {
                         break;
                     }
 
@@ -420,7 +429,7 @@ impl SenderQueue {
         inner: &Arc<Mutex<SenderQueueInner>>,
         orphan: &Arc<Mutex<Vec<String>>>,
     ) {
-        let send_ok = match Self::try_send(ctx_ptr, item) {
+        let outcome = match Self::try_send(ctx_ptr, item) {
             Ok(v) => v,
             Err(_) => {
                 // 取锁失败使该项未发送即被丢弃：登记其去重键待补清理
@@ -433,7 +442,7 @@ impl SenderQueue {
 
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
 
-        if send_ok {
+        if let SendOutcome::Sent = outcome {
             if let Some(ref key) = item.dedup_key {
                 if !key.is_empty() {
                     // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
@@ -455,7 +464,8 @@ impl SenderQueue {
             return;
         }
 
-        // 发送失败：设置递增冷却，避免对不可达设备反复握手占用并发槽位
+        // 未送达：设置递增冷却，避免对不可达设备反复握手占用并发槽位。
+        // 设备离线属于正常状态，失败计数只用于退避节奏，不产生告警。
         if let Ok(mut guard) = inner.lock() {
             let streak = {
                 let entry = guard
@@ -509,6 +519,12 @@ impl SenderQueue {
                     item.device_uuid,
                     item.header
                 );
+            } else if let SendOutcome::Offline = outcome {
+                log::info!(
+                    "发送队列: 设备离线，放弃本次送达 uuid={}, header={}",
+                    item.device_uuid,
+                    item.header
+                );
             } else {
                 log::warn!(
                     "发送队列: 发送失败已达最大重试 uuid={}, header={}",
@@ -519,76 +535,85 @@ impl SenderQueue {
         }
     }
 
-    fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<bool, ()> {
+    /// 发送单项：走 QUIC 会话（header + 明文，加密由 TLS 1.3 承担）。
+    ///
+    /// 上下文锁只用于取句柄与在线判定；发送与拨号在锁外执行。
+    /// 发送与拨号都会阻塞在 tokio 运行时上，持锁进行会让同一把锁上的
+    /// 其他线程（含入站回调）永久等待。
+    fn try_send(ctx_ptr: usize, item: &SendItem) -> Result<SendOutcome, ()> {
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        let (key_arr, local_uuid) = {
-            // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
+        let (local_uuid, transport, ip, online) = {
             let Ok(guard) = ctx.lock() else {
                 return Err(());
             };
-            let key = guard.crypto.get_aes_key(&item.device_uuid);
             let uuid = guard
                 .broadcast_info
                 .as_ref()
                 .map(|i| i.uuid.clone())
                 .unwrap_or_default();
-            (key, uuid)
-        };
-
-        let key_arr = match key_arr {
-            Some(k) => k,
-            None => {
-                log::warn!("发送队列: 未找到密钥 uuid={}", item.device_uuid);
-                return Ok(false);
-            }
-        };
-
-        if !local_uuid.is_empty() && item.device_uuid == local_uuid {
-            log::warn!("发送队列: 跳过向自身发送 uuid={}", item.device_uuid);
-            return Ok(false);
-        }
-
-        // DATA 通道统一使用绑定 core 版本的 AAD：跨 major.minor 时对端 AAD 不同，
-        // GCM 认证必然失败，即便公钥与密钥完全一致也无法通信。
-        let encrypted = match aes::encrypt_with_aad(
-            &key_arr,
-            item.plaintext.as_bytes(),
-            &crate::protocol::version::data_aad(),
-        ) {
-            Ok(e) => e,
-            Err(_) => return Ok(false),
-        };
-        let msg = codec::encode_data_message(&item.header, &local_uuid, "", &encrypted);
-
-        // 始终使用 oneshot 新连接发送，不依赖可能即将关闭的 TCP session
-        let ip = {
-            let Ok(guard) = ctx.lock() else {
-                return Ok(false);
-            };
-            guard
+            let online = guard
+                .heartbeat
+                .is_recently_seen(&item.device_uuid, crate::heartbeat::ONLINE_WINDOW_SECS);
+            let ip = guard
                 .device_ips
                 .lock()
                 .ok()
                 .and_then(|ips| ips.get(&item.device_uuid).cloned())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (uuid, guard.quic.clone(), ip, online)
         };
-        if !ip.is_empty() && ip != "0.0.0.0" {
-            // 媒体类消息用短超时快速失败，避免长时间占用并发槽位
-            let timeout_ms = if Self::is_media_header(&item.header) {
-                Self::MEDIA_TIMEOUT_MS
-            } else {
-                Self::DEFAULT_TIMEOUT_MS
-            };
-            Ok(crate::network::oneshot_send_only(
-                &msg,
-                &ip,
-                codec::DEFAULT_TCP_PORT,
-                timeout_ms,
-            ))
-        } else {
-            log::warn!("发送队列: 无有效IP uuid={}", item.device_uuid);
-            Ok(false)
+
+        if !local_uuid.is_empty() && item.device_uuid == local_uuid {
+            log::warn!("发送队列: 跳过向自身发送 uuid={}", item.device_uuid);
+            return Ok(SendOutcome::Failed);
         }
+
+        let Some(transport) = transport else {
+            log::info!(
+                "发送队列: 传输层未就绪，暂不发送 uuid={}, header={}",
+                item.device_uuid,
+                item.header
+            );
+            return Ok(SendOutcome::Offline);
+        };
+
+        // 在线：直接发送；失败说明会话已不可用，转入重连判定
+        if online
+            && transport
+                .send(&item.device_uuid, &item.header, item.plaintext.as_bytes())
+                .is_ok()
+        {
+            return Ok(SendOutcome::Sent);
+        }
+
+        // 离线或会话失效：按已知 IP 重连一次再发。
+        // 设备离线是常态，不作为故障上报。
+        let ip = crate::utils::normalize_ip(&ip);
+        if ip.is_empty() || ip == "0.0.0.0" {
+            log::info!(
+                "发送队列: 无有效地址，暂不发送 uuid={}, header={}",
+                item.device_uuid,
+                item.header
+            );
+            return Ok(SendOutcome::Offline);
+        }
+        let port = codec::DEFAULT_TCP_PORT;
+        if let Err(e) = transport.connect(&item.device_uuid, &ip, port, None) {
+            log::info!(
+                "发送队列: 重连未建立 uuid={}, ip={}, error={}",
+                item.device_uuid,
+                ip,
+                e
+            );
+            return Ok(SendOutcome::Offline);
+        }
+        if transport
+            .send(&item.device_uuid, &item.header, item.plaintext.as_bytes())
+            .is_ok()
+        {
+            return Ok(SendOutcome::Sent);
+        }
+        Ok(SendOutcome::Failed)
     }
 
     pub fn stop(&self) {
@@ -947,5 +972,280 @@ mod tests {
             !guard.dedup.check_and_pend("k-new", 3000),
             "保留项的键仍在 pending"
         );
+    }
+}
+
+// ===== 上下文级发送队列入口 =====
+
+/// 发送去重 TTL（毫秒），与原平台端 SENT_KEY_TTL_MS 一致
+const SENT_DEDUP_TTL_MS: i64 = 3000;
+
+/// 参与发送去重的通知类 header（仅通知通道存在重复发送语义）
+fn is_notification_header(header: &str) -> bool {
+    header == "DATA_NOTIFICATION"
+}
+
+/// 规范化帧类型标识：非空且不以 DATA_ 开头时补前缀（接收端只识别 DATA_*）
+pub fn normalize_header(header: &str) -> String {
+    if !header.is_empty() && !header.starts_with("DATA_") {
+        format!("DATA_{}", header)
+    } else {
+        header.to_string()
+    }
+}
+
+/// 创建发送队列并登记句柄（供统一启动入口调用）。返回句柄，0 表示失败。
+pub fn create_with_ctx(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let queue = Box::new(SenderQueue::new());
+    queue.set_ctx_ptr(ctx_ptr);
+    let handle = crate::handle::put(Box::into_raw(queue) as *mut std::os::raw::c_void);
+
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    if let Ok(mut guard) = ctx.lock() {
+        guard.sender_queue = handle;
+    }
+
+    handle
+}
+
+/// 启动队列后台工作者（供统一启动入口调用）。
+pub fn start_worker_for(ctx_ptr: usize, queue_handle: u64) {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    queue.start_worker(ctx_ptr);
+}
+
+/// 写入一条待发送报文（header 规范化、去重键推导与发送去重均在此完成）。
+///
+/// 发送去重仅作用于通知类消息（`DATA_NOTIFICATION`）：其他通道无重复语义。
+/// 返回：1=已入队 0=命中去重丢弃（仅通知类） -1=参数无效或队列未初始化。
+pub fn enqueue_message(
+    ctx_ptr: usize,
+    queue_handle: u64,
+    device_uuid: &str,
+    header: &str,
+    plaintext: &str,
+) -> i32 {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return -1;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    let hdr = normalize_header(header);
+
+    let is_notification = is_notification_header(&hdr);
+
+    let dedup_key = if is_notification {
+        let key = crate::dedup::compute_dedup_key(device_uuid, plaintext);
+        let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+        let dedup_ok = match ctx.lock() {
+            Ok(mut g) => {
+                g.dedup.maybe_cleanup();
+                g.dedup.check_and_pend(&key, SENT_DEDUP_TTL_MS)
+            }
+            Err(_) => return -1,
+        };
+        if !dedup_ok {
+            return 0;
+        }
+        Some(key)
+    } else {
+        None
+    };
+
+    // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
+    // 断线期间的通知累积是有益的，恢复后应完整补收（实时状态的丢弃在 state_merge / sender_queue 内处理）。
+    //
+    // 仅对 DATA_NOTIFICATION 注入：其他通道（图标/应用列表/控制等）的模型未声明 `ts`，
+    // 注入会触发 `normalize_or_keep` 的"往返丢字段"兜底并产生无谓告警，且这些通道无时效语义。
+    let plaintext = if is_notification {
+        crate::timestamp::inject_ts(plaintext, crate::timestamp::now_ms())
+    } else {
+        plaintext.to_string()
+    };
+
+    queue.enqueue(SendItem {
+        device_uuid: device_uuid.to_string(),
+        header: hdr,
+        plaintext,
+        dedup_key,
+        retries_left: 0,
+        coalesce_key: None,
+    });
+    // 补清理队列丢弃项遗留的去重键（此处未持有 ctx 锁）
+    queue.flush_orphan_keys();
+    1
+}
+
+/// 读取上下文中的发送队列句柄（未启动时为 0）。
+pub fn handle_of(ctx_ptr: usize) -> u64 {
+    if ctx_ptr == 0 {
+        return 0;
+    }
+    let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
+    match ctx.lock() {
+        Ok(guard) => guard.sender_queue,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn create_ctx() -> Mutex<crate::CoreContext> {
+        let p = std::env::temp_dir()
+            .join(format!("nrsq_ctx_{}", std::process::id()))
+            .join("rust_core.db");
+        Mutex::new(crate::CoreContext::with_db_override(p))
+    }
+
+    #[test]
+    fn normalize_header_cases() {
+        assert_eq!(normalize_header("ICON_REQUEST"), "DATA_ICON_REQUEST");
+        assert_eq!(normalize_header("DATA_JSON"), "DATA_JSON");
+        assert_eq!(normalize_header("DATA_"), "DATA_");
+        assert_eq!(normalize_header(""), "");
+    }
+
+    #[test]
+    fn enqueue_message_params_and_dedup() {
+        let ctx = create_ctx();
+        let ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+
+        // 空上下文 / 队列未初始化 → -1
+        assert_eq!(enqueue_message(0, 0, "", "", ""), -1);
+        assert_eq!(enqueue_message(ptr, 0, "", "", ""), -1);
+
+        let queue_handle = create_with_ctx(ptr);
+        assert_ne!(queue_handle, 0);
+
+        let body = r#"{"a":1}"#;
+        let body2 = r#"{"a":2}"#;
+
+        // 通知：首次入队 → 1
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body),
+            1
+        );
+        // 通知：同一 (uuid, plaintext) 在 TTL 内重复 → 0
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body),
+            0
+        );
+        // 通知：不同 plaintext → 1
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "DATA_NOTIFICATION", body2),
+            1
+        );
+        // 非通知通道不去重：同一负载连续两次都入队
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "ICON_REQUEST", body),
+            1
+        );
+        assert_eq!(
+            enqueue_message(ptr, queue_handle, "uuid-1", "ICON_REQUEST", body),
+            1
+        );
+
+        let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+        assert_eq!(queue.pending_count(), 4);
+    }
+
+    /// 传输层未启动时 try_send 必须报告离线（不再回落旧 TCP）。
+    #[test]
+    fn try_send_reports_offline_without_transport() {
+        let ctx = create_ctx();
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+
+        let item = SendItem {
+            device_uuid: "peer".to_string(),
+            header: "DATA_NOTIFICATION".to_string(),
+            plaintext: r#"{"title":"t"}"#.to_string(),
+            dedup_key: None,
+            retries_left: 0,
+            coalesce_key: None,
+        };
+        assert!(
+            matches!(
+                SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+                SendOutcome::Offline
+            ),
+            "QUIC 传输层未启动时必须报告离线"
+        );
+    }
+
+    /// 已建立 QUIC 会话时，try_send 必须经该会话成功投递。
+    #[test]
+    fn try_send_delivers_over_quic_session() {
+        use crate::crypto::{cert, ecdh};
+        use crate::quic::QuicTransport;
+        use std::sync::mpsc;
+
+        let (secret_a, _) = ecdh::generate_keypair();
+        let (secret_b, _) = ecdh::generate_keypair();
+        let cert_a = cert::derive_cert(&secret_a, "peer-a").expect("A 证书");
+        let cert_b = cert::derive_cert(&secret_b, "peer-b").expect("B 证书");
+        let fp_b = cert_b.fingerprint.clone();
+
+        // 对端：接收帧
+        let server = QuicTransport::new().expect("创建服务端");
+        let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+        let port = server
+            .start_server(
+                0,
+                cert_b,
+                |_, _| {},
+                move |_u, h, p| {
+                    let _ = tx.send((h, p));
+                },
+            )
+            .expect("启动服务端");
+
+        // 本机：作为客户端连上对端，并把传输层放进上下文
+        let client = QuicTransport::new().expect("创建客户端");
+        client.set_local_cert(cert_a);
+        client
+            .connect("peer", "127.0.0.1", port, Some(&fp_b))
+            .expect("连接");
+
+        let ctx = create_ctx();
+        let ctx_ptr = &ctx as *const Mutex<crate::CoreContext> as usize;
+        {
+            let mut guard = ctx.lock().unwrap();
+            guard.quic = Some(std::sync::Arc::new(client));
+            guard
+                .device_ips
+                .lock()
+                .unwrap()
+                .insert("peer".to_string(), "127.0.0.1".to_string());
+        }
+
+        let item = SendItem {
+            device_uuid: "peer".to_string(),
+            header: "DATA_NOTIFICATION".to_string(),
+            plaintext: r#"{"title":"quic"}"#.to_string(),
+            dedup_key: None,
+            retries_left: 0,
+            coalesce_key: None,
+        };
+        assert!(
+            matches!(
+                SenderQueue::try_send(ctx_ptr, &item).unwrap(),
+                SendOutcome::Sent
+            ),
+            "已建立 QUIC 会话时必须投递成功"
+        );
+
+        let (header, payload) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("对端应收到帧");
+        assert_eq!(header, "DATA_NOTIFICATION");
+        assert_eq!(payload, br#"{"title":"quic"}"#.to_vec());
     }
 }

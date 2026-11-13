@@ -11,7 +11,7 @@
 //! 但接收端 Rust 会把 DELTA 合并回全量再交给 App。
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -68,6 +68,29 @@ pub enum MergeOutcome {
     Dropped,
 }
 
+/// 同会话下发锁上限：超出时回收未被持有的条目。
+const DELIVERY_LOCKS_MAX: usize = 256;
+
+/// 会话键（`device_uuid|feature_id`）→ 下发锁。
+///
+/// 锁覆盖「合并 → 平台回调」全过程；锁序恒为 delivery → ctx。
+static DELIVERY_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// 取指定会话的下发锁（不存在时创建）。
+fn delivery_lock(key: &str) -> Arc<Mutex<()>> {
+    let map = DELIVERY_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = locks.get(key) {
+        return existing.clone();
+    }
+    if locks.len() >= DELIVERY_LOCKS_MAX {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key.to_string(), lock.clone());
+    lock
+}
+
 pub struct StateMerge {
     senders: HashMap<String, SenderState>,
     receivers: HashMap<String, ReceiverState>,
@@ -96,6 +119,18 @@ impl StateMerge {
                 remote_uuid,
                 feature_id
             );
+        }
+    }
+
+    /// 入站报文的会话 feature id：媒体为固定会话键，超级岛取 wire 的 `featureKeyValue`。
+    pub fn incoming_feature_id(is_media: bool, v: &Value) -> String {
+        if is_media {
+            MEDIA_KEY.to_string()
+        } else {
+            v.get("featureKeyValue")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
         }
     }
 
@@ -225,14 +260,7 @@ impl StateMerge {
         payload: &str,
     ) -> Option<MergeOutcome> {
         let v: Value = serde_json::from_str(payload).ok()?;
-        let feature_id = if is_media {
-            MEDIA_KEY.to_string()
-        } else {
-            v.get("featureKeyValue")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
+        let feature_id = Self::incoming_feature_id(is_media, &v);
         if feature_id.is_empty() {
             return None;
         }
@@ -485,7 +513,7 @@ pub fn parse_superisland_inbound(uuid: &str, pkg: &str, full_json: &str) -> Valu
     let feature_id = if !feature_key_value.trim().is_empty() {
         feature_key_value.to_string()
     } else {
-        crate::ffi::utils::compute_feature_id_impl(package_name, param_raw, title_raw, text_raw, "")
+        crate::utils::compute_feature_id(package_name, param_raw, title_raw, text_raw, "")
     };
 
     let is_end = terminate_value == TERMINATE_VALUE;
@@ -575,6 +603,11 @@ pub fn parse_notification_inbound(full_json: &str) -> Value {
 /// - `mediaType`/`packageName`/`appName`/`title`/`text`/`coverImage`：字符串，空时为 `null`
 /// - `isPlaying`：bool，缺省 `true`
 /// - `time`：i64，缺省 `0`（由平台自行替换为当前时间）
+/// - `timerType`/`timerWhen`/`timerTotal`/`timerSystemCurrent`：i64，缺省 `0`；
+///   口径与超级岛计时器组件一致（`timerType`：1 正计时进行中、2 正计时暂停，
+///   `timerWhen` 为位置归零时刻、`timerTotal` 为总时长、`timerSystemCurrent` 为采样时刻），
+///   接收端据此在本地推进显示进度，发送端无需按进度高频推送
+/// - `songKey`：字符串，空时为 `null`；歌词滚动期间保持不变，供接收端判定换曲
 /// - `isEnd`：`mediaType` 忽略大小写等于 `"END"` 或 `terminateValue == TERMINATE_VALUE`
 ///
 /// 非 JSON 对象时返回 `Value::Null`。
@@ -605,6 +638,39 @@ pub fn parse_media_inbound(full_json: &str) -> Value {
 
     let is_end = media_type.eq_ignore_ascii_case("END") || terminate_value == TERMINATE_VALUE;
 
+    // 播放进度：优先取计时器口径字段，缺省时由「采样位置 + 采样时刻」推导出等价的归零时刻。
+    let opt_i64 = |key: &str| -> Option<i64> { obj.get(key).and_then(|x| x.as_i64()) };
+    let position_ms = opt_i64("positionMs");
+    let duration_ms = opt_i64("durationMs");
+    let position_at = opt_i64("positionAt").filter(|v| *v > 0);
+    let timer_total = opt_i64("timerTotal").or(duration_ms).unwrap_or(0);
+    let timer_system_current = opt_i64("timerSystemCurrent")
+        .filter(|v| *v > 0)
+        .or(position_at)
+        .unwrap_or(0);
+    let timer_when = opt_i64("timerWhen")
+        .filter(|v| *v > 0)
+        .or_else(|| {
+            let sampled_at = timer_system_current;
+            let position = position_ms?;
+            if sampled_at > 0 {
+                Some(sampled_at - position)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    // 有总时长才视为可推进；正计时 1 前进、2 暂停，与超级岛计时器组件同口径。
+    let timer_type = if timer_total > 0 {
+        if is_playing {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+
     json!({
         "mediaType": opt_str("mediaType"),
         "packageName": opt_str("packageName"),
@@ -612,9 +678,14 @@ pub fn parse_media_inbound(full_json: &str) -> Value {
         "title": opt_str("title"),
         "text": opt_str("text"),
         "coverImage": opt_str("coverUrl"),
+        "songKey": opt_str("songKey"),
         "isPlaying": is_playing,
         "isEnd": is_end,
         "time": time,
+        "timerType": timer_type,
+        "timerWhen": timer_when,
+        "timerTotal": timer_total,
+        "timerSystemCurrent": timer_system_current,
     })
 }
 
@@ -810,7 +881,7 @@ pub fn enqueue_resync_request(
     if queue_handle == 0 {
         return;
     }
-    let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *const SenderQueue) };
+    let q = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
     let payload = json!({
         "type": "RESEND_FULL",
         "feature": feature_id,
@@ -848,6 +919,17 @@ pub fn handle_state_message(
         Ok(v) => v,
         Err(_) => return false,
     };
+    // 同会话「合并 → 平台回调」整体互斥，锁序恒为 delivery → ctx；
+    // 覆盖合并与回调之间已释放 ctx 锁的窗口。无 featureId 的报文不参与串行化。
+    let feature_id = StateMerge::incoming_feature_id(is_media, &v);
+    let session_lock = if feature_id.is_empty() {
+        None
+    } else {
+        Some(delivery_lock(&StateMerge::key(uuid, &feature_id)))
+    };
+    let _delivery_guard = session_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     if v.get("type").and_then(|x| x.as_str()) == Some("SI_ACK") {
         let fid = v
             .get("featureKeyValue")
@@ -887,18 +969,18 @@ pub fn handle_state_message(
     let wire_val: Value = serde_json::from_str(&full).unwrap_or(Value::Object(Map::new()));
     let wire_hash = sha256_hex(&full);
     let wire = build_full_wire(&wire_val, &fid, &wire_hash, is_end);
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return false;
         };
-        (g.router.on_data, g.router.user_data)
+        g.router.on_data.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let mt_c =
-            CString::new(if is_media { "MEDIAPLAY" } else { "SUPERISLAND" }).unwrap_or_default();
-        let wire_c = CString::new(wire).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), mt_c.as_ptr(), wire_c.as_ptr(), ud);
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(
+            uuid,
+            if is_media { "MEDIAPLAY" } else { "SUPERISLAND" },
+            &wire,
+        );
     }
     // 超级岛需回 ACK（媒体不需要），用于发送端清除 pending / 超时强制全量
     // 无前文时不发 ACK，让发送端超时后强制发全量
@@ -906,7 +988,7 @@ pub fn handle_state_message(
         if let Some(hash) = v.get("hash").and_then(|x| x.as_str()) {
             let queue_handle = ctx.lock().ok().map(|g| g.sender_queue).unwrap_or(0);
             if queue_handle != 0 {
-                let q = unsafe { &*(crate::ffi::handle::get(queue_handle) as *mut SenderQueue) };
+                let q = unsafe { &*(crate::handle::get(queue_handle) as *mut SenderQueue) };
                 let ack = json!({
                     "type": "SI_ACK",
                     "device": uuid,
@@ -963,22 +1045,25 @@ pub fn handle_state_message(
     true
 }
 
-/// 启动后台心跳线程（在 nrc_init 中调用一次）。
+/// 启动后台心跳线程（在上下文创建时调用一次）。
 /// 每秒 tick：锁内收集待查询会话快照 → 释放锁 → 调用平台查询回调（返回状态码）
-/// → 重新加锁处理结果。回调必须在锁外执行，因为平台回调内可能直接调 `nrc_push_*`。
+/// → 重新加锁处理结果。回调必须在锁外执行，因为平台回调内可能直接调 `push_*`。
 pub fn start_heartbeat_thread(ctx_ptr: usize) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
+        if crate::lifecycle::is_shutdown_requested() {
+            log::warn!("状态合并: 收到关停请求，心跳线程退出");
+            return;
+        }
         let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
         let now = Instant::now();
-        let (cb, user_data, queries) = {
+        let (cb, queries) = {
             let mut guard = match ctx.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
             (
-                guard.router.on_state_query,
-                guard.router.user_data,
+                guard.router.on_state_query.clone(),
                 guard.state_merge.heartbeat_tick(now),
             )
         };
@@ -991,15 +1076,12 @@ pub fn start_heartbeat_thread(ctx_ptr: usize) {
         };
         let mut results: Vec<(String, String, i32)> = Vec::with_capacity(queries.len());
         for (device_uuid, feature_id, is_media) in queries {
-            let uuid_c = CString::new(device_uuid.clone()).unwrap_or_default();
-            let fid_c = CString::new(feature_id.clone()).unwrap_or_default();
-            let code = cb_fn(uuid_c.as_ptr(), fid_c.as_ptr(), is_media as i32, user_data);
+            let code = cb_fn(&device_uuid, &feature_id, is_media);
             results.push((device_uuid, feature_id, code));
         }
         if let Ok(mut guard) = ctx.lock() {
             if guard.sender_queue != 0 {
-                let q =
-                    unsafe { &*(crate::ffi::handle::get(guard.sender_queue) as *mut SenderQueue) };
+                let q = unsafe { &*(crate::handle::get(guard.sender_queue) as *mut SenderQueue) };
                 guard.state_merge.apply_query_results(q, results);
             }
         }
@@ -1010,6 +1092,51 @@ impl Default for StateMerge {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ===== 上下文级状态合并入口 =====
+
+/// 推送全量状态；返回 true 表示已入队。
+pub fn push_state(
+    ctx_ptr: usize,
+    queue_handle: u64,
+    device_uuid: &str,
+    full_json: &str,
+    is_end: bool,
+    is_query: bool,
+    is_media: bool,
+) -> i32 {
+    if ctx_ptr == 0 || queue_handle == 0 {
+        return -1;
+    }
+    let queue = unsafe { &*(crate::handle::get(queue_handle) as *const SenderQueue) };
+    let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
+    let Ok(mut guard) = ctx.lock() else {
+        return -1;
+    };
+    if guard
+        .state_merge
+        .push_state(queue, device_uuid, is_media, full_json, is_end, is_query)
+    {
+        0
+    } else {
+        -1
+    }
+}
+
+/// 解析超级岛入站报文，返回归一结构 JSON 字符串。
+pub fn parse_superisland_inbound_json(device_uuid: &str, pkg: &str, full_json: &str) -> String {
+    parse_superisland_inbound(device_uuid, pkg, full_json).to_string()
+}
+
+/// 解析通知入站报文。
+pub fn parse_notification_inbound_json(full_json: &str) -> String {
+    parse_notification_inbound(full_json).to_string()
+}
+
+/// 解析媒体入站报文。
+pub fn parse_media_inbound_json(full_json: &str) -> String {
+    parse_media_inbound(full_json).to_string()
 }
 
 #[cfg(test)]
@@ -1238,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_media_need_full_enqueues_resync_request() {
-        use crate::ffi::handle as hdl;
+        use crate::handle as hdl;
         let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
@@ -1277,7 +1404,7 @@ mod tests {
 
     #[test]
     fn test_resync_request_triggers_full_resend() {
-        use crate::ffi::handle as hdl;
+        use crate::handle as hdl;
         let ctx = Mutex::new(CoreContext::new());
         let queue = Box::new(SenderQueue::new());
         let qh = hdl::put(Box::into_raw(queue) as *mut c_void);
@@ -1478,5 +1605,87 @@ mod tests {
             .to_string(),
         );
         assert_eq!(v["title"], "t", "通知解析不受时间戳影响");
+    }
+
+    /// 同会话并发下发：不得重叠，且按时间戳单调递增、末次为最新状态。
+    #[test]
+    fn test_concurrent_media_states_deliver_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Probe {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+        }
+
+        let probe = Arc::new(Probe {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let delivered: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let ctx = Arc::new(Mutex::new(CoreContext::new()));
+        {
+            let probe_cb = probe.clone();
+            let delivered_cb = delivered.clone();
+            let mut guard = ctx.lock().unwrap();
+            guard.router.on_data = Some(Arc::new(
+                move |_uuid: &str, _msg_type: &str, plaintext: &str| {
+                    let in_flight = probe_cb.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    probe_cb
+                        .max_in_flight
+                        .fetch_max(in_flight, Ordering::SeqCst);
+                    // 单次下发窗口 5ms
+                    std::thread::sleep(Duration::from_millis(5));
+                    let title = serde_json::from_str::<Value>(plaintext)
+                        .ok()
+                        .and_then(|v| v.get("title").and_then(|x| x.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    delivered_cb
+                        .lock()
+                        .unwrap()
+                        .push(title.trim_start_matches("track").parse().unwrap_or(-1));
+                    probe_cb.in_flight.fetch_sub(1, Ordering::SeqCst);
+                },
+            ));
+        }
+
+        let base = crate::timestamp::now_ms();
+        let mut handles = Vec::new();
+        for index in 0..8i64 {
+            let ctx = ctx.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = json!({
+                    "type": "MEDIA_PLAY",
+                    "title": format!("track{}", index),
+                    "text": "artist",
+                    "coverUrl": "",
+                    "isPlaying": true,
+                    "ts": base + index,
+                })
+                .to_string();
+                handle_state_message(&ctx, "order-peer", true, &payload);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let sequence = delivered.lock().unwrap().clone();
+        assert_eq!(
+            probe.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "同会话下发不得并发"
+        );
+        assert!(
+            sequence.windows(2).all(|pair| pair[0] < pair[1]),
+            "下发必须按时间戳单调递增: {:?}",
+            sequence
+        );
+        assert_eq!(
+            sequence.last().copied(),
+            Some(7),
+            "末次下发必须是时间戳最新的状态: {:?}",
+            sequence
+        );
     }
 }

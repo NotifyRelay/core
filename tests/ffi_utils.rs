@@ -10,13 +10,53 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use notify_relay_core::{ffi, CoreContext, SafeContext};
 
+/// 进程内已创建的临时库目录；进程退出时统一清理，避免在 TEMP 下堆积。
+/// 上下文序号：保证每个测试上下文使用独立的临时数据库。
 static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// 清理本进程及历史遗留的全部测试临时库目录。
+fn prune_temp_dirs() {
+    // 清本进程登记的目录
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        for dir in dirs.drain(..) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    // 清历史进程遗留（进程已退出，目录残留）：按前缀匹配自己的测试库
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("nrctx_") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 注册进程退出清理（只注册一次）。
+fn register_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn on_exit() {
+            prune_temp_dirs();
+        }
+        // SAFETY: 回调只做文件删除，不访问其他全局状态
+        unsafe { libc::atexit(on_exit) };
+    });
+}
+
 fn create_ctx() -> SafeContext {
     let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = std::env::temp_dir()
-        .join(format!("nrctx_{}_{}", std::process::id(), n))
-        .join("rust_core.db");
-    Mutex::new(CoreContext::with_db_override(p))
+    let dir = std::env::temp_dir().join(format!("nrctx_{}_{}", std::process::id(), n));
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        dirs.push(dir.clone());
+    }
+    register_cleanup_once();
+    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
 }
 
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
@@ -133,39 +173,41 @@ fn test_compute_feature_id_distinguishes_inputs() {
 fn test_content_dedup_action_semantics() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("App");
     let title = cstr("Title");
     let text = cstr("Body");
 
     // 未标记 → 0（未见）
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
     // 标记已见 → 0
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, title, text) },
         0
     );
     // 窗口内已见 → 1（纯查询不改变状态，重复查询结果一致）
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
     // 清除内容键 → 0，之后未见
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 2, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 2, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
 
     unsafe {
+        free_cstr(app);
         free_cstr(title);
         free_cstr(text);
     }
@@ -175,34 +217,36 @@ fn test_content_dedup_action_semantics() {
 fn test_content_dedup_edge_cases() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("");
     let title = cstr("");
     let text = cstr("");
 
     // 空上下文 → -1
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(std::ptr::null_mut(), 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(std::ptr::null_mut(), 0, app, title, text) },
         -1
     );
     // 非法 action → -1
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 99, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 99, app, title, text) },
         -1
     );
     // 空 title/text 仍可用
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, title, text) },
         0
     );
     assert_eq!(
-        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, title, text) },
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, title, text) },
         1
     );
 
     unsafe {
+        free_cstr(app);
         free_cstr(title);
         free_cstr(text);
     }
@@ -212,17 +256,28 @@ fn test_content_dedup_edge_cases() {
 fn test_content_dedup_key_isolation() {
     let ctx = create_ctx();
     let ptr = ctx_ptr(&ctx);
+    let app = cstr("App");
     let t1 = cstr("A");
     let x1 = cstr("1");
     let t2 = cstr("A");
     let x2 = cstr("2");
 
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 1, t1, x1) }, 0);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 1, app, t1, x1) },
+        0
+    );
     // 键不同的 (title,text) 互不影响
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t2, x2) }, 0);
-    assert_eq!(unsafe { ffi::utils::nrc_content_dedup(ptr, 0, t1, x1) }, 1);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, t2, x2) },
+        0
+    );
+    assert_eq!(
+        unsafe { ffi::utils::nrc_content_dedup(ptr, 0, app, t1, x1) },
+        1
+    );
 
     unsafe {
+        free_cstr(app);
         free_cstr(t1);
         free_cstr(x1);
         free_cstr(t2);
@@ -301,17 +356,43 @@ fn test_dedup_keys_independent() {
 
 #[test]
 fn test_should_deduplicate_identical_returns_1() {
+    let na = cstr("App");
     let nt = cstr("Hello");
     let ntx = cstr("World");
+    let oa = cstr("App");
     let ot = cstr("Hello");
     let otx = cstr("World");
     assert_eq!(
-        unsafe { ffi::utils::nrc_should_deduplicate(nt, ntx, ot, otx) },
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
         1
     );
     unsafe {
+        free_cstr(na);
         free_cstr(nt);
         free_cstr(ntx);
+        free_cstr(oa);
+        free_cstr(ot);
+        free_cstr(otx);
+    }
+}
+
+#[test]
+fn test_should_deduplicate_different_app_returns_0() {
+    let na = cstr("QQ");
+    let nt = cstr("Hello");
+    let ntx = cstr("World");
+    let oa = cstr("WeChat");
+    let ot = cstr("Hello");
+    let otx = cstr("World");
+    assert_eq!(
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
+        0
+    );
+    unsafe {
+        free_cstr(na);
+        free_cstr(nt);
+        free_cstr(ntx);
+        free_cstr(oa);
         free_cstr(ot);
         free_cstr(otx);
     }
@@ -319,17 +400,21 @@ fn test_should_deduplicate_identical_returns_1() {
 
 #[test]
 fn test_should_deduplicate_completely_different_returns_0() {
+    let na = cstr("App");
     let nt = cstr("Completely different title");
     let ntx = cstr("Completely different text body that is very long");
+    let oa = cstr("App");
     let ot = cstr("Something else entirely");
     let otx = cstr("Another message that shares no words with the other");
     assert_eq!(
-        unsafe { ffi::utils::nrc_should_deduplicate(nt, ntx, ot, otx) },
+        unsafe { ffi::utils::nrc_should_deduplicate(na, nt, ntx, oa, ot, otx) },
         0
     );
     unsafe {
+        free_cstr(na);
         free_cstr(nt);
         free_cstr(ntx);
+        free_cstr(oa);
         free_cstr(ot);
         free_cstr(otx);
     }
@@ -338,7 +423,10 @@ fn test_should_deduplicate_completely_different_returns_0() {
 #[test]
 fn test_should_deduplicate_empty_both_returns_1() {
     let e = cstr("");
-    assert_eq!(unsafe { ffi::utils::nrc_should_deduplicate(e, e, e, e) }, 1);
+    assert_eq!(
+        unsafe { ffi::utils::nrc_should_deduplicate(e, e, e, e, e, e) },
+        1
+    );
     unsafe { free_cstr(e) };
 }
 

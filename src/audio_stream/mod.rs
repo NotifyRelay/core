@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -14,9 +13,10 @@ use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 
 use crate::audio_codec::{JitterBuffer, OpusDecoder, OpusEncoder};
 
-pub type AudioDataCb = Option<extern "C" fn(*const c_char, *const u8, i32, i32, i32, *mut c_void)>;
-pub type AudioEventCb =
-    Option<extern "C" fn(*const c_char, *const c_char, *const c_char, *mut c_void)>;
+/// 音频 PCM 数据回调：`(device_uuid, pcm, sample_rate, channels)`。
+pub type AudioDataCb = Arc<dyn Fn(&str, &[u8], i32, i32) + Send + Sync>;
+/// 音频事件回调：`(device_uuid, event, data)`。
+pub type AudioEventCb = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 pub struct AudioStats {
     pub packets_sent: AtomicU64,
@@ -86,9 +86,8 @@ pub struct AudioStreamState {
     pub channels: i32,
     pub thread_handle: Option<thread::JoinHandle<()>>,
     pub playback_handle: Option<thread::JoinHandle<()>>,
-    pub on_data: AudioDataCb,
-    pub on_event: AudioEventCb,
-    pub user_data: *mut c_void,
+    pub on_data: Option<AudioDataCb>,
+    pub on_event: Option<AudioEventCb>,
     pub remote_uuid: String,
     pub peer_ip: String,
     pub peer_port: u16,
@@ -115,7 +114,6 @@ impl AudioStreamState {
             playback_handle: None,
             on_data: None,
             on_event: None,
-            user_data: std::ptr::null_mut(),
             remote_uuid: String::new(),
             peer_ip: String::new(),
             peer_port: 0,
@@ -290,8 +288,7 @@ fn start_read_thread(state: &mut AudioStreamState) {
     let active = state.active.clone();
     let sample_rate = state.sample_rate;
     let channels = state.channels;
-    let on_data = state.on_data;
-    let ud = state.user_data as usize;
+    let on_data = state.on_data.clone();
 
     let decoder = Arc::clone(&state.decoder);
     let jitter = Arc::clone(&state.jitter);
@@ -318,8 +315,6 @@ fn start_read_thread(state: &mut AudioStreamState) {
     state.thread_handle = Some(handle);
 
     let playback_handle = thread::spawn(move || {
-        let ud_ptr = ud as *mut c_void;
-
         let mut wait_count = 0;
         while active.load(Ordering::SeqCst) {
             if pcm_queue.lock().len() >= 3 {
@@ -337,7 +332,6 @@ fn start_read_thread(state: &mut AudioStreamState) {
         playback_loop(
             active,
             on_data,
-            ud_ptr,
             sample_rate,
             channels,
             pcm_queue,
@@ -348,6 +342,8 @@ fn start_read_thread(state: &mut AudioStreamState) {
     state.playback_handle = Some(playback_handle);
 }
 
+// 播放线程需要完整的一组运行期句柄；拆成结构体只是搬运字段，不增加可读性。
+#[allow(clippy::too_many_arguments)]
 fn read_loop(
     socket: UdpSocket,
     active: Arc<AtomicBool>,
@@ -485,8 +481,7 @@ fn read_loop(
 
 fn playback_loop(
     active: Arc<AtomicBool>,
-    on_data: AudioDataCb,
-    user_data: *mut c_void,
+    on_data: Option<AudioDataCb>,
     sample_rate: i32,
     channels: i32,
     pcm_queue: Arc<Mutex<VecDeque<Vec<i16>>>>,
@@ -513,22 +508,14 @@ fn playback_loop(
                 if is_silent_frame(&data, 50) {
                     stats.recv_silence_frames.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(cb) = on_data {
+                if let Some(ref cb) = on_data {
                     let pcm_bytes = unsafe {
                         std::slice::from_raw_parts(
                             data.as_ptr() as *const u8,
                             data.len() * std::mem::size_of::<i16>(),
                         )
                     };
-                    let dev = std::ffi::CString::new("").unwrap();
-                    cb(
-                        dev.as_ptr(),
-                        pcm_bytes.as_ptr(),
-                        pcm_bytes.len() as i32,
-                        sample_rate,
-                        channels,
-                        user_data,
-                    );
+                    cb("", pcm_bytes, sample_rate, channels);
                 }
 
                 frame_count += 1;
@@ -559,7 +546,9 @@ pub(crate) fn write_frame(state: &AudioStreamState, pcm_data: &[u8]) -> bool {
     }
 
     let pcm: Vec<i16> = pcm_data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
@@ -794,4 +783,215 @@ pub(crate) fn stop(state: &mut AudioStreamState) -> Vec<std::thread::JoinHandle<
     log::info!("音频流: 已停止");
 
     handles
+}
+
+// ===== 上下文级音频入口 =====
+
+use crate::SafeContext;
+
+/// 发送音频控制帧。
+///
+/// 入参为传输层句柄而非上下文引用：调用方不得持上下文锁执行网络发送，
+/// 否则发送阻塞时会锁死整条核心链路。
+fn send_control(
+    transport: &crate::quic::QuicTransport,
+    remote_uuid: &str,
+    action: &str,
+    sample_rate: i32,
+    channels: i32,
+) {
+    log::info!(
+        "音频流: send_control 开始 action={}, 远端UUID={}",
+        action,
+        remote_uuid
+    );
+    let payload = if action == "audioStart" {
+        format!(
+            r#"{{"type":"MEDIA_CONTROL","action":"{}","sampleRate":{},"channels":{},"codec":"opus"}}"#,
+            action, sample_rate, channels
+        )
+    } else {
+        format!(r#"{{"type":"MEDIA_CONTROL","action":"{}"}}"#, action)
+    };
+
+    // QUIC 已由 TLS 1.3 提供加密，直接发送明文业务载荷
+    match transport.send(remote_uuid, "DATA_MEDIA_CONTROL", payload.as_bytes()) {
+        Ok(()) => log::info!("音频流: 已发送控制消息 action={}", action),
+        Err(e) => log::warn!("音频流: 发送控制消息失败 action={}, error={}", action, e),
+    }
+}
+
+/// 启动音频流。`direction` 为 "send" 或 "recv"；返回 0 表示成功。
+pub fn start(
+    ctx: &SafeContext,
+    direction: &str,
+    port: i32,
+    sample_rate: i32,
+    channels: i32,
+    remote_uuid: &str,
+) -> i32 {
+    let p = port as u16;
+    log::info!(
+        "音频流: 启动 方向={}, 端口={}, 采样率={}, 声道数={}, 远端UUID={}",
+        direction,
+        port,
+        sample_rate,
+        channels,
+        remote_uuid
+    );
+
+    let start_ok = {
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
+        let mut audio_state = guard.audio.lock().unwrap();
+        audio_state.remote_uuid = remote_uuid.to_string();
+
+        match direction {
+            "send" => {
+                let resolved_ip = guard
+                    .device_ips
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(remote_uuid).cloned())
+                    .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+                    .unwrap_or_else(|| {
+                        log::error!("音频流: 无法解析对端IP uuid={}", remote_uuid);
+                        String::new()
+                    });
+                if resolved_ip.is_empty() {
+                    false
+                } else {
+                    audio_state.peer_ip = resolved_ip.clone();
+                    start_sender(&mut audio_state, &resolved_ip, p, sample_rate, channels)
+                }
+            }
+            "recv" => {
+                audio_state.peer_ip = String::new();
+                start_receiver(&mut audio_state, p, sample_rate, channels)
+            }
+            _ => {
+                log::error!("音频流: 未知方向 {}", direction);
+                false
+            }
+        }
+    };
+
+    if start_ok {
+        log::info!("音频流: 启动成功");
+        if direction == "send" {
+            let transport = ctx.lock().ok().and_then(|guard| guard.quic.clone());
+            match transport {
+                Some(transport) => {
+                    send_control(&transport, remote_uuid, "audioStart", sample_rate, channels)
+                }
+                None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
+            }
+        }
+        0
+    } else {
+        log::error!("音频流: 启动失败");
+        -1
+    }
+}
+
+/// 写入一帧 PCM 数据（16 位小端）。
+pub fn write_pcm_frame(ctx: &SafeContext, pcm_data: &[u8]) -> i32 {
+    if pcm_data.is_empty() {
+        return -1;
+    }
+    let Ok(guard) = ctx.lock() else {
+        return -1;
+    };
+    if let Ok(audio_state) = guard.audio.try_lock() {
+        if write_frame(&audio_state, pcm_data) {
+            return 0;
+        }
+    }
+    -1
+}
+
+/// 停止音频流。
+pub fn stop_stream(ctx: &SafeContext) -> i32 {
+    log::info!("音频流: 停止开始");
+
+    let (uuid, transport) = {
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
+        let uuid = guard.audio.lock().unwrap().remote_uuid.clone();
+        (uuid, guard.quic.clone())
+    };
+    if !uuid.is_empty() {
+        log::info!("音频流: 发送 audioStop 控制消息到 uuid={}", uuid);
+        match transport {
+            Some(transport) => send_control(&transport, &uuid, "audioStop", 0, 0),
+            None => log::warn!("音频流: QUIC 传输层未就绪，无法发送控制消息"),
+        }
+    }
+
+    let thread_handles = {
+        let Ok(guard) = ctx.lock() else {
+            return -1;
+        };
+        let mut audio_state = guard.audio.lock().unwrap();
+        stop(&mut audio_state)
+    };
+
+    for h in thread_handles {
+        log::info!("音频流: 等待线程退出");
+        h.join().ok();
+        log::info!("音频流: 线程已退出");
+    }
+
+    if let Ok(guard) = ctx.lock() {
+        let audio_state = guard.audio.lock().unwrap();
+        *audio_state.encoder.lock() = None;
+        *audio_state.decoder.lock() = None;
+        *audio_state.jitter.lock() = None;
+        audio_state.stats.reset();
+        audio_state.pcm_queue.lock().clear();
+        audio_state.pcm_buffer.lock().clear();
+    }
+
+    log::info!("音频流: 停止完成");
+    0
+}
+
+/// 音频流是否活跃。
+pub fn is_active(ctx: &SafeContext) -> bool {
+    let Ok(guard) = ctx.lock() else {
+        return false;
+    };
+    let active = match guard.audio.try_lock() {
+        Ok(audio_state) => {
+            let active = audio_state.active.load(Ordering::SeqCst);
+            log::debug!("音频流: 查询活跃状态={}", active);
+            active
+        }
+        Err(_) => false,
+    };
+    active
+}
+
+/// 注册音频数据回调。
+pub fn register_data_cb(ctx: &SafeContext, cb: AudioDataCb) {
+    let Ok(guard) = ctx.lock() else {
+        return;
+    };
+    let data_result = guard.audio.lock();
+    if let Ok(mut audio_state) = data_result {
+        audio_state.on_data = Some(cb);
+    }
+}
+
+/// 注册音频事件回调。
+pub fn register_event_cb(ctx: &SafeContext, cb: AudioEventCb) {
+    let Ok(guard) = ctx.lock() else {
+        return;
+    };
+    let event_result = guard.audio.try_lock();
+    if let Ok(mut audio_state) = event_result {
+        audio_state.on_event = Some(cb);
+    }
 }

@@ -1,80 +1,50 @@
-use std::os::raw::c_char;
-use std::os::raw::c_void;
+//! ECDH C ABI 委托。
 
-use base64::Engine;
-
-use crate::crypto::{self, ecdh, hkdf};
+use std::os::raw::{c_char, c_void};
 
 use super::common::{from_cstr, to_cstr, with_ctx};
 
 #[no_mangle]
 pub extern "C" fn nrc_ecdh_generate_keypair(ctx_ptr: *mut c_void) -> i32 {
     with_ctx(ctx_ptr, |ctx| {
-        ctx.ensure_persistence_loaded();
-        let (secret, b64) = ecdh::generate_keypair();
-        ctx.crypto.local_key = Some(secret);
-        ctx.crypto.local_pub_key_b64 = Some(b64);
-        ctx.mark_persistence_dirty();
+        crate::crypto::ops::generate_keypair(ctx);
         0
     })
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_ecdh_get_public_key(ctx_ptr: *mut c_void) -> *mut c_char {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.ensure_persistence_loaded();
-        ctx.crypto
-            .local_pub_key_b64
-            .as_deref()
-            .map(to_cstr)
-            .unwrap_or(std::ptr::null_mut())
-    })
+    match with_ctx(ctx_ptr, crate::crypto::ops::public_key) {
+        Some(b64) => to_cstr(&b64),
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn nrc_ecdh_has_keypair(ctx_ptr: *mut c_void) -> i32 {
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.ensure_persistence_loaded();
-        if ctx.crypto.local_key.is_some() {
-            1
-        } else {
-            0
-        }
-    })
+    if with_ctx(ctx_ptr, crate::crypto::ops::has_keypair) {
+        1
+    } else {
+        0
+    }
 }
 
+/// # Safety
+/// 字符串指针须为空或有效 C 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn nrc_ecdh_derive_shared_secret(
     ctx_ptr: *mut c_void,
     peer_uuid: *const c_char,
     peer_pub_key_b64: *const c_char,
 ) -> i32 {
-    let uuid = from_cstr(peer_uuid).to_string();
-    let peer = from_cstr(peer_pub_key_b64).to_string();
-    with_ctx(ctx_ptr, |ctx| {
-        ctx.ensure_persistence_loaded();
-        if let Some(ref priv_key) = ctx.crypto.local_key {
-            match ecdh::compute_shared_secret(priv_key, &peer) {
-                Ok(shared) => {
-                    let aes_key = hkdf::derive_session_key(&shared);
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(aes_key);
-                    ctx.crypto.device_keys.insert(
-                        uuid.clone(),
-                        crypto::DeviceKeyEntry {
-                            remote_pub_key: peer.clone(),
-                            aes_key_b64: b64,
-                            aes_key_bytes: Some(aes_key),
-                        },
-                    );
-                    // 配对密钥：立即落库设备行（关键路径，防进程丢失）
-                    ctx.mark_persistence_dirty();
-                    ctx.persist_device_row_now(&uuid);
-                    0
-                }
-                Err(_) => -1,
-            }
-        } else {
-            -1
-        }
-    })
+    let uuid = unsafe { from_cstr(peer_uuid) }.to_string();
+    let peer = unsafe { from_cstr(peer_pub_key_b64) }.to_string();
+    let ok = with_ctx(ctx_ptr, |ctx| {
+        crate::crypto::ops::derive_shared_secret(ctx, &uuid, &peer)
+    });
+    if ok {
+        0
+    } else {
+        -1
+    }
 }

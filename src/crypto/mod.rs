@@ -1,6 +1,8 @@
 pub mod aes;
+pub mod cert;
 pub mod ecdh;
 pub mod hkdf;
+pub mod ops;
 pub mod spake2;
 
 use base64::Engine;
@@ -94,5 +96,11 @@ impl CryptoState {
                 aes_key_bytes,
             },
         );
+    }
+}
+
+impl Default for CryptoState {
+    fn default() -> Self {
+        Self::new()
     }
 }

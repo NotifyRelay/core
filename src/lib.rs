@@ -1,26 +1,35 @@
 #![allow(clippy::missing_safety_doc)]
 
+pub mod api;
 mod app_sync;
 pub mod audio_codec;
 pub mod audio_stream;
 mod clipboard;
-mod crypto;
+pub mod crypto;
 mod dedup;
 pub mod device_registry;
 pub mod diff;
-mod discovery;
+pub mod discovery;
 pub mod ffi;
 mod filter;
+pub mod handle;
 mod heartbeat;
+pub mod lifecycle;
+mod log_bridge;
 mod models;
 mod network;
 mod persistence;
-mod protocol;
+mod processing;
+pub mod protocol;
+pub mod quic;
 pub mod reconnect;
 mod router;
+pub mod send;
 pub mod sender_queue;
+mod service;
 mod state_merge;
 mod timestamp;
+pub mod utils;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -42,10 +51,12 @@ pub struct CoreContext {
     pub discovery: discovery::DiscoveryState,
     pub audio: Arc<Mutex<audio_stream::AudioStreamState>>,
     pub network: network::NetworkState,
+    /// QUIC 传输层（方案 B）：Arc 共享，便于「锁内取句柄、锁外发送」避免持锁做 I/O
+    pub quic: Option<std::sync::Arc<quic::QuicTransport>>,
     pub dedup: dedup::DedupState,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
-    pub filter: ffi::filter::FilterState,
+    pub filter: filter::FilterState,
     /// 设备运行时状态统一注册表
     pub registry: device_registry::DeviceRegistry,
     /// 按对端 uuid 隔离的配对会话：
@@ -60,6 +71,16 @@ pub struct CoreContext {
     pub broadcast_handle: Option<BroadcastHandle>,
     /// UUID → IP 映射（从 TCP 连接等收集）
     pub device_ips: Mutex<HashMap<String, String>>,
+    /// UUID → 该设备 mDNS 通告的全部可用地址（按优先级排序）。
+    ///
+    /// mDNS 会同时通告 IPv4/IPv6/多网卡地址，其中部分不可达。
+    /// 建连时按顺序逐个尝试，任一成功即可——不应只挑一个地址死磕。
+    pub device_addrs: Mutex<HashMap<String, Vec<String>>>,
+    /// UUID → 已确认不可达的地址集合。
+    ///
+    /// mDNS 会通告多个地址（含虚拟网卡、跨网段地址），其中部分不可达。
+    /// 建连失败后记入此处，后续尝试时排到最后（而非永久拉黑）。
+    pub failed_ips: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     // 新增字段
     /// 统一心跳调度器句柄（扫描 known_devices 自动启停每设备心跳）
     pub heartbeat_scheduler: u64,
@@ -158,6 +179,8 @@ pub struct BroadcastInfo {
 
 pub struct BroadcastHandle {
     pub running: Arc<AtomicBool>,
+    /// mDNS 发现句柄（停止时注销并关闭 daemon）
+    pub mdns: Option<Arc<std::sync::Mutex<crate::discovery::mdns::MdnsDiscovery>>>,
 }
 
 impl CoreContext {
@@ -169,12 +192,15 @@ impl CoreContext {
             discovery: discovery::DiscoveryState::new(),
             audio: Arc::new(Mutex::new(audio_stream::AudioStreamState::new())),
             network: network::NetworkState::new(),
+            quic: None,
             dedup: dedup::DedupState::new(),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),
-            filter: ffi::filter::FilterState::new(),
+            filter: filter::FilterState::new(),
             registry: device_registry::DeviceRegistry::new(),
             device_ips: Mutex::new(HashMap::new()),
+            device_addrs: Mutex::new(HashMap::new()),
+            failed_ips: Mutex::new(HashMap::new()),
             pairing_sessions: HashMap::new(),
             pairing_code: None,
             pairing_code_expiry: None,
@@ -293,6 +319,22 @@ impl CoreContext {
                 log::warn!("持久化库存在但打开失败，将在下次调用时重试");
             }
         }
+    }
+
+    /// 取「mDNS 句柄 + 当前电量」快照，供锁外刷新 TXT 记录。
+    ///
+    /// mDNS 的 TXT 记录在注册时固化，电量变化必须重注册才会被对端看到。
+    /// 重注册是跨线程的传输层操作，必须在释放上下文锁之后执行：
+    /// 持锁做 I/O 会让锁在 daemon 阻塞期间不可用，波及全部核心调用。
+    pub fn mdns_battery_target(
+        &self,
+    ) -> Option<(
+        Arc<std::sync::Mutex<crate::discovery::mdns::MdnsDiscovery>>,
+        i32,
+    )> {
+        let battery = self.broadcast_info.as_ref().map(|b| b.battery)?;
+        let mdns = self.broadcast_handle.as_ref()?.mdns.as_ref()?.clone();
+        Some((mdns, battery))
     }
 
     pub fn mark_persistence_dirty(&mut self) {
@@ -510,3 +552,7 @@ impl Default for CoreContext {
 }
 
 pub type SafeContext = Mutex<CoreContext>;
+
+// UniFFI 脚手架：生成 Kotlin 绑定所需的元数据与符号。
+// 由 gobley-uniffi-bindgen 0.3.7 从编译产物中读取。
+uniffi::setup_scaffolding!("notify_relay_core");

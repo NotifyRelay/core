@@ -1,69 +1,55 @@
-use std::os::raw::c_char;
-use std::os::raw::c_void;
+//! 平台回调集合。
+//!
+//! 内部以 `Arc<dyn Fn>` 闭包持有，注册方（UniFFI 导出层或 C ABI 委托层）负责把
+//! 平台对象包装成闭包；内部调用点只传 Rust 类型，不再涉及 C 字符串与 `user_data`。
 
-pub type OnPairingCb = Option<
-    extern "C" fn(
-        *const c_char, // device_uuid
-        *const c_char, // message_type: "HANDSHAKE", "PAIRING_INIT", "PAIRING_RESP", "ACCEPT", "REJECT", "HEARTBEAT_TCP", "RESULT"
-        *const c_char, // data (JSON格式，包含所有字段)
-        i32,           // int_value (battery, success等)
-        *const c_char, // extra (pub_key, ip等)
-        *mut c_void,   // user_data
-    ),
->;
+use std::sync::Arc;
 
-pub type OnDataCb = Option<
-    extern "C" fn(
-        *const c_char, // device_uuid
-        *const c_char, // message_type: "NOTIFICATION", "MEDIAPLAY", "ICON_REQUEST", ...
-        *const c_char, // plaintext
-        *mut c_void,   // user_data
-    ),
->;
+/// 配对/握手过程消息。
+///
+/// 参数：`(device_uuid, message_type, data, int_value, extra)`。
+/// `message_type` 取值："HANDSHAKE" / "PAIRING_INIT" / "PAIRING_RESP" / "ACCEPT" /
+/// "REJECT" / "HEARTBEAT_TCP" / "RESULT"。
+pub type OnPairing = Arc<dyn Fn(&str, &str, &str, i32, &str) + Send + Sync>;
 
-/// 状态查询回调（心跳线程锁外调用）：
-/// 参数为 (device_uuid, feature_id, is_media, user_data)，返回状态码：
-/// 0 = 该会话在平台上不存在（引擎应移除会话，不发任何包）
-/// 1 = 存在且无变更（引擎保活）
-/// 2 = 存在且有变更（平台会随后通过 `nrc_push_*`(is_query=1)` 推送新状态）
-pub type OnStateQueryCb =
-    Option<extern "C" fn(*const c_char, *const c_char, i32, *mut c_void) -> i32>;
+/// 入站数据报文；`message_type` 如 "NOTIFICATION" / "MEDIAPLAY" / "ICON_REQUEST"。
+pub type OnData = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
-pub type OnDeviceTimeoutCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+/// 状态查询（心跳线程锁外调用）。
+///
+/// 返回 0=该会话在平台不存在（引擎应移除会话）、1=存在且无变更、2=存在且有变更。
+pub type OnStateQuery = Arc<dyn Fn(&str, &str, bool) -> i32 + Send + Sync>;
 
-pub type OnDeviceConnectedCb = Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>;
-pub type OnDeviceDisconnectedCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
-pub type OnTcpErrorCb = Option<extern "C" fn(*const c_char, *mut c_void)>;
+/// 设备超时（离线）。
+pub type OnDeviceTimeout = Arc<dyn Fn(&str) + Send + Sync>;
 
-pub type OnDeviceDiscoveredCb = Option<
-    extern "C" fn(
-        *const c_char, // device_uuid
-        *const c_char, // name_b64
-        u16,           // port
-        i32,           // battery
-        *const c_char, // device_type
-        *const c_char, // ip
-        *mut c_void,   // user_data
-    ),
->;
+/// 设备已连接。
+pub type OnDeviceConnected = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// 设备已断开。
+pub type OnDeviceDisconnected = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// TCP 层错误。
+pub type OnTcpError = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 发现新设备；`name_b64` 为设备名的 base64 编码。
+pub type OnDeviceDiscovered = Arc<dyn Fn(&str, &str, u16, i32, &str, &str) + Send + Sync>;
 
 pub struct Router {
-    pub user_data: *mut c_void,
-    pub on_pairing: OnPairingCb,
-    pub on_data: OnDataCb,
-    pub on_state_query: OnStateQueryCb,
+    pub on_pairing: Option<OnPairing>,
+    pub on_data: Option<OnData>,
+    pub on_state_query: Option<OnStateQuery>,
 
-    pub on_device_discovered: OnDeviceDiscoveredCb,
-    pub on_device_timeout: OnDeviceTimeoutCb,
-    pub on_device_connected: OnDeviceConnectedCb,
-    pub on_device_disconnected: OnDeviceDisconnectedCb,
-    pub on_tcp_error: OnTcpErrorCb,
+    pub on_device_discovered: Option<OnDeviceDiscovered>,
+    pub on_device_timeout: Option<OnDeviceTimeout>,
+    pub on_device_connected: Option<OnDeviceConnected>,
+    pub on_device_disconnected: Option<OnDeviceDisconnected>,
+    pub on_tcp_error: Option<OnTcpError>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
-            user_data: std::ptr::null_mut(),
             on_pairing: None,
             on_data: None,
             on_state_query: None,
@@ -73,5 +59,11 @@ impl Router {
             on_device_disconnected: None,
             on_tcp_error: None,
         }
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
     }
 }

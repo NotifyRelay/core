@@ -1,5 +1,3 @@
-use std::ffi::CString;
-
 use base64::Engine;
 
 use crate::{
@@ -8,7 +6,7 @@ use crate::{
     SafeContext,
 };
 
-use super::send::do_send_via_network;
+use crate::send::send_via_quic;
 
 fn fire_pairing_cb(
     ctx: &SafeContext,
@@ -18,25 +16,14 @@ fn fire_pairing_cb(
     int_value: i32,
     extra: &str,
 ) {
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return;
         };
-        (g.router.on_pairing, g.router.user_data)
+        g.router.on_pairing.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let type_c = CString::new(msg_type).unwrap_or_default();
-        let data_c = CString::new(data).unwrap_or_default();
-        let extra_c = CString::new(extra).unwrap_or_default();
-        cb_fn(
-            uuid_c.as_ptr(),
-            type_c.as_ptr(),
-            data_c.as_ptr(),
-            int_value,
-            extra_c.as_ptr(),
-            ud,
-        );
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(uuid, msg_type, data, int_value, extra);
     }
 }
 
@@ -49,11 +36,12 @@ fn fire_pairing_cb(
 /// 2. 触发本机 `on_pairing("REJECT")` 与 `on_pairing("RESULT")`，data/extra 携带 reason。
 fn reject_with_reason(ctx: &SafeContext, uuid: &str, reason: &str) {
     let network = match ctx.lock() {
-        Ok(guard) => guard.network.tcp.clone(),
+        Ok(guard) => guard.network.transport.clone(),
         Err(_) => return,
     };
-    let reject = codec::encode_reject_with_reason(uuid, reason);
-    do_send_via_network(&network, uuid, &reject);
+    let reject = codec::reject_payload_with_reason(uuid, reason);
+    let _ = &network;
+    send_via_quic(ctx, uuid, crate::processing::CTRL_REJECT, &reject);
     fire_pairing_cb(
         ctx,
         uuid,
@@ -101,17 +89,14 @@ fn notify_version_mismatch_once(ctx: &SafeContext, uuid: &str) {
 }
 
 fn fire_data_cb(ctx: &SafeContext, uuid: &str, msg_type: &str, plaintext: &str) {
-    let (cb, ud) = {
+    let cb = {
         let Ok(g) = ctx.lock() else {
             return;
         };
-        (g.router.on_data, g.router.user_data)
+        g.router.on_data.clone()
     };
-    if let Some(cb_fn) = cb {
-        let uuid_c = CString::new(uuid).unwrap_or_default();
-        let type_c = CString::new(msg_type).unwrap_or_default();
-        let text_c = CString::new(plaintext).unwrap_or_default();
-        cb_fn(uuid_c.as_ptr(), type_c.as_ptr(), text_c.as_ptr(), ud);
+    if let Some(cb_fn) = cb.as_ref() {
+        cb_fn(uuid, msg_type, plaintext);
     }
 }
 
@@ -120,14 +105,14 @@ fn frame_sender_uuid(msg_type: u8, payload: &[u8]) -> Option<String> {
     match msg_type {
         MessageType::HANDSHAKE => binary_codec::decode_handshake_frame(payload).map(|h| h.uuid),
         MessageType::HEARTBEAT => binary_codec::decode_heartbeat_frame(payload).map(|h| h.uuid),
-        t if t >= 10 && t <= 200 => std::str::from_utf8(payload)
+        t if (10..=200).contains(&t) => std::str::from_utf8(payload)
             .ok()
-            .and_then(|s| s.splitn(4, ':').nth(1).map(|v| v.to_string())),
+            .and_then(|s| s.split(':').nth(1).map(|v| v.to_string())),
         // 配对帧与 ACCEPT：首段即发送方 uuid
         MessageType::PAIRING_INIT | MessageType::PAIRING_RESP | MessageType::ACCEPT => {
             std::str::from_utf8(payload)
                 .ok()
-                .and_then(|s| s.splitn(2, ':').next().map(|v| v.trim().to_string()))
+                .and_then(|s| s.split(':').next().map(|v| v.trim().to_string()))
                 .filter(|u| !u.is_empty())
         }
         _ => None,
@@ -168,7 +153,7 @@ pub(crate) fn process_frame(
             0
         }
         MessageType::RESYNC_REQUEST => process_data(ctx, msg_type, payload),
-        t if t >= 10 && t <= 200 => process_data(ctx, t, payload),
+        t if (10..=200).contains(&t) => process_data(ctx, t, payload),
         _ => {
             log::warn!("处理消息: 未知消息类型 type={}", msg_type);
             -1
@@ -306,19 +291,15 @@ fn process_handshake(ctx: &SafeContext, payload: &[u8]) -> i32 {
                 guard.crypto.local_pub_key_b64.clone().unwrap_or_default(),
                 bi.map(|b| b.battery).unwrap_or(0),
                 bi.map(|b| b.device_type.clone()).unwrap_or_default(),
-                guard.network.tcp.clone(),
+                guard.network.transport.clone(),
             )
         };
-        let local_ip = super::utils::get_local_ip_impl().unwrap_or_default();
+        let local_ip = crate::utils::get_local_ip();
         if !local_uuid.is_empty() && !local_pub.is_empty() {
-            let accept = codec::encode_accept(
-                &local_uuid,
-                &local_pub,
-                &local_ip,
-                local_battery,
-                &local_type,
-            );
-            do_send_via_network(&network, &uuid_str, &accept);
+            let _ = (&local_ip, local_battery, &local_type);
+            let accept = codec::accept_payload(&local_uuid, &local_pub);
+            let _ = &network;
+            send_via_quic(ctx, &uuid_str, crate::processing::CTRL_ACCEPT, &accept);
             log::info!("配对自动闭环: 已配对设备 {} 握手后自动 ACCEPT", uuid_str);
         }
     }
@@ -645,7 +626,7 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
                             if let Ok(g) = ctx.lock() {
                                 if g.sender_queue != 0 {
                                     let q = unsafe {
-                                        &*(crate::ffi::handle::get(g.sender_queue)
+                                        &*(crate::handle::get(g.sender_queue)
                                             as *const crate::sender_queue::SenderQueue)
                                     };
                                     let now = std::time::SystemTime::now()
@@ -700,12 +681,8 @@ fn process_accept(ctx: &SafeContext, payload: &[u8]) -> i32 {
     }
 
     {
-        let ack = codec::encode_ack(&uuid);
-        let network = match ctx.lock() {
-            Ok(guard) => guard.network.tcp.clone(),
-            Err(_) => return -1,
-        };
-        do_send_via_network(&network, &uuid, &ack);
+        let ack = codec::ack_payload(&uuid);
+        send_via_quic(ctx, &uuid, crate::processing::CTRL_ACK, &ack);
     }
     0
 }
@@ -720,7 +697,7 @@ fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
     let network = match ctx.lock() {
         Ok(mut guard) => {
             guard.pairing_sessions.remove(&uuid);
-            guard.network.tcp.clone()
+            guard.network.transport.clone()
         }
         Err(_) => return -1,
     };
@@ -742,8 +719,9 @@ fn process_reject(ctx: &SafeContext, payload: &[u8]) -> i32 {
         &reason,
     );
     {
-        let ack = codec::encode_ack(&uuid);
-        do_send_via_network(&network, &uuid, &ack);
+        let _ = &network;
+        let ack = codec::ack_payload(&uuid);
+        send_via_quic(ctx, &uuid, crate::processing::CTRL_ACK, &ack);
     }
     0
 }
@@ -761,6 +739,12 @@ fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
         return -1;
     };
     guard.heartbeat.record(&hb.uuid);
+    log::debug!(
+        "收到心跳: uuid={}, battery={}, type={}",
+        hb.uuid,
+        hb.battery,
+        hb.device_type
+    );
     drop(guard);
     let name_decoded = String::from_utf8(
         base64::engine::general_purpose::STANDARD
@@ -787,6 +771,10 @@ fn process_heartbeat(ctx: &SafeContext, payload: &[u8]) -> i32 {
             hb.battery,
             &hb.device_type,
         );
+        // 收到心跳即证明对端可达：必须恢复在线标记。
+        // 否则一旦出现过一次超时，connected 会永久停在 false，
+        // 表现为设备「掉线后再也回不来」。
+        guard.registry.mark_connected(&hb.uuid, &ip);
     }
 
     let data = serde_json::json!({
@@ -864,6 +852,57 @@ fn lost_non_null_fields(
         .collect()
 }
 
+/// QUIC 控制帧的 wire header（与 `MessageType` 常量一一对应）。
+pub(crate) const CTRL_HANDSHAKE: &str = "CTRL_HANDSHAKE";
+pub(crate) const CTRL_PAIRING_INIT: &str = "CTRL_PAIRING_INIT";
+pub(crate) const CTRL_PAIRING_RESP: &str = "CTRL_PAIRING_RESP";
+pub(crate) const CTRL_ACCEPT: &str = "CTRL_ACCEPT";
+pub(crate) const CTRL_REJECT: &str = "CTRL_REJECT";
+pub(crate) const CTRL_HEARTBEAT: &str = "CTRL_HEARTBEAT";
+pub(crate) const CTRL_ACK: &str = "CTRL_ACK";
+pub(crate) const CTRL_RESYNC: &str = "CTRL_RESYNC";
+
+/// 控制帧 header → 消息类型；非控制帧返回 None。
+pub(crate) fn control_header_to_type(header: &str) -> Option<u8> {
+    Some(match header {
+        CTRL_HANDSHAKE => MessageType::HANDSHAKE,
+        CTRL_PAIRING_INIT => MessageType::PAIRING_INIT,
+        CTRL_PAIRING_RESP => MessageType::PAIRING_RESP,
+        CTRL_ACCEPT => MessageType::ACCEPT,
+        CTRL_REJECT => MessageType::REJECT,
+        CTRL_HEARTBEAT => MessageType::HEARTBEAT,
+        CTRL_ACK => MessageType::ACK,
+        CTRL_RESYNC => MessageType::RESYNC_REQUEST,
+        _ => return None,
+    })
+}
+
+/// 以「wire header + 明文 payload」形式处理入站帧（QUIC 传输层入口）。
+///
+/// 与 [process_frame] 的差异：QUIC 传输不携带二进制帧头，
+/// 直接给出 header 与明文载荷，故此处按 header 反查消息类型后复用同一处理路径。
+pub(crate) fn process_header_frame(
+    ctx: &SafeContext,
+    session_uuid: Option<&str>,
+    header: &str,
+    payload: &[u8],
+) -> i32 {
+    // 控制帧（握手/配对/心跳等）：按类型直接走既有控制帧处理路径
+    if let Some(ctrl_type) = control_header_to_type(header) {
+        return process_frame(ctx, session_uuid, ctrl_type, payload);
+    }
+    let msg_type = crate::protocol::binary_codec::data_header_to_type(header);
+    if msg_type == 0xFF {
+        log::warn!("处理消息: 未知 header={}", header);
+        return -1;
+    }
+    // QUIC 已由 TLS 1.3 提供机密性与完整性，业务载荷无需再做 AES-GCM 解密，
+    // 直接进入明文分发，与旧 TCP 路径解密后的处理完全一致。
+    let uuid = session_uuid.unwrap_or("");
+    let plaintext = String::from_utf8_lossy(payload);
+    dispatch_plaintext(ctx, msg_type, header, uuid, &plaintext)
+}
+
 fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // DATA 消息 payload 格式: DATA_TYPE:uuid:coreVersion:pub_key:encrypted_data
     let text = match std::str::from_utf8(payload) {
@@ -937,17 +976,26 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     } else {
         wire_header
     };
-
     log::debug!(
         "处理消息: 解密 DATA header={}, uuid={}, 密文长度={}",
         data_header,
         local_uuid,
         encrypted_payload.len()
     );
+    dispatch_plaintext(ctx, msg_type, data_header, local_uuid, &plaintext)
+}
 
+/// 明文分发：把已解密的业务载荷交给对应处理器（旧 TCP 路径与 QUIC 路径共用）。
+fn dispatch_plaintext(
+    ctx: &SafeContext,
+    msg_type: u8,
+    data_header: &str,
+    local_uuid: &str,
+    plaintext: &str,
+) -> i32 {
     // 重同步请求：接收端缺失基线时主动请求发送方重发 FULL
     if msg_type == MessageType::RESYNC_REQUEST {
-        match serde_json::from_str::<serde_json::Value>(&plaintext) {
+        match serde_json::from_str::<serde_json::Value>(plaintext) {
             Ok(v) => {
                 if let Some(fid) = v.get("feature").and_then(|x| x.as_str()) {
                     // local_uuid 为请求方（原接收端）；本机作为发送方标记对应会话重发 FULL
@@ -964,7 +1012,7 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     // 超级岛 / 媒体：交给状态合并引擎
     if msg_type == MessageType::MEDIA_SESSION || msg_type == MessageType::FEATURE_STATUS {
         let is_media = msg_type == MessageType::MEDIA_SESSION;
-        crate::state_merge::handle_state_message(ctx, local_uuid, is_media, &plaintext);
+        crate::state_merge::handle_state_message(ctx, local_uuid, is_media, plaintext);
         return 0;
     }
 
@@ -990,66 +1038,64 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
     };
 
     let processed_text = match msg_type {
-        MessageType::NOTIFICATION => {
-            serde_json::from_str::<crate::models::Notification>(&plaintext)
-                .ok()
-                .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
-        }
+        MessageType::NOTIFICATION => serde_json::from_str::<crate::models::Notification>(plaintext)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or(plaintext.to_string()),
         MessageType::MEDIA_SESSION | MessageType::FEATURE_STATUS => {
-            serde_json::from_str::<crate::models::MediaPayload>(&plaintext)
+            serde_json::from_str::<crate::models::MediaPayload>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         // DATA_ICON_REQUEST / DATA_ICON_RESPONSE 共用 PACKAGE_INFO，必须按 wire header
         // 选择模型：响应侧用 IconRequest 归一化会把 iconData/icons/missing 静默丢弃
         MessageType::PACKAGE_INFO => {
             if data_header == "DATA_ICON_RESPONSE" {
-                normalize_or_keep::<crate::models::IconResponse>(&plaintext)
+                normalize_or_keep::<crate::models::IconResponse>(plaintext)
             } else {
-                normalize_or_keep::<crate::models::IconRequest>(&plaintext)
+                normalize_or_keep::<crate::models::IconRequest>(plaintext)
             }
         }
         MessageType::SYNC_SEARCH_APP => {
-            serde_json::from_str::<crate::models::AppListRequest>(&plaintext)
+            serde_json::from_str::<crate::models::AppListRequest>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::SYNC_SEARCH_APP_RESPONSE => {
-            serde_json::from_str::<crate::models::AppListResponse>(&plaintext)
+            serde_json::from_str::<crate::models::AppListResponse>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::MEDIA_SESSION_CONTROL => {
-            serde_json::from_str::<crate::models::MediaControl>(&plaintext)
+            serde_json::from_str::<crate::models::MediaControl>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
-        MessageType::FTP => serde_json::from_str::<crate::models::FtpMessage>(&plaintext)
+        MessageType::FTP => serde_json::from_str::<crate::models::FtpMessage>(plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or(plaintext.clone()),
-        MessageType::CLIPBOARD => serde_json::from_str::<crate::models::ClipboardData>(&plaintext)
+            .unwrap_or(plaintext.to_string()),
+        MessageType::CLIPBOARD => serde_json::from_str::<crate::models::ClipboardData>(plaintext)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or(plaintext.clone()),
+            .unwrap_or(plaintext.to_string()),
         MessageType::DEVICE_STATUS => {
-            serde_json::from_str::<crate::models::StatusMessage>(&plaintext)
+            serde_json::from_str::<crate::models::StatusMessage>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
         MessageType::RELAY_APPLICATION => {
-            serde_json::from_str::<crate::models::AppLaunch>(&plaintext)
+            serde_json::from_str::<crate::models::AppLaunch>(plaintext)
                 .ok()
                 .and_then(|v| serde_json::to_string(&v).ok())
-                .unwrap_or(plaintext.clone())
+                .unwrap_or(plaintext.to_string())
         }
-        _ => plaintext.clone(),
+        _ => plaintext.to_string(),
     };
 
     fire_data_cb(ctx, local_uuid, cb_type, &processed_text);
@@ -1060,7 +1106,6 @@ fn process_data(ctx: &SafeContext, msg_type: u8, payload: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::{CoreContext, MAX_PAIRING_SESSIONS};
-    use std::os::raw::{c_char, c_void};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -1130,28 +1175,6 @@ mod tests {
         ICON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    extern "C" fn capture_data_cb(
-        _uuid: *const c_char,
-        msg_type: *const c_char,
-        plaintext: *const c_char,
-        _user_data: *mut c_void,
-    ) {
-        use std::ffi::CStr;
-        let read = |p: *const c_char| -> String {
-            if p.is_null() {
-                return String::new();
-            }
-            unsafe { CStr::from_ptr(p) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
-        };
-        DATA_EVENTS
-            .lock()
-            .unwrap()
-            .push((read(msg_type), read(plaintext)));
-    }
-
     /// 构造与本机对端密钥匹配的测试上下文，并注册 on_data 捕获回调
     fn ctx_with_data_cb() -> SafeContext {
         DATA_EVENTS.lock().unwrap().clear();
@@ -1163,8 +1186,14 @@ mod tests {
                 String::new(),
                 base64::engine::general_purpose::STANDARD.encode(TEST_AES_KEY),
             );
-            guard.router.user_data = &DATA_EVENTS as *const DataEvents as *mut c_void;
-            guard.router.on_data = Some(capture_data_cb);
+            guard.router.on_data = Some(std::sync::Arc::new(
+                |_uuid: &str, msg_type: &str, plaintext: &str| {
+                    DATA_EVENTS
+                        .lock()
+                        .unwrap()
+                        .push((msg_type.to_string(), plaintext.to_string()));
+                },
+            ));
         }
         ctx
     }
@@ -1441,37 +1470,20 @@ mod tests {
     type PairingEvents = Mutex<Vec<(String, String, String)>>;
     static PAIRING_EVENTS: PairingEvents = Mutex::new(Vec::new());
 
-    extern "C" fn capture_pairing_cb(
-        _uuid: *const c_char,
-        msg_type: *const c_char,
-        data: *const c_char,
-        _int_value: i32,
-        extra: *const c_char,
-        _user_data: *mut c_void,
-    ) {
-        use std::ffi::CStr;
-        let read = |p: *const c_char| -> String {
-            if p.is_null() {
-                return String::new();
-            }
-            unsafe { CStr::from_ptr(p) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
-        };
-        PAIRING_EVENTS
-            .lock()
-            .unwrap()
-            .push((read(msg_type), read(data), read(extra)));
-    }
-
     fn ctx_with_pairing_cb() -> SafeContext {
         PAIRING_EVENTS.lock().unwrap().clear();
         let ctx = Mutex::new(CoreContext::new());
         {
             let mut guard = ctx.lock().unwrap();
-            guard.router.user_data = &PAIRING_EVENTS as *const PairingEvents as *mut c_void;
-            guard.router.on_pairing = Some(capture_pairing_cb);
+            guard.router.on_pairing = Some(std::sync::Arc::new(
+                |_uuid: &str, msg_type: &str, data: &str, _int_value: i32, extra: &str| {
+                    PAIRING_EVENTS.lock().unwrap().push((
+                        msg_type.to_string(),
+                        data.to_string(),
+                        extra.to_string(),
+                    ));
+                },
+            ));
         }
         ctx
     }
@@ -1486,13 +1498,10 @@ mod tests {
         let _serial = icon_test_guard();
         let ctx = ctx_with_pairing_cb();
 
-        let frame =
-            codec::encode_reject_with_reason("peer-x", codec::RejectReason::VERSION_MISMATCH);
-        // 帧头 5 字节（type + length LE），payload 紧随其后
-        let decoded = crate::protocol::binary_codec::read_frame(&mut &frame[..]).unwrap();
-        assert_eq!(decoded.0, MessageType::REJECT);
+        let payload =
+            codec::reject_payload_with_reason("peer-x", codec::RejectReason::VERSION_MISMATCH);
         assert_eq!(
-            process_frame(&ctx, None, decoded.0, &decoded.1),
+            process_frame(&ctx, None, MessageType::REJECT, payload.as_bytes()),
             0,
             "REJECT 应被正常处理"
         );

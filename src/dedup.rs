@@ -83,9 +83,9 @@ pub fn compute_dedup_key(device_uuid: &str, data: &str) -> String {
     hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// 入站内容去重键：前缀 + title|text
-pub fn content_key(title: &str, text: &str) -> String {
-    format!("{}{}|{}", CONTENT_KEY_PREFIX, title, text)
+/// 入站内容去重键：前缀 + appName|title|text
+pub fn content_key(app_name: &str, title: &str, text: &str) -> String {
+    format!("{}{}|{}|{}", CONTENT_KEY_PREFIX, app_name, title, text)
 }
 
 fn now_ms() -> i64 {
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn contains_true_after_mark_and_false_after_cleanup() {
         let mut d = DedupState::new();
-        let key = content_key("t", "x");
+        let key = content_key("app", "t", "x");
         d.mark_sent(&key);
         assert!(d.contains(&key, CONTENT_DEDUP_TTL_MS));
         d.cleanup(now_ms() + CONTENT_DEDUP_TTL_MS + 1, CONTENT_DEDUP_TTL_MS);
@@ -119,10 +119,16 @@ mod tests {
     }
 
     #[test]
+    fn content_key_distinguishes_app_name() {
+        assert_ne!(content_key("QQ", "t", "x"), content_key("WeChat", "t", "x"));
+        assert_eq!(content_key("QQ", "t", "x"), content_key("QQ", "t", "x"));
+    }
+
+    #[test]
     fn clear_prefix_keeps_outbound_keys() {
         let mut d = DedupState::new();
         let outbound = compute_dedup_key("uuid-1", "data-1");
-        let content = content_key("title", "text");
+        let content = content_key("app", "title", "text");
         d.mark_sent(&outbound);
         d.mark_sent(&content);
         d.clear_prefix(CONTENT_KEY_PREFIX);

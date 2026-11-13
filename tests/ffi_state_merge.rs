@@ -8,12 +8,48 @@ use std::sync::Mutex;
 use notify_relay_core::{ffi, CoreContext, SafeContext};
 
 static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 进程内已创建的临时库目录；进程退出时统一清理，避免在 TEMP 下堆积。
+static CTX_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// 清理本进程及历史遗留的全部测试临时库目录。
+fn prune_temp_dirs() {
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        for dir in dirs.drain(..) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("nrctx_") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 注册进程退出清理（只注册一次）。
+fn register_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn on_exit() {
+            prune_temp_dirs();
+        }
+        // SAFETY: 回调只做文件删除，不访问其他全局状态
+        unsafe { libc::atexit(on_exit) };
+    });
+}
+
 fn create_ctx() -> SafeContext {
     let n = CTX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = std::env::temp_dir()
-        .join(format!("nrctx_{}_{}", std::process::id(), n))
-        .join("rust_core.db");
-    Mutex::new(CoreContext::with_db_override(p))
+    let dir = std::env::temp_dir().join(format!("nrctx_{}_{}", std::process::id(), n));
+    if let Ok(mut dirs) = CTX_DIRS.lock() {
+        dirs.push(dir.clone());
+    }
+    register_cleanup_once();
+    Mutex::new(CoreContext::with_db_override(dir.join("rust_core.db")))
 }
 
 fn ctx_ptr(ctx: &SafeContext) -> *mut c_void {
@@ -388,6 +424,19 @@ fn test_parse_media_basic() {
 }
 
 #[test]
+fn test_parse_media_song_key_passthrough() {
+    // 歌曲身份原样透传：歌词滚动期间对端据此判定是否换曲
+    let v = parse_media(r#"{"title":"某句歌词","songKey":"171234"}"#);
+    assert_eq!(v["songKey"], "171234");
+}
+
+#[test]
+fn test_parse_media_song_key_absent_is_null() {
+    let v = parse_media(r#"{"title":"t"}"#);
+    assert!(v["songKey"].is_null(), "缺失 songKey 应为 null");
+}
+
+#[test]
 fn test_parse_media_is_end_by_media_type() {
     let v = parse_media(r#"{"mediaType":"END"}"#);
     assert_eq!(v["isEnd"], true);
@@ -421,6 +470,58 @@ fn test_parse_media_is_playing_default_true() {
 fn test_parse_media_is_playing_false() {
     let v = parse_media(r#"{"isPlaying":false}"#);
     assert_eq!(v["isPlaying"], false);
+}
+
+#[test]
+fn test_parse_media_progress_from_position() {
+    // 采样位置 + 采样时刻 + 播放态 → 等价的计时器口径
+    let v = parse_media(
+        r#"{"title":"t","positionMs":30000,"durationMs":180000,"positionAt":1700000000000,"isPlaying":true}"#,
+    );
+    assert_eq!(v["timerType"], 1, "播放中应为正计时进行");
+    assert_eq!(v["timerTotal"], 180000);
+    assert_eq!(v["timerSystemCurrent"], 1700000000000i64);
+    assert_eq!(v["timerWhen"], 1700000000000i64 - 30000);
+}
+
+#[test]
+fn test_parse_media_progress_paused() {
+    let v = parse_media(
+        r#"{"positionMs":1000,"durationMs":60000,"positionAt":1700000000000,"isPlaying":false}"#,
+    );
+    assert_eq!(v["timerType"], 2, "暂停应取正计时暂停");
+    assert_eq!(v["timerWhen"], 1700000000000i64 - 1000);
+}
+
+#[test]
+fn test_parse_media_progress_without_duration_is_not_advancing() {
+    let v = parse_media(r#"{"positionMs":1000,"positionAt":1700000000000,"isPlaying":true}"#);
+    assert_eq!(v["timerType"], 0, "无总时长时不可推进");
+    assert_eq!(v["timerTotal"], 0);
+}
+
+#[test]
+fn test_parse_media_progress_absent_defaults_zero() {
+    let v = parse_media(r#"{"title":"t"}"#);
+    assert_eq!(v["timerType"], 0);
+    assert_eq!(v["timerWhen"], 0);
+    assert_eq!(v["timerTotal"], 0);
+    assert_eq!(v["timerSystemCurrent"], 0);
+}
+
+#[test]
+fn test_parse_media_progress_timer_fields_win() {
+    // 发送端已按计时器口径给出时直接透传，不再由位置推导
+    let v = parse_media(
+        r#"{"timerType":2,"timerWhen":100,"timerTotal":900,"timerSystemCurrent":500,"positionMs":400}"#,
+    );
+    assert_eq!(
+        v["timerType"], 1,
+        "timerType 由总时长与播放态派生，暂停由 isPlaying 表达"
+    );
+    assert_eq!(v["timerWhen"], 100);
+    assert_eq!(v["timerTotal"], 900);
+    assert_eq!(v["timerSystemCurrent"], 500);
 }
 
 #[test]
