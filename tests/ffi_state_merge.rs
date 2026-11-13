@@ -424,6 +424,19 @@ fn test_parse_media_basic() {
 }
 
 #[test]
+fn test_parse_media_song_key_passthrough() {
+    // 歌曲身份原样透传：歌词滚动期间对端据此判定是否换曲
+    let v = parse_media(r#"{"title":"某句歌词","songKey":"171234"}"#);
+    assert_eq!(v["songKey"], "171234");
+}
+
+#[test]
+fn test_parse_media_song_key_absent_is_null() {
+    let v = parse_media(r#"{"title":"t"}"#);
+    assert!(v["songKey"].is_null(), "缺失 songKey 应为 null");
+}
+
+#[test]
 fn test_parse_media_is_end_by_media_type() {
     let v = parse_media(r#"{"mediaType":"END"}"#);
     assert_eq!(v["isEnd"], true);

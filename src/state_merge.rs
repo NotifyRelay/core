@@ -607,6 +607,7 @@ pub fn parse_notification_inbound(full_json: &str) -> Value {
 ///   口径与超级岛计时器组件一致（`timerType`：1 正计时进行中、2 正计时暂停，
 ///   `timerWhen` 为位置归零时刻、`timerTotal` 为总时长、`timerSystemCurrent` 为采样时刻），
 ///   接收端据此在本地推进显示进度，发送端无需按进度高频推送
+/// - `songKey`：字符串，空时为 `null`；歌词滚动期间保持不变，供接收端判定换曲
 /// - `isEnd`：`mediaType` 忽略大小写等于 `"END"` 或 `terminateValue == TERMINATE_VALUE`
 ///
 /// 非 JSON 对象时返回 `Value::Null`。
@@ -677,6 +678,7 @@ pub fn parse_media_inbound(full_json: &str) -> Value {
         "title": opt_str("title"),
         "text": opt_str("text"),
         "coverImage": opt_str("coverUrl"),
+        "songKey": opt_str("songKey"),
         "isPlaying": is_playing,
         "isEnd": is_end,
         "time": time,
