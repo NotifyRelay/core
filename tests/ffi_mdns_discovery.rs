@@ -29,6 +29,24 @@ type DiscoveredEvent = (String, String, u16, i32, String, String);
 /// 记录 on_device_discovered 回调事件（回调为 extern "C"，无法捕获上下文）
 static DISCOVERED: Mutex<Vec<DiscoveredEvent>> = Mutex::new(Vec::new());
 
+/// 发现态容器是进程级共享：使用它的测试必须串行执行，
+/// 否则一个测试的 clear 会清掉另一个测试刚记录的事件。
+static DISCOVERY_SERIAL: Mutex<()> = Mutex::new(());
+
+/// 取得串行许可；前序测试 panic 导致的锁中毒不阻断后续测试。
+fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    DISCOVERY_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 读取已记录事件；中毒时取回内部数据而非直接失败。
+fn discovered() -> std::sync::MutexGuard<'static, Vec<DiscoveredEvent>> {
+    DISCOVERED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 extern "C" fn on_device_discovered(
     uuid: *const c_char,
     name_b64: *const c_char,
@@ -38,7 +56,7 @@ extern "C" fn on_device_discovered(
     ip: *const c_char,
     _user_data: *mut c_void,
 ) {
-    DISCOVERED.lock().unwrap().push((
+    discovered().push((
         unsafe { read_cstr(uuid) },
         unsafe { read_cstr(name_b64) },
         port,
@@ -51,7 +69,8 @@ extern "C" fn on_device_discovered(
 /// 通过发现消费链登记一台对端，并断言 registry、device_ips、known_devices 与回调。
 #[test]
 fn mdns_discovery_registers_peer_through_consumer() {
-    DISCOVERED.lock().unwrap().clear();
+    let _serial = serial_guard();
+    discovered().clear();
 
     let ctx = create_ctx();
     ffi::callbacks::nrc_set_on_device_discovered_cb(ctx_ptr(&ctx), Some(on_device_discovered));
@@ -100,7 +119,7 @@ fn mdns_discovery_registers_peer_through_consumer() {
     }
 
     // 3) 平台回调已按统一语义上抛
-    let evs = DISCOVERED.lock().unwrap();
+    let evs = discovered();
     let ev = evs
         .iter()
         .find(|(u, _, _, _, _, _)| u == PEER_UUID)
@@ -115,7 +134,8 @@ fn mdns_discovery_registers_peer_through_consumer() {
 /// mDNS 组播会回环到本机，自身通告必须被忽略。
 #[test]
 fn mdns_discovery_ignores_self_announcement() {
-    DISCOVERED.lock().unwrap().clear();
+    let _serial = serial_guard();
+    discovered().clear();
 
     let ctx = create_ctx();
     ffi::callbacks::nrc_set_on_device_discovered_cb(ctx_ptr(&ctx), Some(on_device_discovered));
@@ -129,7 +149,7 @@ fn mdns_discovery_ignores_self_announcement() {
     );
 
     assert!(
-        DISCOVERED.lock().unwrap().is_empty(),
+        discovered().is_empty(),
         "本机自身通告不得触发 on_device_discovered"
     );
     {
@@ -144,7 +164,8 @@ fn mdns_discovery_ignores_self_announcement() {
 /// 服务下线后必须清理发现态，否则设备永久挂在列表里并被反复重拨。
 #[test]
 fn mdns_service_removed_clears_discovery_state() {
-    DISCOVERED.lock().unwrap().clear();
+    let _serial = serial_guard();
+    discovered().clear();
 
     let ctx = create_ctx();
     {
@@ -186,6 +207,7 @@ fn mdns_service_removed_clears_discovery_state() {
 /// 本机自身服务下线通知不得触发清理（避免误删自身状态）。
 #[test]
 fn mdns_service_removed_ignores_self() {
+    let _serial = serial_guard();
     // 各测试使用独立的 local uuid，避免并行执行时共享 DISCOVERED 互相污染
     const SELF_UUID: &str = "self-removed-test";
 

@@ -32,6 +32,26 @@ pub fn should_deduplicate(
     )
 }
 
+/// 在一批候选中查找相似条目，返回首个命中的下标；全部不相似时返回 -1。
+///
+/// 候选为扁平序列：`[应用名, 标题, 正文, 应用名, 标题, 正文, ...]`。
+/// 逐条调用 [`should_deduplicate`] 的代价随候选数量线性放大跨语言调用次数，
+/// 本入口把候选整体传入，单次调用完成比较。
+#[uniffi::export]
+pub fn find_similar_candidate(
+    new_app_name: String,
+    new_title: String,
+    new_text: String,
+    candidates: Vec<String>,
+) -> i64 {
+    let triples: Vec<crate::utils::Candidate> = candidates
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|chunk| (chunk[0].clone(), chunk[1].clone(), chunk[2].clone()))
+        .collect();
+    crate::utils::find_similar_candidate(&new_app_name, &new_title, &new_text, &triples)
+}
 /// 由共享密钥派生 FTP 凭据。
 #[uniffi::export]
 pub fn derive_ftp_credentials(shared_secret_b64: String) -> String {

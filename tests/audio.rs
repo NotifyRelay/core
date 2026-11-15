@@ -14,9 +14,6 @@ fn init_logger() {
         .try_init();
 }
 
-/// 上下文序号：保证每个测试上下文使用独立的临时数据库。
-static CTX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(23336);
 
 fn get_test_port() -> u16 {

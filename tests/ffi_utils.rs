@@ -3,8 +3,6 @@
 //! 说明：nrc_enqueue_message 依赖 crate 内 pub(crate) 队列构造，集成测试不可达，
 //!       其语义由 src/ffi/sender_queue.rs 的 crate 内单元测试覆盖。
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use notify_relay_core::ffi;
 
 mod common;
@@ -227,16 +225,9 @@ fn test_dedup_action_semantics() {
     // action=1 标记已发送 → 0，TTL 内重复 → 0
     assert_eq!(unsafe { ffi::utils::nrc_dedup(ptr, 1, key, 0, 0) }, 0);
     assert_eq!(unsafe { ffi::utils::nrc_dedup(ptr, 0, key, 60000, 0) }, 0);
-    // action=3 清理过期（时间前进 70s，TTL 60s）→ 0，之后可再次发送
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    assert_eq!(
-        unsafe { ffi::utils::nrc_dedup(ptr, 3, key, now + 70000, 60000) },
-        0
-    );
-    assert_eq!(unsafe { ffi::utils::nrc_dedup(ptr, 0, key, 60000, 0) }, 1);
+    // action=3 按各条目自身过期时刻清理 → 0；60s 窗口内条目仍在，重复查询仍为 0
+    assert_eq!(unsafe { ffi::utils::nrc_dedup(ptr, 3, key, 0, 0) }, 0);
+    assert_eq!(unsafe { ffi::utils::nrc_dedup(ptr, 0, key, 60000, 0) }, 0);
 
     unsafe { free_cstr(key) };
 }

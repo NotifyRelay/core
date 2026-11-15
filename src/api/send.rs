@@ -296,60 +296,21 @@ impl Core {
     // ===== 去重 =====
 
     /// 统一去重接口：action 0=check_and_pend / 1=mark_sent / 2=clear_pending / 3=cleanup。
-    pub fn dedup(&self, action: i32, dedup_key: String, arg1_ms: i64, arg2_ms: i64) -> i32 {
-        let Ok(mut guard) = self.ctx().lock() else {
-            return -1;
-        };
-        match action {
-            0 => {
-                if dedup_key.is_empty() {
-                    return 0;
-                }
-                i32::from(guard.dedup.check_and_pend(&dedup_key, arg1_ms))
-            }
-            1 => {
-                if !dedup_key.is_empty() {
-                    guard.dedup.mark_sent(&dedup_key);
-                }
-                0
-            }
-            2 => {
-                if !dedup_key.is_empty() {
-                    guard.dedup.clear_pending(&dedup_key);
-                }
-                0
-            }
-            3 => {
-                guard.dedup.cleanup(arg1_ms, arg2_ms);
-                0
-            }
-            _ => -1,
-        }
+    ///
+    /// `arg1_ms` 是 action 0/1 的窗口长度；action 3 按各条目自身过期时刻清理，不再需要窗口参数。
+    /// `arg2_ms` 无作用，仅为保持既有调用方签名不变。
+    pub fn dedup(&self, action: i32, dedup_key: String, arg1_ms: i64, _arg2_ms: i64) -> i32 {
+        crate::dedup::with_handle(self.ctx_ptr() as usize, -1, |state| {
+            crate::dedup::apply_action(state, action, &dedup_key, arg1_ms)
+        })
     }
 
     /// 入站内容去重：0=纯查询 / 1=标记已见 / 2=清除内容键。
     pub fn content_dedup(&self, action: i32, app_name: String, title: String, text: String) -> i32 {
         let key = crate::dedup::content_key(&app_name, &title, &text);
-        let Ok(mut guard) = self.ctx().lock() else {
-            return -1;
-        };
-        match action {
-            0 => i32::from(
-                guard
-                    .dedup
-                    .contains(&key, crate::dedup::CONTENT_DEDUP_TTL_MS),
-            ),
-            1 => {
-                guard.dedup.maybe_cleanup();
-                guard.dedup.mark_sent(&key);
-                0
-            }
-            2 => {
-                guard.dedup.clear_prefix(crate::dedup::CONTENT_KEY_PREFIX);
-                0
-            }
-            _ => -1,
-        }
+        crate::dedup::with_handle(self.ctx_ptr() as usize, -1, |state| {
+            crate::dedup::apply_content_action(state, action, &key)
+        })
     }
 }
 

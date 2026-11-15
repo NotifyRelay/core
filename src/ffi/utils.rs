@@ -2,7 +2,7 @@
 
 use std::os::raw::{c_char, c_void};
 
-use super::common::{from_cstr, to_cstr, with_ctx_or};
+use super::common::{from_cstr, to_cstr};
 
 /// # Safety
 /// 字符串指针须为空或有效 C 字符串。
@@ -28,6 +28,7 @@ pub unsafe extern "C" fn nrc_compute_feature_id(
 ///
 /// action: 0=check_and_pend, 1=mark_sent, 2=clear_pending, 3=cleanup。
 /// action=0 时返回 1=应发送, 0=重复；action=1/2/3 时返回 0=成功, -1=失败。
+/// `arg1_ms` 是 action 0/1 的窗口长度；`arg2_ms` 无作用，仅为保持既有签名不变。
 ///
 /// # Safety
 /// `dedup_key` 须为空或有效 C 字符串。
@@ -37,36 +38,14 @@ pub unsafe extern "C" fn nrc_dedup(
     action: i32,
     dedup_key: *const c_char,
     arg1_ms: i64,
-    arg2_ms: i64,
+    _arg2_ms: i64,
 ) -> i32 {
     if ctx_ptr.is_null() {
         return -1;
     }
-    let key = unsafe { from_cstr(dedup_key) };
-    with_ctx_or(ctx_ptr, -1, |guard| match action {
-        0 => {
-            if key.is_empty() {
-                return 0;
-            }
-            i32::from(guard.dedup.check_and_pend(key, arg1_ms))
-        }
-        1 => {
-            if !key.is_empty() {
-                guard.dedup.mark_sent(key);
-            }
-            0
-        }
-        2 => {
-            if !key.is_empty() {
-                guard.dedup.clear_pending(key);
-            }
-            0
-        }
-        3 => {
-            guard.dedup.cleanup(arg1_ms, arg2_ms);
-            0
-        }
-        _ => -1,
+    let raw = unsafe { from_cstr(dedup_key) };
+    crate::dedup::with_handle(ctx_ptr as usize, -1, |state| {
+        crate::dedup::apply_action(state, action, raw, arg1_ms)
     })
 }
 
@@ -91,22 +70,8 @@ pub unsafe extern "C" fn nrc_content_dedup(
         unsafe { from_cstr(title) },
         unsafe { from_cstr(text) },
     );
-    with_ctx_or(ctx_ptr, -1, |guard| match action {
-        0 => i32::from(
-            guard
-                .dedup
-                .contains(&key, crate::dedup::CONTENT_DEDUP_TTL_MS),
-        ),
-        1 => {
-            guard.dedup.maybe_cleanup();
-            guard.dedup.mark_sent(&key);
-            0
-        }
-        2 => {
-            guard.dedup.clear_prefix(crate::dedup::CONTENT_KEY_PREFIX);
-            0
-        }
-        _ => -1,
+    crate::dedup::with_handle(ctx_ptr as usize, -1, |state| {
+        crate::dedup::apply_content_action(state, action, &key)
     })
 }
 

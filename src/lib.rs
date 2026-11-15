@@ -53,7 +53,8 @@ pub struct CoreContext {
     pub network: network::NetworkState,
     /// QUIC 传输层（方案 B）：Arc 共享，便于「锁内取句柄、锁外发送」避免持锁做 I/O
     pub quic: Option<std::sync::Arc<quic::QuicTransport>>,
-    pub dedup: dedup::DedupState,
+    /// 去重状态：独立锁持有，查重不参与上下文锁竞争
+    pub dedup: Arc<Mutex<dedup::DedupState>>,
     pub clipboard: clipboard::ClipboardState,
     pub app_sync: app_sync::AppSyncState,
     pub filter: filter::FilterState,
@@ -193,7 +194,7 @@ impl CoreContext {
             audio: Arc::new(Mutex::new(audio_stream::AudioStreamState::new())),
             network: network::NetworkState::new(),
             quic: None,
-            dedup: dedup::DedupState::new(),
+            dedup: Arc::new(Mutex::new(dedup::DedupState::new())),
             clipboard: clipboard::ClipboardState::new(),
             app_sync: app_sync::AppSyncState::new(),
             filter: filter::FilterState::new(),

@@ -136,7 +136,40 @@ pub fn should_deduplicate(
     if !same_app(new_app_name, old_app_name) {
         return false;
     }
-    combined_similarity(new_title, new_text, old_title, old_text) >= 0.8
+    combined_similarity(new_title, new_text, old_title, old_text) >= SIMILARITY_THRESHOLD
+}
+
+/// 去重相似度阈值。
+const SIMILARITY_THRESHOLD: f64 = 0.8;
+
+/// 单条相似度候选：应用名、标题、正文。
+pub type Candidate = (String, String, String);
+
+/// 在一批候选记录中查找相似条目，返回首个命中的下标；全部不相似时返回 -1。
+///
+/// 逐条调用 [`should_deduplicate`] 需要每条候选一次跨语言调用；批量入口把候选整体传入，
+/// 单次调用完成比较，避免候选数量放大跨语言编组开销。
+/// 应用名不指向同一应用时在 [`same_app`] 即返回，不进入相似度计算。
+pub fn find_similar_candidate(
+    new_app_name: &str,
+    new_title: &str,
+    new_text: &str,
+    candidates: &[Candidate],
+) -> i64 {
+    candidates
+        .iter()
+        .position(|(app, title, text)| {
+            should_deduplicate(
+                new_app_name,
+                new_title,
+                new_text,
+                app.as_str(),
+                title.as_str(),
+                text.as_str(),
+            )
+        })
+        .map(|index| index as i64)
+        .unwrap_or(-1)
 }
 
 /// 由共享密钥派生 FTP 凭据，返回 `{"username":..,"password":..}` JSON。
@@ -351,5 +384,46 @@ mod tests {
     #[test]
     fn test_generate_random_password() {
         assert_eq!(generate_random_password().len(), 12);
+    }
+
+    #[test]
+    fn find_similar_candidate_returns_first_hit() {
+        let candidates = vec![
+            (
+                "微信".to_string(),
+                "李四".to_string(),
+                "无关内容".to_string(),
+            ),
+            ("QQ".to_string(), "张三".to_string(), "在吗".to_string()),
+            ("微信".to_string(), "李四".to_string(), "在吗".to_string()),
+        ];
+        // 第一条应用名相同但正文不同，第三条才命中
+        assert_eq!(
+            find_similar_candidate("微信", "李四", "在吗", &candidates),
+            2
+        );
+    }
+
+    #[test]
+    fn find_similar_candidate_misses_without_hit() {
+        let candidates = vec![(
+            "微信".to_string(),
+            "李四".to_string(),
+            "完全不同的内容".to_string(),
+        )];
+        assert_eq!(
+            find_similar_candidate("微信", "李四", "在吗", &candidates),
+            -1
+        );
+    }
+
+    #[test]
+    fn find_similar_candidate_skips_other_app() {
+        let candidates = vec![("QQ".to_string(), "李四".to_string(), "在吗".to_string())];
+        assert_eq!(
+            find_similar_candidate("微信", "李四", "在吗", &candidates),
+            -1,
+            "应用名不同不进入相似度判定"
+        );
     }
 }

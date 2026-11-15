@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::dedup::Fingerprint;
 use crate::protocol::codec;
 use crate::SafeContext;
 
@@ -25,7 +26,8 @@ pub struct SendItem {
     pub device_uuid: String,
     pub header: String,
     pub plaintext: String,
-    pub dedup_key: Option<String>,
+    /// 发送去重指纹：仅通知类消息携带，其余通道为 None
+    pub dedup_key: Option<Fingerprint>,
     pub retries_left: u32,
     /// 队列内合并键（媒体类消息为 "device_uuid|header"）：
     /// 全量状态入队时移除队列中同键旧项，避免积压后爆发式回放
@@ -40,13 +42,13 @@ pub struct SenderQueue {
     /// core 上下文指针：补清理未发送即被丢弃项的去重键时使用（0 表示未绑定）
     ctx_ptr: AtomicUsize,
     /// 待补清理的去重键：丢弃发生在可能已持有 ctx 锁的调用栈内，此处只登记
-    orphan_keys: Arc<Mutex<Vec<String>>>,
+    orphan_keys: Arc<Mutex<Vec<Fingerprint>>>,
 }
 
 struct SenderQueueInner {
     items: Vec<SendItem>,
     /// dedup_key -> 发送开始时间
-    in_flight: HashMap<String, Instant>,
+    in_flight: HashMap<Fingerprint, Instant>,
     /// device_uuid -> 发送开始时间（同设备串行发送，保证消息顺序）
     busy_devices: HashMap<String, Instant>,
     /// device_uuid -> 冷却截止时间（发送失败退避，避免反复烧满连接超时）
@@ -60,7 +62,7 @@ struct TaskGuard {
     inner: Arc<Mutex<SenderQueueInner>>,
     active: Arc<AtomicUsize>,
     device_uuid: String,
-    dedup_key: Option<String>,
+    dedup_key: Option<Fingerprint>,
 }
 
 impl Drop for TaskGuard {
@@ -68,10 +70,8 @@ impl Drop for TaskGuard {
         self.active.fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut guard) = self.inner.lock() {
             guard.busy_devices.remove(&self.device_uuid);
-            if let Some(ref key) = self.dedup_key {
-                if !key.is_empty() {
-                    guard.in_flight.remove(key);
-                }
+            if let Some(key) = self.dedup_key.as_ref() {
+                guard.in_flight.remove(key);
             }
         }
     }
@@ -151,7 +151,7 @@ impl SenderQueue {
     /// 导致后续相同负载被误判为重复而静默丢弃。
     /// 丢弃可能发生在已持有 ctx 锁的调用栈内（状态推送 → enqueue/purge_stale_realtime），
     /// 而 SafeContext 是不可重入互斥锁，故此处只登记，不在原地加锁。
-    fn defer_orphan_keys_at(orphan: &Arc<Mutex<Vec<String>>>, keys: &[String]) {
+    fn defer_orphan_keys_at(orphan: &Arc<Mutex<Vec<Fingerprint>>>, keys: &[Fingerprint]) {
         if keys.is_empty() {
             return;
         }
@@ -161,20 +161,20 @@ impl SenderQueue {
                 let overflow = len + keys.len() - Self::MAX_ORPHAN_KEYS;
                 list.drain(0..overflow.min(len));
             }
-            list.extend(keys.iter().filter(|k| !k.is_empty()).cloned());
+            list.extend(keys.iter().copied());
         }
     }
 
-    fn defer_orphan_keys(&self, keys: &[String]) {
+    fn defer_orphan_keys(&self, keys: &[Fingerprint]) {
         Self::defer_orphan_keys_at(&self.orphan_keys, keys);
     }
 
     /// 补清理延迟释放的键（worker 每轮与 FFI 入队路径调用，调用时未持有 ctx 锁）
-    fn flush_orphan_keys_at(ctx_ptr: usize, orphan: &Arc<Mutex<Vec<String>>>) {
+    fn flush_orphan_keys_at(ctx_ptr: usize, orphan: &Arc<Mutex<Vec<Fingerprint>>>) {
         if ctx_ptr == 0 {
             return;
         }
-        let keys: Vec<String> = match orphan.lock() {
+        let keys: Vec<Fingerprint> = match orphan.lock() {
             Ok(mut list) => {
                 if list.is_empty() {
                     return;
@@ -183,15 +183,15 @@ impl SenderQueue {
             }
             Err(_) => return,
         };
-        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-        match ctx.lock() {
-            Ok(mut guard) => {
-                for key in &keys {
-                    guard.dedup.clear_pending(key);
-                }
+        // 锁内只取去重状态句柄，清理在上下文锁之外执行
+        let cleaned = crate::dedup::with_handle(ctx_ptr, false, |state| {
+            for key in &keys {
+                state.clear_pending(key);
             }
-            // 取锁失败：回填，留待下一次补清理
-            Err(_) => Self::defer_orphan_keys_at(orphan, &keys),
+            true
+        });
+        if !cleaned {
+            Self::defer_orphan_keys_at(orphan, &keys);
         }
     }
 
@@ -216,7 +216,7 @@ impl SenderQueue {
             return 0;
         };
         let before = inner.items.len();
-        let mut dropped_keys: Vec<String> = Vec::new();
+        let mut dropped_keys: Vec<Fingerprint> = Vec::new();
         inner.items.retain(|it| {
             if it.device_uuid != device_uuid || it.header != header {
                 return true;
@@ -230,8 +230,8 @@ impl SenderQueue {
                 None => true,
             };
             if !keep {
-                if let Some(ref key) = it.dedup_key {
-                    dropped_keys.push(key.clone());
+                if let Some(key) = it.dedup_key.as_ref() {
+                    dropped_keys.push(*key);
                 }
             }
             keep
@@ -269,7 +269,7 @@ impl SenderQueue {
         if is_media && item.coalesce_key.is_none() {
             item.coalesce_key = Some(format!("{}|{}", item.device_uuid, item.header));
         }
-        let mut replaced_keys: Vec<String> = Vec::new();
+        let mut replaced_keys: Vec<Fingerprint> = Vec::new();
         if let Ok(mut inner) = self.inner.lock() {
             // 全量媒体状态入队时移除同键旧项（含未发出的增量），只保留最新，
             // 根除网络恢复后过期状态的爆发式回放
@@ -279,8 +279,8 @@ impl SenderQueue {
                     inner.items.retain(|it| {
                         let replaced = it.coalesce_key.as_deref() == Some(key.as_str());
                         if replaced {
-                            if let Some(ref k) = it.dedup_key {
-                                replaced_keys.push(k.clone());
+                            if let Some(k) = it.dedup_key.as_ref() {
+                                replaced_keys.push(*k);
                             }
                         }
                         !replaced
@@ -325,7 +325,7 @@ impl SenderQueue {
                         continue;
                     }
 
-                    let mut stale_keys: Vec<String> = Vec::new();
+                    let mut stale_keys: Vec<Fingerprint> = Vec::new();
                     let item = {
                         let mut guard = match inner.lock() {
                             Ok(g) => g,
@@ -351,8 +351,8 @@ impl SenderQueue {
                         guard.items.retain(|it| {
                             let stale = Self::is_stale_realtime_item(it);
                             if stale {
-                                if let Some(ref key) = it.dedup_key {
-                                    stale_keys.push(key.clone());
+                                if let Some(key) = it.dedup_key.as_ref() {
+                                    stale_keys.push(*key);
                                 }
                             }
                             !stale
@@ -364,18 +364,19 @@ impl SenderQueue {
 
                         // 选取可发送项：同 dedup_key 不并发、同设备串行、冷却中的设备跳过
                         let idx = guard.items.iter().position(|it| {
-                            let key = it.dedup_key.as_deref().unwrap_or("");
-                            (key.is_empty() || !guard.in_flight.contains_key(key))
+                            let free_key = match it.dedup_key.as_ref() {
+                                Some(key) => !guard.in_flight.contains_key(key),
+                                None => true,
+                            };
+                            free_key
                                 && !guard.busy_devices.contains_key(&it.device_uuid)
                                 && !guard.device_cooldown.contains_key(&it.device_uuid)
                         });
                         match idx {
                             Some(i) => {
                                 let it = guard.items.remove(i);
-                                if let Some(ref key) = it.dedup_key {
-                                    if !key.is_empty() {
-                                        guard.in_flight.insert(key.clone(), now);
-                                    }
+                                if let Some(key) = it.dedup_key.as_ref() {
+                                    guard.in_flight.insert(*key, now);
                                 }
                                 guard.busy_devices.insert(it.device_uuid.clone(), now);
                                 Some(it)
@@ -393,11 +394,11 @@ impl SenderQueue {
                                 inner: inner.clone(),
                                 active: active.clone(),
                                 device_uuid: item.device_uuid.clone(),
-                                dedup_key: item.dedup_key.clone(),
+                                dedup_key: item.dedup_key,
                             };
                             let task_inner = inner.clone();
                             let task_orphan = orphan.clone();
-                            let orphan_key = item.dedup_key.clone();
+                            let orphan_key = item.dedup_key;
                             let spawn_result = thread::Builder::new()
                                 .name("sender-task".to_string())
                                 .spawn(move || {
@@ -407,7 +408,7 @@ impl SenderQueue {
                             if let Err(e) = spawn_result {
                                 // spawn 失败时闭包被丢弃：TaskGuard 的 Drop 已清理并发状态，
                                 // 该项不会发送，需同时登记其去重键待补清理
-                                if let Some(ref key) = orphan_key {
+                                if let Some(key) = orphan_key.as_ref() {
                                     Self::defer_orphan_keys_at(&orphan, std::slice::from_ref(key));
                                 }
                                 log::warn!("发送队列: 派生发送任务失败: {}", e);
@@ -427,29 +428,25 @@ impl SenderQueue {
         ctx_ptr: usize,
         item: &SendItem,
         inner: &Arc<Mutex<SenderQueueInner>>,
-        orphan: &Arc<Mutex<Vec<String>>>,
+        orphan: &Arc<Mutex<Vec<Fingerprint>>>,
     ) {
         let outcome = match Self::try_send(ctx_ptr, item) {
             Ok(v) => v,
             Err(_) => {
                 // 取锁失败使该项未发送即被丢弃：登记其去重键待补清理
-                if let Some(ref key) = item.dedup_key {
+                if let Some(key) = item.dedup_key.as_ref() {
                     Self::defer_orphan_keys_at(orphan, std::slice::from_ref(key));
                 }
                 return;
             }
         };
 
-        let ctx = unsafe { &*(ctx_ptr as *const SafeContext) };
-
         if let SendOutcome::Sent = outcome {
-            if let Some(ref key) = item.dedup_key {
-                if !key.is_empty() {
-                    // 后台线程：通过 lock() 取锁，与扫描回调、FFI 共用同一把锁
-                    if let Ok(mut guard) = ctx.lock() {
-                        guard.dedup.mark_sent(key);
-                    }
-                }
+            if let Some(key) = item.dedup_key.as_ref() {
+                // 锁内只取句柄：确认动作不占用上下文锁
+                crate::dedup::with_handle(ctx_ptr, (), |state| {
+                    state.mark_sent(key, SENT_DEDUP_TTL_MS);
+                });
             }
             // 发送成功：清除该设备的失败退避状态
             if let Ok(mut guard) = inner.lock() {
@@ -500,18 +497,16 @@ impl SenderQueue {
                     device_uuid: item.device_uuid.clone(),
                     header: item.header.clone(),
                     plaintext: item.plaintext.clone(),
-                    dedup_key: item.dedup_key.clone(),
+                    dedup_key: item.dedup_key,
                     retries_left: item.retries_left - 1,
                     coalesce_key: item.coalesce_key.clone(),
                 });
             }
         } else {
-            if let Some(ref key) = item.dedup_key {
-                if !key.is_empty() {
-                    if let Ok(mut guard) = ctx.lock() {
-                        guard.dedup.clear_pending(key);
-                    }
-                }
+            if let Some(key) = item.dedup_key.as_ref() {
+                crate::dedup::with_handle(ctx_ptr, (), |state| {
+                    state.clear_pending(key);
+                });
             }
             if Self::is_media_header(&item.header) && !Self::is_media_end_packet(&item.plaintext) {
                 log::debug!(
@@ -642,6 +637,16 @@ impl SenderQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用去重指纹：把字面量键归一成定长指纹。
+    fn fp(key: &str) -> Fingerprint {
+        crate::dedup::fingerprint(&[key])
+    }
+
+    /// 测试用去重状态句柄：与生产路径同样从上下文锁内取出。
+    fn state_of(ctx: &Mutex<crate::CoreContext>) -> Arc<Mutex<crate::dedup::DedupState>> {
+        ctx.lock().unwrap().dedup.clone()
+    }
 
     fn item(uuid: &str, header: &str, text: &str) -> SendItem {
         SendItem {
@@ -845,7 +850,7 @@ mod tests {
             device_uuid: uuid.to_string(),
             header: header.to_string(),
             plaintext: text.to_string(),
-            dedup_key: Some(key.to_string()),
+            dedup_key: Some(crate::dedup::fingerprint(&[key])),
             retries_left: 0,
             coalesce_key: None,
         }
@@ -859,10 +864,11 @@ mod tests {
         q.set_ctx_ptr(ctx_ptr);
 
         // 模拟入队时的去重键登记
+        let state = state_of(&ctx);
         {
-            let mut guard = ctx.lock().unwrap();
-            assert!(guard.dedup.check_and_pend("k-purge", 3000));
-            assert!(!guard.dedup.check_and_pend("k-purge", 3000));
+            let mut guard = state.lock().unwrap();
+            assert!(guard.check_and_pend(&fp("k-purge"), 3000));
+            assert!(!guard.check_and_pend(&fp("k-purge"), 3000));
         }
 
         let stale = crate::timestamp::now_ms() - crate::timestamp::STATE_MAX_AGE_MS - 1;
@@ -874,7 +880,7 @@ mod tests {
         q.flush_orphan_keys();
         // 丢弃项的去重键必须被释放，否则相同负载会被永久判为重复
         assert!(
-            ctx.lock().unwrap().dedup.check_and_pend("k-purge", 3000),
+            state.lock().unwrap().check_and_pend(&fp("k-purge"), 3000),
             "被丢弃项的去重键应已释放"
         );
     }
@@ -886,9 +892,10 @@ mod tests {
         let q = SenderQueue::new();
         q.set_ctx_ptr(ctx_ptr);
 
+        let state = state_of(&ctx);
         {
-            let mut guard = ctx.lock().unwrap();
-            assert!(guard.dedup.check_and_pend("k-old", 3000));
+            let mut guard = state.lock().unwrap();
+            assert!(guard.check_and_pend(&fp("k-old"), 3000));
         }
 
         // 模拟状态推送路径：持 ctx 锁调用 enqueue（第二次入队触发 coalesce 丢弃第一项）
@@ -910,7 +917,7 @@ mod tests {
 
         q.flush_orphan_keys();
         assert!(
-            ctx.lock().unwrap().dedup.check_and_pend("k-old", 3000),
+            state.lock().unwrap().check_and_pend(&fp("k-old"), 3000),
             "持锁路径丢弃的键应由补清理释放"
         );
     }
@@ -922,16 +929,17 @@ mod tests {
         let q = SenderQueue::new();
         q.set_ctx_ptr(ctx_ptr);
 
+        let state = state_of(&ctx);
         {
-            let mut guard = ctx.lock().unwrap();
-            guard.dedup.mark_sent("k-sent");
+            let mut guard = state.lock().unwrap();
+            guard.mark_sent(&fp("k-sent"), SENT_DEDUP_TTL_MS);
         }
-        q.defer_orphan_keys(&["k-sent".to_string()]);
+        q.defer_orphan_keys(&[fp("k-sent")]);
         q.flush_orphan_keys();
 
         // 补清理只清 pending，不得影响已发送键的窗口
         assert!(
-            !ctx.lock().unwrap().dedup.check_and_pend("k-sent", 3000),
+            !state.lock().unwrap().check_and_pend(&fp("k-sent"), 3000),
             "已发送键的窗口不应被补清理影响"
         );
     }
@@ -943,10 +951,11 @@ mod tests {
         let q = SenderQueue::new();
         q.set_ctx_ptr(ctx_ptr);
 
+        let state = state_of(&ctx);
         {
-            let mut guard = ctx.lock().unwrap();
-            assert!(guard.dedup.check_and_pend("k-old", 3000));
-            assert!(guard.dedup.check_and_pend("k-new", 3000));
+            let mut guard = state.lock().unwrap();
+            assert!(guard.check_and_pend(&fp("k-old"), 3000));
+            assert!(guard.check_and_pend(&fp("k-new"), 3000));
         }
 
         q.enqueue(item_with_key(
@@ -963,13 +972,13 @@ mod tests {
         ));
         q.flush_orphan_keys();
 
-        let mut guard = ctx.lock().unwrap();
+        let mut guard = state.lock().unwrap();
         assert!(
-            guard.dedup.check_and_pend("k-old", 3000),
+            guard.check_and_pend(&fp("k-old"), 3000),
             "被替换旧项的去重键应已释放"
         );
         assert!(
-            !guard.dedup.check_and_pend("k-new", 3000),
+            !guard.check_and_pend(&fp("k-new"), 3000),
             "保留项的键仍在 pending"
         );
     }
@@ -1039,17 +1048,16 @@ pub fn enqueue_message(
 
     let is_notification = is_notification_header(&hdr);
 
-    let dedup_key = if is_notification {
+    let dedup_key: Option<Fingerprint> = if is_notification {
         let key = crate::dedup::compute_dedup_key(device_uuid, plaintext);
-        let ctx = unsafe { &*(ctx_ptr as *const crate::SafeContext) };
-        let dedup_ok = match ctx.lock() {
-            Ok(mut g) => {
-                g.dedup.maybe_cleanup();
-                g.dedup.check_and_pend(&key, SENT_DEDUP_TTL_MS)
-            }
-            Err(_) => return -1,
-        };
-        if !dedup_ok {
+        let dedup_ok = crate::dedup::with_handle(ctx_ptr, -1, |state| {
+            state.maybe_cleanup();
+            i32::from(state.check_and_pend(&key, SENT_DEDUP_TTL_MS))
+        });
+        if dedup_ok < 0 {
+            return -1;
+        }
+        if dedup_ok == 0 {
             return 0;
         }
         Some(key)
@@ -1057,11 +1065,14 @@ pub fn enqueue_message(
         None
     };
 
-    // 通知类消息只注入并记录生成时刻 `ts`，不做丢弃：
+    // 通知类消息只记录生成时刻 `ts`，不做丢弃：
     // 断线期间的通知累积是有益的，恢复后应完整补收（实时状态的丢弃在 state_merge / sender_queue 内处理）。
     //
     // 仅对 DATA_NOTIFICATION 注入：其他通道（图标/应用列表/控制等）的模型未声明 `ts`，
     // 注入会触发 `normalize_or_keep` 的"往返丢字段"兜底并产生无谓告警，且这些通道无时效语义。
+    //
+    // `ts` 参与去重指纹，因此必须在算完指纹之后再注入：指纹覆盖实际上线的字节，
+    // 否则两条仅 `ts` 不同的相同通知会被判为新内容。
     let plaintext = if is_notification {
         crate::timestamp::inject_ts(plaintext, crate::timestamp::now_ms())
     } else {
