@@ -750,7 +750,11 @@ fn pics_map(v: &Value) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// 计算 island 状态差异：pics 保持差量逻辑，其他字段（title/text/param_v2_raw/coverUrl/isPlaying）填入实际值。
+/// 计算 island 状态差异：pics 保持差量逻辑，其余字段填入实际值。
+///
+/// 除展示字段外还必须带上进度三元组：媒体每次推送都会刷新位置，
+/// 若它们不进入 changes，接收端的全量里就永远是最早那一份进度，
+/// 表现为播放态能同步而进度冻结。字段缺失时不写入，让接收端沿用旧值。
 fn diff_island(old: &Value, new: &Value) -> Value {
     let mut changes = Map::new();
     // 非 pics 字段：填入实际值（无论是否变化）
@@ -760,6 +764,14 @@ fn diff_island(old: &Value, new: &Value) -> Value {
     }
     if let Some(v) = new.get("isPlaying") {
         changes.insert("isPlaying".to_string(), v.clone());
+    }
+    // 进度三元组：数值字段，按原样透传；缺失即不携带
+    for k in ["timerWhen", "timerTotal", "timerSystemCurrent"] {
+        if let Some(v) = new.get(k) {
+            if !v.is_null() {
+                changes.insert(k.to_string(), v.clone());
+            }
+        }
     }
     // pics 字段：保持差量（仅变化的 key）
     let op = pics_map(old);
@@ -808,6 +820,16 @@ fn merge_island(base: &Value, changes: &Value) -> String {
                 m.remove("isPlaying");
             } else {
                 m.insert("isPlaying".to_string(), v.clone());
+            }
+        }
+        // 进度三元组：与 diff_island 对应，缺失即沿用 base 中的旧值
+        for k in ["timerWhen", "timerTotal", "timerSystemCurrent"] {
+            if let Some(v) = changes.get(k) {
+                if v.is_null() {
+                    m.remove(k);
+                } else {
+                    m.insert(k.to_string(), v.clone());
+                }
             }
         }
         if let Some(pics_new) = changes.get("pics").and_then(|x| x.as_object()) {
@@ -1159,6 +1181,67 @@ mod tests {
             "pics": {},
         })
         .to_string()
+    }
+
+    fn media_full(position_ms: i64, playing: bool) -> String {
+        // timerWhen/timerSystemCurrent 之差即位置；这里直接用固定基准构造
+        let sys_cur = 1_700_000_000_000i64;
+        json!({
+            "packageName": "tv.danmaku.bili",
+            "appName": "哔哩哔哩",
+            "title": "曲目",
+            "text": "歌手",
+            "isPlaying": playing,
+            "timerType": if playing { 1 } else { 2 },
+            "timerWhen": sys_cur - position_ms,
+            "timerTotal": 887_296i64,
+            "timerSystemCurrent": sys_cur,
+        })
+        .to_string()
+    }
+
+    /// 媒体位置必须随每次推送进入差量。
+    ///
+    /// 展示字段与进度在同一份报文里，但进度三元组是数值且每次都变；
+    /// 若 diff 不带它们，接收端只在首次 FULL 看到进度，之后永远冻结。
+    #[test]
+    fn media_position_survives_delta_roundtrip() {
+        let q = SenderQueue::new();
+        let mut sender = StateMerge::new();
+        let mut receiver = StateMerge::new();
+
+        // 首次推送为 FULL，携带进度 10s
+        assert!(sender.push_state(&q, "devA", true, &media_full(10_000, true), false, false));
+        // 位置推进到 50s，内容其余字段不变
+        assert!(sender.push_state(&q, "devA", true, &media_full(50_000, true), false, false));
+
+        let items = q.test_drain_plaintexts();
+        assert_eq!(items.len(), 2);
+        assert!(items[1].contains("\"type\":\"delta\""));
+        // 差量必须携带进度三元组
+        assert!(
+            items[1].contains("timerWhen") && items[1].contains("timerSystemCurrent"),
+            "差量应携带进度字段，实际: {}",
+            items[1]
+        );
+
+        // 接收端依次合并：最终全量里的进度应为最新值
+        let mut merged = String::new();
+        for item in &items {
+            if let Some(MergeOutcome::Merged(_, full_json, _, _)) =
+                receiver.merge_incoming("devA", true, item)
+            {
+                merged = full_json;
+            }
+        }
+        assert!(!merged.is_empty(), "接收端应产出媒体全量");
+        let v: Value = serde_json::from_str(&merged).unwrap();
+        let when = v.get("timerWhen").and_then(|x| x.as_i64()).unwrap();
+        let sys_cur = v
+            .get("timerSystemCurrent")
+            .and_then(|x| x.as_i64())
+            .unwrap();
+        assert_eq!(sys_cur - when, 50_000, "合并后位置应为最新的 50s");
     }
 
     #[test]
